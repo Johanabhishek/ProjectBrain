@@ -1,0 +1,3 @@
+function testPlaceholder() {
+  return true;
+}

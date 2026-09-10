@@ -1,0 +1,62 @@
+[
+  {
+    "id": "flask-checkout-discount",
+    "project": "sample_flask_app",
+    "prompt": "add a discount code to checkout",
+    "expected_files": ["routes/checkout.py", "services/discount.py", "models/coupon.py"]
+  },
+  {
+    "id": "flask-coupon-validation",
+    "project": "sample_flask_app",
+    "prompt": "coupon validation is failing",
+    "expected_files": ["models/coupon.py", "services/discount.py"]
+  },
+  {
+    "id": "flask-checkout-endpoint",
+    "project": "sample_flask_app",
+    "prompt": "fix the checkout endpoint",
+    "expected_files": ["routes/checkout.py"]
+  },
+  {
+    "id": "flask-app-entrypoint",
+    "project": "sample_flask_app",
+    "prompt": "where does the flask app get created",
+    "expected_files": ["app.py"]
+  },
+  {
+    "id": "flask-util-helper",
+    "project": "sample_flask_app",
+    "prompt": "shared utility helper function",
+    "expected_files": ["services/util.py"]
+  },
+  {
+    "id": "express-user-lookup",
+    "project": "sample_express_app",
+    "prompt": "how do we look up a user by id",
+    "expected_files": ["routes/users.js", "services/authService.js", "models/user.js"]
+  },
+  {
+    "id": "express-auth-service",
+    "project": "sample_express_app",
+    "prompt": "auth service find user",
+    "expected_files": ["services/authService.js"]
+  },
+  {
+    "id": "express-user-model",
+    "project": "sample_express_app",
+    "prompt": "user model database lookup",
+    "expected_files": ["models/user.js"]
+  },
+  {
+    "id": "express-users-endpoint",
+    "project": "sample_express_app",
+    "prompt": "fix GET users endpoint",
+    "expected_files": ["routes/users.js"]
+  },
+  {
+    "id": "express-app-entrypoint",
+    "project": "sample_express_app",
+    "prompt": "where is the express app created",
+    "expected_files": ["app.js"]
+  }
+]

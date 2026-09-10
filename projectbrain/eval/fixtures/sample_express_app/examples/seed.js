@@ -1,0 +1,3 @@
+function seedUsers() {
+  return [];
+}

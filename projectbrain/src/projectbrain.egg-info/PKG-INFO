@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: projectbrain
+Version: 0.1.0
+Summary: Codebase intelligence layer for AI coding agents
+Requires-Python: >=3.9
+Requires-Dist: mcp
+Requires-Dist: tree-sitter>=0.23
+Requires-Dist: tree-sitter-python
+Requires-Dist: tree-sitter-javascript
+Requires-Dist: tree-sitter-typescript
+Provides-Extra: dev
+Requires-Dist: pytest>=7; extra == "dev"

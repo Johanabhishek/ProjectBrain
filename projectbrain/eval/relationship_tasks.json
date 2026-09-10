@@ -1,0 +1,90 @@
+[
+  {
+    "id": "flask-checkout-neighbors-two-hop",
+    "project": "sample_flask_app",
+    "kind": "neighbors",
+    "node_id": "fn:routes/checkout.py:checkout",
+    "edge_types": ["calls"],
+    "depth": 2,
+    "expected_neighbor_substrings": ["validate_coupon"],
+    "grep_keyword": "coupon",
+    "grep_should_miss_file": "routes/checkout.py",
+    "note": "checkout() only calls apply_discount() in its own source text; validate_coupon is two hops out through services/discount.py and never appears in checkout.py's text at all."
+  },
+  {
+    "id": "flask-checkout-to-coupon-path",
+    "project": "sample_flask_app",
+    "kind": "relationship",
+    "name_a": "checkout",
+    "name_b": "Coupon",
+    "min_hops": 2,
+    "expected_path_substrings": ["discount"],
+    "grep_keyword": "coupon",
+    "grep_should_miss_file": "routes/checkout.py",
+    "note": "The path must route through services/discount.py; grepping routes/checkout.py for 'coupon' finds nothing since the word never appears there."
+  },
+  {
+    "id": "flask-util-isolated-neighbors",
+    "project": "sample_flask_app",
+    "kind": "neighbors",
+    "node_id": "fn:services/util.py:helper",
+    "edge_types": ["calls", "imports"],
+    "depth": 1,
+    "expected_neighbor_substrings": [],
+    "unexpected_neighbor_substrings": ["checkout", "coupon", "discount"],
+    "note": "Negative control: services/util.py's helper() is genuinely unrelated to checkout - the graph must not fabricate a connection."
+  },
+  {
+    "id": "flask-app-to-coupon-no-path",
+    "project": "sample_flask_app",
+    "kind": "relationship",
+    "name_a": "app.py",
+    "name_b": "Coupon",
+    "expect_no_path": true,
+    "note": "Negative control: create_app() only returns a reference to checkout, never calls it, so there is genuinely no traceable edge from app.py to anything downstream. find_relationship must honestly report 'no path' rather than guessing one."
+  },
+  {
+    "id": "express-user-neighbors-two-hop",
+    "project": "sample_express_app",
+    "kind": "neighbors",
+    "node_id": "fn:routes/users.js:handleGetUser",
+    "edge_types": ["calls"],
+    "depth": 2,
+    "expected_neighbor_substrings": ["findUserInDb"],
+    "grep_keyword": "findUserInDb",
+    "grep_should_miss_file": "routes/users.js",
+    "note": "handleGetUser only calls findUser() in its own source text; findUserInDb is two hops out through services/authService.js and never appears in routes/users.js's text at all."
+  },
+  {
+    "id": "express-user-to-db-path",
+    "project": "sample_express_app",
+    "kind": "relationship",
+    "name_a": "handleGetUser",
+    "name_b": "findUserInDb",
+    "min_hops": 2,
+    "expected_path_substrings": ["authService"],
+    "grep_keyword": "findUserInDb",
+    "grep_should_miss_file": "routes/users.js",
+    "note": "The path must route through services/authService.js; grepping routes/users.js for 'findUserInDb' finds nothing since the word never appears there."
+  },
+  {
+    "id": "express-test-isolated-neighbors",
+    "project": "sample_express_app",
+    "kind": "neighbors",
+    "node_id": "fn:tests/users.test.js:testPlaceholder",
+    "edge_types": ["calls", "imports"],
+    "depth": 1,
+    "expected_neighbor_substrings": [],
+    "unexpected_neighbor_substrings": ["authService", "findUserInDb", "handleGetUser"],
+    "note": "Negative control: the decoy test file's placeholder function is genuinely unrelated to the auth flow."
+  },
+  {
+    "id": "express-app-to-db-no-path",
+    "project": "sample_express_app",
+    "kind": "relationship",
+    "name_a": "app.js",
+    "name_b": "findUserInDb",
+    "expect_no_path": true,
+    "note": "Negative control: createApp() only returns a reference to handleGetUser, never calls it, so there is genuinely no traceable edge from app.js downstream. find_relationship must honestly report 'no path' rather than guessing one."
+  }
+]

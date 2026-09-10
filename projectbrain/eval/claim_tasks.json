@@ -1,0 +1,153 @@
+[
+  {
+    "id": "flask-checkout-calls-apply-discount",
+    "project": "sample_flask_app",
+    "subject": "checkout", "relation": "calls", "object": "apply_discount",
+    "expected_verdict": "SUPPORTED",
+    "note": "Direct, import-resolved call — the plain positive case."
+  },
+  {
+    "id": "flask-checkout-calls-validate-coupon-is-indirect",
+    "project": "sample_flask_app",
+    "subject": "checkout", "relation": "calls", "object": "validate_coupon",
+    "expected_verdict": "REFUTED",
+    "note": "validate_coupon is two hops away. A DIRECT-call claim is correctly false; that precision is the point."
+  },
+  {
+    "id": "flask-checkout-reaches-validate-coupon",
+    "project": "sample_flask_app",
+    "subject": "checkout", "relation": "reaches", "object": "validate_coupon",
+    "expected_verdict": "SUPPORTED",
+    "note": "Transitive call flow does connect them — reaches, unlike calls, is SUPPORTED."
+  },
+  {
+    "id": "flask-checkout-calls-nonexistent",
+    "project": "sample_flask_app",
+    "subject": "checkout", "relation": "calls", "object": "wipe_db",
+    "expected_verdict": "REFUTED",
+    "note": "checkout's complete captured call set does not contain wipe_db; file parsed cleanly."
+  },
+  {
+    "id": "flask-create-app-reaches-validate-coupon-no-flow",
+    "project": "sample_flask_app",
+    "subject": "create_app", "relation": "reaches", "object": "validate_coupon",
+    "expected_verdict": "UNKNOWN",
+    "note": "create_app returns a reference to checkout but never calls it — no call-flow path. Honest UNKNOWN, not REFUTED."
+  },
+  {
+    "id": "flask-route-handles-checkout",
+    "project": "sample_flask_app",
+    "subject": "POST /checkout", "relation": "handles", "object": "checkout",
+    "expected_verdict": "SUPPORTED",
+    "note": "The route's declared handler is exactly checkout."
+  },
+  {
+    "id": "flask-app-imports-checkout-module",
+    "project": "sample_flask_app",
+    "subject": "app.py", "relation": "imports", "object": "routes.checkout",
+    "expected_verdict": "SUPPORTED",
+    "note": "Structural import fact."
+  },
+
+  {
+    "id": "claims-admin-inherits-user",
+    "project": "sample_claims",
+    "subject": "Admin", "relation": "inherits", "object": "User",
+    "expected_verdict": "SUPPORTED",
+    "note": "Import-resolved base class."
+  },
+  {
+    "id": "claims-admin-inherits-wrong-base",
+    "project": "sample_claims",
+    "subject": "Admin", "relation": "inherits", "object": "Account",
+    "expected_verdict": "REFUTED",
+    "note": "Admin's complete base list is [User]; Account is absent; file parsed cleanly."
+  },
+  {
+    "id": "claims-user-has-method-save",
+    "project": "sample_claims",
+    "subject": "User", "relation": "has_method", "object": "save",
+    "expected_verdict": "SUPPORTED",
+    "note": "Structural method fact."
+  },
+  {
+    "id": "claims-user-missing-method",
+    "project": "sample_claims",
+    "subject": "User", "relation": "has_method", "object": "delete",
+    "expected_verdict": "REFUTED",
+    "note": "User's complete method set is {save}; delete is absent."
+  },
+  {
+    "id": "claims-file-defines-user",
+    "project": "sample_claims",
+    "subject": "models/user.py", "relation": "defines", "object": "User",
+    "expected_verdict": "SUPPORTED"
+  },
+  {
+    "id": "claims-file-defines-ghost",
+    "project": "sample_claims",
+    "subject": "models/user.py", "relation": "defines", "object": "Ghost",
+    "expected_verdict": "REFUTED"
+  },
+  {
+    "id": "claims-list-users-calls-find",
+    "project": "sample_claims",
+    "subject": "list_users", "relation": "calls", "object": "find",
+    "expected_verdict": "SUPPORTED",
+    "note": "Same-file exact call — unambiguous despite the name collision elsewhere."
+  },
+  {
+    "id": "claims-list-users-refute-save",
+    "project": "sample_claims",
+    "subject": "list_users", "relation": "calls", "object": "save",
+    "expected_verdict": "REFUTED"
+  },
+  {
+    "id": "claims-collision-ambiguous-target",
+    "project": "sample_claims",
+    "subject": "process", "relation": "calls", "object": "find",
+    "expected_verdict": "UNKNOWN",
+    "note": "ANTI-FALSE-SUPPORT: `find` is defined in two files, process imports neither. The target is ambiguous — UNKNOWN, never a confident SUPPORTED."
+  },
+  {
+    "id": "claims-partial-file-external-call",
+    "project": "sample_claims",
+    "subject": "handler", "relation": "calls", "object": "compute",
+    "expected_verdict": "UNKNOWN",
+    "note": "compute is external AND handler's file parsed partial — cannot confirm."
+  },
+  {
+    "id": "claims-partial-file-cannot-refute",
+    "project": "sample_claims",
+    "subject": "handler", "relation": "calls", "object": "nonexistent",
+    "expected_verdict": "UNKNOWN",
+    "note": "ANTI-FALSE-REFUTATION: the file parsed partial, so absence from the captured set proves nothing. UNKNOWN, never REFUTED."
+  },
+  {
+    "id": "claims-go-unsupported-language",
+    "project": "sample_claims",
+    "subject": "legacy/util.go", "relation": "defines", "object": "Helper",
+    "expected_verdict": "UNKNOWN",
+    "note": "HONESTY: Go has no grammar, so an empty symbol set means 'not looked at'. Never REFUTED."
+  },
+  {
+    "id": "claims-ts-has-method",
+    "project": "sample_claims",
+    "subject": "Widget", "relation": "has_method", "object": "render",
+    "expected_verdict": "SUPPORTED",
+    "note": "TypeScript parsing produces real structural facts."
+  },
+  {
+    "id": "claims-ts-missing-method",
+    "project": "sample_claims",
+    "subject": "Widget", "relation": "has_method", "object": "destroy",
+    "expected_verdict": "REFUTED"
+  },
+  {
+    "id": "claims-ts-same-file-call",
+    "project": "sample_claims",
+    "subject": "mount", "relation": "calls", "object": "build",
+    "expected_verdict": "SUPPORTED",
+    "note": "TS same-file direct call."
+  }
+]
