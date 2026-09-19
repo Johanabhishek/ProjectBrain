@@ -1,0 +1,759 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>ProjectBrain — Codebase Intelligence for AI Agents</title>
+  <meta name="description" content="A local-first intelligence layer that helps AI coding agents find the right files, in the right order, with reasons — instead of scanning blindly." />
+  <style>
+    /* ── Reset & Base ──────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:        #0b0f19;
+      --surface:   #131825;
+      --border:    #1e2536;
+      --text:      #c9d1d9;
+      --text-dim:  #7d8590;
+      --heading:   #e6edf3;
+      --accent:    #58a6ff;
+      --accent-2:  #3fb950;
+      --accent-3:  #d2a8ff;
+      --code-bg:   #161b22;
+      --code-text: #c9d1d9;
+      --radius:    8px;
+      --max-w:     960px;
+    }
+
+    html { scroll-behavior: smooth; font-size: 16px; }
+
+    body {
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.7;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    /* ── Typography ────────────────────────────────────────────────── */
+    h1, h2, h3 { color: var(--heading); font-weight: 600; letter-spacing: -0.02em; }
+    h1 { font-size: 2.75rem; line-height: 1.15; }
+    h2 { font-size: 1.75rem; line-height: 1.3; margin-bottom: 1rem; }
+    h3 { font-size: 1.15rem; margin-bottom: 0.5rem; }
+    p  { margin-bottom: 1rem; }
+    a  { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    code, pre {
+      font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", "Consolas", monospace;
+      font-size: 0.875rem;
+    }
+
+    code {
+      background: var(--code-bg);
+      padding: 0.15em 0.4em;
+      border-radius: 4px;
+      color: var(--accent);
+    }
+
+    pre {
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem 1.5rem;
+      overflow-x: auto;
+      margin-bottom: 1.5rem;
+      line-height: 1.55;
+    }
+
+    pre code {
+      background: none;
+      padding: 0;
+      color: var(--code-text);
+    }
+
+    /* ── Layout ─────────────────────────────────────────────────────── */
+    .container { max-width: var(--max-w); margin: 0 auto; padding: 0 1.5rem; }
+
+    section {
+      padding: 5rem 0;
+      border-bottom: 1px solid var(--border);
+    }
+
+    section:last-of-type { border-bottom: none; }
+
+    /* ── Nav ────────────────────────────────────────────────────────── */
+    nav {
+      position: sticky;
+      top: 0;
+      z-index: 100;
+      background: rgba(11, 15, 25, 0.85);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border-bottom: 1px solid var(--border);
+      padding: 0.85rem 0;
+    }
+
+    nav .container {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+
+    .nav-brand {
+      font-weight: 700;
+      font-size: 1.1rem;
+      color: var(--heading);
+      letter-spacing: -0.01em;
+    }
+
+    .nav-links { display: flex; gap: 1.75rem; }
+
+    .nav-links a {
+      color: var(--text-dim);
+      font-size: 0.875rem;
+      font-weight: 500;
+      transition: color 0.2s;
+    }
+
+    .nav-links a:hover { color: var(--heading); text-decoration: none; }
+
+    /* ── Hero ───────────────────────────────────────────────────────── */
+    .hero {
+      padding: 7rem 0 5rem;
+      text-align: center;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .hero h1 { margin-bottom: 1.5rem; }
+
+    .hero h1 span { color: var(--accent); }
+
+    .hero .subtitle {
+      font-size: 1.2rem;
+      color: var(--text-dim);
+      max-width: 640px;
+      margin: 0 auto 2.5rem;
+      line-height: 1.65;
+    }
+
+    .hero-install {
+      display: inline-block;
+      background: var(--code-bg);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 0.75rem 1.75rem;
+      font-family: "JetBrains Mono", "Fira Code", monospace;
+      font-size: 1rem;
+      color: var(--accent-2);
+      letter-spacing: 0.01em;
+    }
+
+    .hero-badges {
+      margin-top: 1.75rem;
+      display: flex;
+      justify-content: center;
+      gap: 2rem;
+      flex-wrap: wrap;
+      font-size: 0.85rem;
+      color: var(--text-dim);
+    }
+
+    .hero-badges span { white-space: nowrap; }
+
+    /* ── Problem ────────────────────────────────────────────────────── */
+    .problem-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 2rem;
+      margin-top: 2rem;
+    }
+
+    .problem-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.75rem;
+    }
+
+    .problem-card h3 { color: var(--text-dim); text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.08em; margin-bottom: 0.75rem; }
+    .problem-card p { margin-bottom: 0; color: var(--text); }
+    .problem-card .highlight { color: var(--heading); font-weight: 500; }
+
+    /* ── How It Works ──────────────────────────────────────────────── */
+    .steps {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 2rem;
+      margin-top: 2rem;
+    }
+
+    .step {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 2rem 1.5rem;
+    }
+
+    .step-number {
+      display: inline-block;
+      width: 2rem;
+      height: 2rem;
+      line-height: 2rem;
+      text-align: center;
+      border-radius: 50%;
+      background: var(--accent);
+      color: var(--bg);
+      font-weight: 700;
+      font-size: 0.85rem;
+      margin-bottom: 1rem;
+    }
+
+    .step h3 { margin-bottom: 0.5rem; }
+    .step p  { color: var(--text-dim); margin-bottom: 0; font-size: 0.925rem; }
+
+    /* ── Features ───────────────────────────────────────────────────── */
+    .features-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+      margin-top: 2rem;
+    }
+
+    .feature {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.5rem 1.75rem;
+    }
+
+    .feature h3 { color: var(--heading); }
+    .feature p  { color: var(--text-dim); margin-bottom: 0; font-size: 0.925rem; }
+
+    .feature-tag {
+      display: inline-block;
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      padding: 0.2em 0.6em;
+      border-radius: 4px;
+      margin-bottom: 0.75rem;
+    }
+
+    .tag-core     { background: rgba(88,166,255,0.15); color: var(--accent); }
+    .tag-unique   { background: rgba(210,168,255,0.15); color: var(--accent-3); }
+    .tag-planned  { background: rgba(63,185,80,0.15); color: var(--accent-2); }
+
+    /* ── Comparison ────────────────────────────────────────────────── */
+    .comparison-table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-top: 2rem;
+      font-size: 0.9rem;
+    }
+
+    .comparison-table th,
+    .comparison-table td {
+      text-align: left;
+      padding: 0.85rem 1rem;
+      border-bottom: 1px solid var(--border);
+    }
+
+    .comparison-table th {
+      color: var(--text-dim);
+      font-weight: 500;
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+    }
+
+    .comparison-table td:first-child { color: var(--heading); font-weight: 500; }
+
+    .check  { color: var(--accent-2); }
+    .cross  { color: var(--text-dim); }
+    .partial { color: #d29922; }
+
+    /* ── Code Demo ─────────────────────────────────────────────────── */
+    .demo-block { margin-top: 2rem; }
+
+    .demo-block .demo-label {
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-dim);
+      margin-bottom: 0.5rem;
+    }
+
+    .comment { color: #6e7681; }
+    .keyword { color: #ff7b72; }
+    .string  { color: #a5d6ff; }
+    .fn      { color: #d2a8ff; }
+    .param   { color: #ffa657; }
+    .type    { color: #79c0ff; }
+
+    /* ── Architecture ──────────────────────────────────────────────── */
+    .arch-layers {
+      display: grid;
+      grid-template-columns: 1fr;
+      gap: 1rem;
+      margin-top: 2rem;
+    }
+
+    .arch-layer {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.25rem 1.5rem;
+      display: flex;
+      align-items: flex-start;
+      gap: 1.25rem;
+    }
+
+    .arch-layer-label {
+      flex-shrink: 0;
+      font-size: 0.7rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      padding: 0.25em 0.7em;
+      border-radius: 4px;
+      white-space: nowrap;
+      margin-top: 0.1rem;
+    }
+
+    .arch-layer p { margin-bottom: 0; font-size: 0.925rem; }
+
+    .layer-surface   .arch-layer-label { background: rgba(88,166,255,0.15); color: var(--accent); }
+    .layer-intel     .arch-layer-label { background: rgba(210,168,255,0.15); color: var(--accent-3); }
+    .layer-session   .arch-layer-label { background: rgba(63,185,80,0.15); color: var(--accent-2); }
+    .layer-core      .arch-layer-label { background: rgba(255,123,114,0.15); color: #ff7b72; }
+
+    /* ── CTA ────────────────────────────────────────────────────────── */
+    .cta {
+      text-align: center;
+      padding: 5rem 0;
+    }
+
+    .cta h2 { margin-bottom: 1rem; }
+    .cta p  { color: var(--text-dim); max-width: 540px; margin: 0 auto 2rem; }
+
+    .cta-buttons {
+      display: flex;
+      justify-content: center;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+
+    .btn {
+      display: inline-block;
+      padding: 0.75rem 1.75rem;
+      border-radius: var(--radius);
+      font-weight: 600;
+      font-size: 0.95rem;
+      transition: opacity 0.2s, transform 0.15s;
+      cursor: pointer;
+      text-decoration: none;
+    }
+
+    .btn:hover { text-decoration: none; opacity: 0.9; transform: translateY(-1px); }
+
+    .btn-primary {
+      background: var(--accent);
+      color: var(--bg);
+    }
+
+    .btn-secondary {
+      background: transparent;
+      color: var(--heading);
+      border: 1px solid var(--border);
+    }
+
+    /* ── Footer ─────────────────────────────────────────────────────── */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2rem 0;
+      text-align: center;
+      color: var(--text-dim);
+      font-size: 0.825rem;
+    }
+
+    /* ── Responsive ─────────────────────────────────────────────────── */
+    @media (max-width: 768px) {
+      h1 { font-size: 2rem; }
+      .hero { padding: 4rem 0 3rem; }
+      section { padding: 3.5rem 0; }
+      .problem-grid, .features-grid, .steps { grid-template-columns: 1fr; }
+      .nav-links { gap: 1rem; }
+    }
+  </style>
+</head>
+<body>
+
+  <!-- ── Nav ─────────────────────────────────────────────────────── -->
+  <nav>
+    <div class="container">
+      <div class="nav-brand">ProjectBrain</div>
+      <div class="nav-links">
+        <a href="#problem">Problem</a>
+        <a href="#how">How It Works</a>
+        <a href="#features">Features</a>
+        <a href="#compare">Comparison</a>
+        <a href="#api">API</a>
+        <a href="https://github.com/Johanabhishek/ProjectBrain" target="_blank">GitHub</a>
+      </div>
+    </div>
+  </nav>
+
+  <!-- ── Hero ────────────────────────────────────────────────────── -->
+  <header class="hero">
+    <div class="container">
+      <h1>Codebase intelligence<br />for <span>AI agents</span></h1>
+      <p class="subtitle">
+        A local-first intelligence layer that helps AI coding agents find the right files,
+        in the right order, with reasons &mdash; instead of scanning blindly.
+      </p>
+      <div class="hero-install">pip install projectbrain</div>
+      <div class="hero-badges">
+        <span>Local-first</span>
+        <span>No LLM required</span>
+        <span>Works with any agent</span>
+        <span>Python + JS/TS</span>
+      </div>
+    </div>
+  </header>
+
+  <!-- ── Problem ─────────────────────────────────────────────────── -->
+  <section id="problem">
+    <div class="container">
+      <h2>The problem</h2>
+      <p>AI coding agents waste massive amounts of tokens and time doing blind file reads. A simple 5-line fix can trigger reading 40+ files because the agent does not know where things live or how they connect.</p>
+
+      <div class="problem-grid">
+        <div class="problem-card">
+          <h3>Without ProjectBrain</h3>
+          <p>
+            Agent receives: <span class="highlight">"add discount code to checkout"</span><br /><br />
+            Reads 38 files. Scans routes, services, models, utilities, configs, tests.
+            Burns through context window. Takes 90 seconds before writing a single line of code.
+          </p>
+        </div>
+        <div class="problem-card">
+          <h3>With ProjectBrain</h3>
+          <p>
+            Agent queries ProjectBrain first.<br /><br />
+            Gets back <span class="highlight">3 files</span> with line ranges, reasons, and reading order.
+            Reads only what it needs. Starts writing code in under 5 seconds.
+          </p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── How It Works ────────────────────────────────────────────── -->
+  <section id="how">
+    <div class="container">
+      <h2>How it works</h2>
+      <div class="steps">
+        <div class="step">
+          <div class="step-number">1</div>
+          <h3>Index</h3>
+          <p>Tree-sitter parses your codebase and extracts functions, classes, routes, imports, exports, and relationships into a typed graph.</p>
+        </div>
+        <div class="step">
+          <div class="step-number">2</div>
+          <h3>Query</h3>
+          <p>Describe your task in plain language. The query engine matches routes, symbols, imports, and traverses the graph to find connected files.</p>
+        </div>
+        <div class="step">
+          <div class="step-number">3</div>
+          <h3>Navigate</h3>
+          <p>Get back a focused set of files with line ranges, relevance reasons, connection chains, and a suggested reading order.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Features ────────────────────────────────────────────────── -->
+  <section id="features">
+    <div class="container">
+      <h2>Core capabilities</h2>
+      <div class="features-grid">
+        <div class="feature">
+          <div class="feature-tag tag-core">Core</div>
+          <h3>Graph-Aware Code Map</h3>
+          <p>Goes beyond file search. Understands imports, function calls, inheritance, route-to-handler chains, and database model relationships.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-tag tag-core">Core</div>
+          <h3>Explainable Results</h3>
+          <p>Every result includes a reason ("defines POST /checkout", "imported by CheckoutService") and a confidence level. No black-box rankings.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-tag tag-unique">Unique</div>
+          <h3>Claim Verification</h3>
+          <p>Verify agent assumptions against the actual code graph before they become commits. Catches hallucinations like "getUserProfile is in auth.ts" when it is not.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-tag tag-unique">Unique</div>
+          <h3>Stateful Sessions</h3>
+          <p>Tracks what the agent has already read and edited. Follow-up queries return only the files the agent has not seen yet.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-tag tag-core">Core</div>
+          <h3>Agent-Native Surfaces</h3>
+          <p>Python API, CLI, and MCP server. Works with Codex, Claude Code, Cursor, Copilot, Antigravity, or any MCP-compatible agent.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-tag tag-planned">Planned</div>
+          <h3>Cross-Language Flow Tracing</h3>
+          <p>Trace a user action from React button click through fetch call to Express route to database query. Follows the flow across language boundaries.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-tag tag-core">Core</div>
+          <h3>Edge Confidence</h3>
+          <p>Every relationship is labeled: exact, qualified, import-resolved, candidate, or unknown. Dynamic dispatch is flagged as approximate, not presented as fact.</p>
+        </div>
+        <div class="feature">
+          <div class="feature-tag tag-planned">Planned</div>
+          <h3>Context Compression</h3>
+          <p>Fits context into a token budget. Focus files get full content, connected files get signatures only, distant files get one-line summaries.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Comparison ──────────────────────────────────────────────── -->
+  <section id="compare">
+    <div class="container">
+      <h2>How it compares</h2>
+      <div style="overflow-x: auto;">
+        <table class="comparison-table">
+          <thead>
+            <tr>
+              <th>Capability</th>
+              <th>Aider repo-map</th>
+              <th>CodeGraph</th>
+              <th>Sourcegraph</th>
+              <th>Cursor</th>
+              <th>ProjectBrain</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Local-first, no infra</td>
+              <td class="check">Yes</td>
+              <td class="check">Yes</td>
+              <td class="cross">No</td>
+              <td class="partial">Embedded</td>
+              <td class="check">Yes</td>
+            </tr>
+            <tr>
+              <td>Works with any agent</td>
+              <td class="cross">Aider only</td>
+              <td class="check">MCP</td>
+              <td class="cross">Own UI</td>
+              <td class="cross">Cursor only</td>
+              <td class="check">API + CLI + MCP</td>
+            </tr>
+            <tr>
+              <td>Typed code graph</td>
+              <td class="partial">File-level</td>
+              <td class="check">Yes</td>
+              <td class="check">Yes</td>
+              <td class="cross">Embeddings</td>
+              <td class="check">Yes</td>
+            </tr>
+            <tr>
+              <td>Explains why</td>
+              <td class="cross">No</td>
+              <td class="cross">No</td>
+              <td class="cross">No</td>
+              <td class="cross">No</td>
+              <td class="check">Yes</td>
+            </tr>
+            <tr>
+              <td>Edge confidence</td>
+              <td class="cross">No</td>
+              <td class="cross">No</td>
+              <td class="cross">No</td>
+              <td class="cross">No</td>
+              <td class="check">Yes</td>
+            </tr>
+            <tr>
+              <td>Session state</td>
+              <td class="cross">Rebuilt per chat</td>
+              <td class="cross">Stateless</td>
+              <td class="cross">No</td>
+              <td class="cross">No</td>
+              <td class="check">Yes</td>
+            </tr>
+            <tr>
+              <td>Claim verification</td>
+              <td class="cross">No</td>
+              <td class="cross">No</td>
+              <td class="cross">No</td>
+              <td class="cross">No</td>
+              <td class="check">Yes</td>
+            </tr>
+            <tr>
+              <td>No LLM required</td>
+              <td class="cross">Needs LLM</td>
+              <td class="check">Yes</td>
+              <td class="check">Yes</td>
+              <td class="cross">Needs LLM</td>
+              <td class="check">Yes</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── API Demo ────────────────────────────────────────────────── -->
+  <section id="api">
+    <div class="container">
+      <h2>Simple API</h2>
+      <p>Three lines to go from a task description to the exact files you need.</p>
+
+      <div class="demo-block">
+        <div class="demo-label">Python</div>
+        <pre><code><span class="keyword">from</span> projectbrain <span class="keyword">import</span> ProjectBrain
+
+brain = ProjectBrain(<span class="string">"./my-project"</span>)
+brain.index()
+
+<span class="comment"># Natural language query — any task, not just bugs</span>
+context = brain.query(<span class="string">"add discount code to checkout"</span>)
+
+<span class="comment"># Returns focused results with reasons</span>
+<span class="keyword">for</span> result <span class="keyword">in</span> context.results:
+    <span class="fn">print</span>(result.file_path, result.reason)
+    <span class="comment"># src/routes/checkout.ts   "defines POST /checkout"</span>
+    <span class="comment"># src/services/checkout.ts "handles checkout logic, imports CouponModel"</span>
+    <span class="comment"># src/models/Coupon.ts     "coupon schema — likely needs new field"</span></code></pre>
+      </div>
+
+      <div class="demo-block">
+        <div class="demo-label">CLI</div>
+        <pre><code><span class="comment"># Index and query from the terminal</span>
+$ projectbrain index ./my-project
+$ projectbrain query <span class="string">"why is /users returning 404"</span>
+
+<span class="comment"># Structured output for piping to other tools</span>
+$ projectbrain query <span class="string">"add discount code to checkout"</span> --json
+
+<span class="comment"># Verify an agent's claim against the code graph</span>
+$ projectbrain verify <span class="string">"auth.ts defines getUserProfile"</span>
+<span class="comment"># REFUTED: getUserProfile is defined in userService.ts</span></code></pre>
+      </div>
+
+      <div class="demo-block">
+        <div class="demo-label">MCP (for AI agents)</div>
+        <pre><code><span class="comment">// Agent calls ProjectBrain via MCP before reading any files</span>
+{
+  <span class="string">"tool"</span>: <span class="string">"projectbrain_query"</span>,
+  <span class="string">"arguments"</span>: {
+    <span class="string">"prompt"</span>: <span class="string">"cart total not updating after coupon applied"</span>,
+    <span class="string">"max_results"</span>: <span class="type">5</span>
+  }
+}
+
+<span class="comment">// Response: 3 files, line ranges, reasons, reading order</span>
+<span class="comment">// Agent reads only those files instead of scanning 40+</span></code></pre>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Architecture ────────────────────────────────────────────── -->
+  <section id="arch">
+    <div class="container">
+      <h2>Architecture</h2>
+      <p>Four layers, each building on the one below.</p>
+
+      <div class="arch-layers">
+        <div class="arch-layer layer-surface">
+          <span class="arch-layer-label">Surfaces</span>
+          <div>
+            <h3>CLI, Python API, MCP Server</h3>
+            <p>Multiple interfaces so any agent or developer can consume results in their preferred format.</p>
+          </div>
+        </div>
+        <div class="arch-layer layer-session">
+          <span class="arch-layer-label">Session</span>
+          <div>
+            <h3>Session Manager, Multi-Agent Coordinator, Task Memory</h3>
+            <p>Tracks what the agent has read and edited. Prevents conflicts when multiple agents work on related code.</p>
+          </div>
+        </div>
+        <div class="arch-layer layer-intel">
+          <span class="arch-layer-label">Intelligence</span>
+          <div>
+            <h3>Query Engine, Predictive Context, Claim Verifier, Context Compressor, Flow Tracer</h3>
+            <p>Turns the raw graph into actionable answers. Routes queries, predicts file sets, verifies claims, compresses context.</p>
+          </div>
+        </div>
+        <div class="arch-layer layer-core">
+          <span class="arch-layer-label">Core</span>
+          <div>
+            <h3>Tree-sitter Parser, Symbol Graph, Import Resolver, Behavioral Classifier</h3>
+            <p>Extracts functions, classes, routes, imports, exports, and relationships. Builds typed edges with confidence levels.</p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Output Example ──────────────────────────────────────────── -->
+  <section id="output">
+    <div class="container">
+      <h2>What the output looks like</h2>
+      <p>Every query returns structured results with reasons, connections, and a suggested reading order.</p>
+      <pre><code>{
+  <span class="string">"results"</span>: [
+    {
+      <span class="string">"file_path"</span>: <span class="string">"src/routes/checkout.ts"</span>,
+      <span class="string">"score"</span>: <span class="type">8.5</span>,
+      <span class="string">"confidence"</span>: <span class="string">"high"</span>,
+      <span class="string">"reason"</span>: <span class="string">"defines POST /checkout, imports CheckoutService"</span>,
+      <span class="string">"line_ranges"</span>: [[<span class="type">12</span>, <span class="type">58</span>]],
+      <span class="string">"connections"</span>: [
+        {
+          <span class="string">"path"</span>: <span class="string">"src/services/CheckoutService.ts"</span>,
+          <span class="string">"relation"</span>: <span class="string">"imports"</span>,
+          <span class="string">"confidence"</span>: <span class="string">"import_resolved"</span>
+        }
+      ]
+    }
+  ],
+  <span class="string">"suggested_read_order"</span>: [
+    <span class="string">"src/routes/checkout.ts"</span>,
+    <span class="string">"src/services/CheckoutService.ts"</span>,
+    <span class="string">"src/models/Coupon.ts"</span>
+  ]
+}</code></pre>
+    </div>
+  </section>
+
+  <!-- ── CTA ─────────────────────────────────────────────────────── -->
+  <section class="cta">
+    <div class="container">
+      <h2>Start using ProjectBrain</h2>
+      <p>Index your codebase in under 30 seconds. Query results in under 100ms. No cloud, no LLM, no setup beyond pip install.</p>
+      <div class="cta-buttons">
+        <a href="https://github.com/Johanabhishek/ProjectBrain" class="btn btn-primary" target="_blank">View on GitHub</a>
+        <a href="#api" class="btn btn-secondary">Read the Docs</a>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Footer ──────────────────────────────────────────────────── -->
+  <footer>
+    <div class="container">
+      <p>ProjectBrain is open source. Local-first codebase intelligence for AI agents.</p>
+    </div>
+  </footer>
+
+</body>
+</html>
