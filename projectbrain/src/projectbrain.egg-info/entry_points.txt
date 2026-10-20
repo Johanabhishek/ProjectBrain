@@ -1,3 +1,0 @@
-[console_scripts]
-projectbrain = projectbrain.cli:main
-projectbrain-mcp = projectbrain.server:main

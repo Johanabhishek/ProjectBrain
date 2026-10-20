@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import time
 from pathlib import Path
 
@@ -202,13 +203,240 @@ def run(project_filter: str | None = None) -> dict:
             if task["project"] == project:
                 claim_results.append(score_claim_task(brain, task))
 
+    # Self-dogfooding evaluation: run `compile_context` on ProjectBrain's own repo!
+    dogfood_results = score_self_dogfood_tasks()
+    adversarial_results = score_adversarial_dogfood_tasks()
+
     return {
         "projects": projects,
         "index_times_ms": index_times,
         "file_retrieval": file_retrieval_results,
         "relationship": relationship_results,
         "claim_verification": claim_results,
+        "dogfood_context_compiler": dogfood_results,
+        "adversarial_dogfood": adversarial_results,
     }
+
+
+def _simulate_disciplined_grep_window_agent(
+    brain: ProjectBrain, prompt: str, expected_symbols: set[str], window_lines: int = 120, max_windows: int = 3
+) -> dict:
+    """Simulate a smart, disciplined agent using `grep` + `view_file(StartLine, EndLine)`:
+    1. Strips English/code filler stopwords so it only greps for meaningful terms.
+    2. Weights grep hits by keyword rarity (a hit on `verify_claim` or `nextjs` ranks
+       far above a generic hit on `parse` or `status`).
+    3. Picks the top `max_windows` (3) best hit locations across `src/` and reads
+       a `window_lines` (120-line) chunk around each hit.
+    """
+    grep_stop = {
+        "how", "does", "what", "when", "where", "who", "why", "the", "and", "for",
+        "from", "with", "that", "this", "are", "was", "were", "has", "have", "into",
+        "out", "someone", "tool", "file", "files", "function", "code", "line", "lines",
+        "stop", "happens", "build", "check", "cut", "saved",
+    }
+    keywords = [
+        w for w in re.findall(r"[a-zA-Z0-9_]+", prompt.lower())
+        if len(w) > 2 and w not in grep_stop
+    ]
+    src_files = [rel for rel in brain._index if rel.startswith("src/")]
+
+    # 1. Count how many lines in src/ each keyword appears on (specificity)
+    kw_line_freq: dict[str, int] = {k: 0 for k in keywords}
+    file_lines_cache: dict[str, list[str]] = {}
+    for rel in src_files:
+        full_path = brain.root / rel
+        try:
+            lines = full_path.read_text(encoding="utf-8", errors="ignore").splitlines()
+        except OSError:
+            continue
+        file_lines_cache[rel] = lines
+        for line_text in lines:
+            low = line_text.lower()
+            for k in keywords:
+                if k in low:
+                    kw_line_freq[k] += 1
+
+    # Specificity weight: rare terms (like `verify_claim`, freq=3) get high weight;
+    # common terms (freq=100) get low weight.
+    kw_weight = {
+        k: (100.0 / max(freq, 1)) if freq > 0 else 0.0
+        for k, freq in kw_line_freq.items()
+    }
+
+    # 2. Score every matching line in src/ by specificity of matched keywords
+    scored_hits: list[tuple[float, str, int]] = []
+    grep_list_tokens = 0
+    for rel, lines in file_lines_cache.items():
+        for idx, line_text in enumerate(lines, start=1):
+            low = line_text.lower()
+            matched = [k for k in keywords if k in low]
+            if matched:
+                grep_list_tokens += max(1, len(line_text) // 4)
+                line_score = sum(kw_weight[k] for k in matched)
+                # Boost if line is a `def ` or `class ` definition
+                if low.lstrip().startswith(("def ", "async def ", "class ")):
+                    line_score *= 2.0
+                scored_hits.append((line_score, rel, idx))
+
+    scored_hits.sort(key=lambda x: (-x[0], x[1], x[2]))
+
+    # 3. Pick top `max_windows` non-overlapping 120-line windows
+    half = window_lines // 2
+    chosen_windows: list[tuple[str, int, int]] = []
+    for _, rel, hl in scored_hits:
+        if any(r == rel and abs(hl - ((s + e) // 2)) < half for r, s, e in chosen_windows):
+            continue
+        lines = file_lines_cache[rel]
+        start_l = max(1, hl - half)
+        end_l = min(len(lines), hl + half)
+        chosen_windows.append((rel, start_l, end_l))
+        if len(chosen_windows) >= max_windows:
+            break
+
+    read_tokens = 0
+    covered_symbols: set[str] = set()
+    for rel, start_l, end_l in chosen_windows:
+        lines = file_lines_cache[rel]
+        chunk_text = "\n".join(lines[start_l - 1 : end_l])
+        read_tokens += max(1, len(chunk_text) // 4)
+        info = brain._index.get(rel, {})
+        for fn in info.get("functions", []):
+            fn_line = fn.get("line_start", 0)
+            if start_l <= fn_line <= end_l:
+                covered_symbols.add(fn["name"])
+
+    total_tokens = min(grep_list_tokens, 300) + read_tokens
+    recall = len(expected_symbols & covered_symbols) / len(expected_symbols) if expected_symbols else 1.0
+    return {
+        "grep_window_tokens": total_tokens,
+        "grep_window_recall": recall,
+        "grep_covered_symbols": sorted(expected_symbols & covered_symbols),
+    }
+
+
+def score_self_dogfood_tasks() -> list[dict]:
+    """Run ProjectBrain's v2 `compile_context` on ProjectBrain's own repository
+    to measure real-world surgical slice token savings vs full-file `view_file` reads.
+    """
+    repo_root = EVAL_DIR.parent
+    brain = ProjectBrain(str(repo_root))
+    brain.index()
+    total_repo_tokens = sum(brain._sizes.values()) // 4
+
+    dogfood_tasks = [
+        {
+            "id": "dogfood-verify-claim",
+            "prompt": "how does verify_claim check closed world parse status and support evidence",
+            "expected_symbols": ["verify_claim", "_support_evidence"],
+        },
+        {
+            "id": "dogfood-import-resolution",
+            "prompt": "resolve python relative imports and typescript path aliases",
+            "expected_symbols": ["resolve_python_import", "resolve_js_import"],
+        },
+        {
+            "id": "dogfood-route-inference",
+            "prompt": "infer nextjs app router and pages router file based routes",
+            "expected_symbols": ["infer_file_based_routes"],
+        },
+    ]
+
+    results = []
+    for t in dogfood_tasks:
+        # Use fresh session state per benchmark task
+        brain._served_slices.clear()
+        brain._served_skeletons.clear()
+        start = time.perf_counter()
+        packet = brain.compile_context(t["prompt"], budget_tokens=2500, top_n=3)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        sliced_symbols = {s["symbol"].split(".")[-1] for s in packet.get("target_slices", [])}
+        expected = set(t["expected_symbols"])
+        symbol_recall = len(expected & sliced_symbols) / len(expected) if expected else 1.0
+        telem = packet["token_telemetry"]
+        grep_sim = _simulate_disciplined_grep_window_agent(brain, t["prompt"], expected)
+        gw_tokens = grep_sim["grep_window_tokens"]
+        saved_vs_gw = round((1.0 - telem["packet_tokens"] / max(gw_tokens, 1)) * 100, 1)
+
+        results.append({
+            "id": t["id"],
+            "prompt": t["prompt"],
+            "symbol_recall": symbol_recall,
+            "sliced_symbols": sorted(sliced_symbols),
+            "packet_tokens": telem["packet_tokens"],
+            "grep_window_tokens": gw_tokens,
+            "grep_window_recall": grep_sim["grep_window_recall"],
+            "tokens_saved_vs_grep_window_pct": saved_vs_gw,
+            "naive_full_files_tokens": telem["naive_full_files_tokens"],
+            "total_repo_tokens": total_repo_tokens,
+            "tokens_saved_vs_matched_files_pct": telem["tokens_saved_pct"],
+            "tokens_saved_vs_repo_pct": round((1.0 - telem["packet_tokens"] / max(total_repo_tokens, 1)) * 100, 1),
+            "compile_time_ms": round(elapsed_ms, 2),
+        })
+    return results
+
+
+def score_adversarial_dogfood_tasks() -> list[dict]:
+    """Unbiased / Adversarial benchmark:
+    Prompts contain ZERO exact function/class identifier names, testing how well
+    `compile_context` handles natural conceptual phrasings vs a disciplined grep+window agent.
+    """
+    repo_root = EVAL_DIR.parent
+    brain = ProjectBrain(str(repo_root))
+    brain.index()
+
+    adversarial_tasks = [
+        {
+            "id": "adv-no-id-syntax-error-refutation",
+            "prompt": "how do we stop the tool from lying when a file has a syntax error or fails to parse",
+            "expected_symbols": ["verify_claim", "_parse_status_counts"],
+        },
+        {
+            "id": "adv-no-id-stale-note",
+            "prompt": "what happens when someone edits a function that has a saved architectural note",
+            "expected_symbols": ["get_notes_for", "remember"],
+        },
+        {
+            "id": "adv-no-id-nextjs-brackets",
+            "prompt": "how are dynamic bracket segments in nextjs urls normalized",
+            "expected_symbols": ["_convert_segments", "infer_file_based_routes"],
+        },
+        {
+            "id": "adv-no-id-code-slicing",
+            "prompt": "cut out exact lines of source code for a function and build a file outline",
+            "expected_symbols": ["slice_lines", "build_file_skeleton"],
+        },
+    ]
+
+    results = []
+    for t in adversarial_tasks:
+        brain._served_slices.clear()
+        brain._served_skeletons.clear()
+        start = time.perf_counter()
+        packet = brain.compile_context(t["prompt"], budget_tokens=2500, top_n=3)
+        elapsed_ms = (time.perf_counter() - start) * 1000
+
+        sliced_symbols = {s["symbol"].split(".")[-1] for s in packet.get("target_slices", [])}
+        expected = set(t["expected_symbols"])
+        symbol_recall = len(expected & sliced_symbols) / len(expected) if expected else 1.0
+        telem = packet["token_telemetry"]
+        grep_sim = _simulate_disciplined_grep_window_agent(brain, t["prompt"], expected)
+        gw_tokens = grep_sim["grep_window_tokens"]
+        saved_vs_gw = round((1.0 - telem["packet_tokens"] / max(gw_tokens, 1)) * 100, 1)
+
+        results.append({
+            "id": t["id"],
+            "prompt": t["prompt"],
+            "expected_symbols": sorted(expected),
+            "sliced_symbols": sorted(sliced_symbols),
+            "symbol_recall": symbol_recall,
+            "packet_tokens": telem["packet_tokens"],
+            "grep_window_tokens": gw_tokens,
+            "grep_window_recall": grep_sim["grep_window_recall"],
+            "tokens_saved_vs_grep_window_pct": saved_vs_gw,
+            "compile_time_ms": round(elapsed_ms, 2),
+        })
+    return results
 
 
 def _print_report(data: dict) -> None:
@@ -286,6 +514,41 @@ def _print_report(data: dict) -> None:
         print(f"\nAggregate: {correct}/{n} exact, "
               f"false_support={false_support}, false_refutation={false_refutation}, "
               f"decisiveness={decisive}/{n} ({decisive / n:.0%})")
+
+    dogfood = data.get("dogfood_context_compiler", [])
+    if dogfood:
+        print()
+        print("=" * 70)
+        print("SELF-DOGFOODING: v2 SURGICAL CONTEXT COMPILER ON PROJECTBRAIN REPO")
+        print("Compares tokens in `brain.compile_context()` (exact target slices +")
+        print("signature skeletons) against BOTH a disciplined grep+120-line window")
+        print("agent AND reading the matched full files via view_file.")
+        print("=" * 70)
+        for d in dogfood:
+            print(f"\nTask: {d['prompt']}")
+            print(f"  Sliced symbols: {', '.join(d['sliced_symbols'])} (recall={d['symbol_recall']:.0%})")
+            print(f"  Compiled packet: {d['packet_tokens']} tokens in {d['compile_time_ms']}ms")
+            print(f"  Disciplined grep + 120-line windows: {d['grep_window_tokens']} tokens "
+                  f"(grep recall={d['grep_window_recall']:.0%}, {d['tokens_saved_vs_grep_window_pct']}% saved)")
+            print(f"  Naive full-file reads: {d['naive_full_files_tokens']} tokens "
+                  f"({d['tokens_saved_vs_matched_files_pct']}% saved vs reading matched files)")
+            print(f"  Full repo size: {d['total_repo_tokens']} tokens "
+                  f"({d['tokens_saved_vs_repo_pct']}% saved vs scanning repo)")
+
+    adv = data.get("adversarial_dogfood", [])
+    if adv:
+        print()
+        print("=" * 70)
+        print("ADVERSARIAL / ZERO-IDENTIFIER BENCHMARK (No exact function names in prompt)")
+        print("Tests natural conceptual prompts with ZERO exact symbol names leaked.")
+        print("=" * 70)
+        for a in adv:
+            print(f"\nTask [{a['id']}]: {a['prompt']}")
+            print(f"  Expected symbols: {', '.join(a['expected_symbols'])}")
+            print(f"  Sliced symbols:   {', '.join(a['sliced_symbols'])} (ProjectBrain recall={a['symbol_recall']:.0%})")
+            print(f"  Compiled packet:  {a['packet_tokens']} tokens in {a['compile_time_ms']}ms")
+            print(f"  Disciplined grep + 120-line windows: {a['grep_window_tokens']} tokens "
+                  f"(grep recall={a['grep_window_recall']:.0%}, {a['tokens_saved_vs_grep_window_pct']}% saved)")
 
     print()
     print(f"Index times (ms): {data['index_times_ms']}")

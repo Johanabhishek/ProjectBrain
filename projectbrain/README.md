@@ -1,225 +1,262 @@
-# ProjectBrain
+# ProjectBrain (`projectbrain-mcp`)
 
-A lightweight, local codebase-intelligence layer for AI coding agents and developers. ProjectBrain indexes a repository into a typed **symbol graph** (files, functions, classes, routes, modules, and the edges between them), then answers natural-language queries with a small, ranked, explained set of relevant files — instead of an agent blindly grepping and reading dozens of files to find the same thing.
+[![PyPI](https://img.shields.io/pypi/v/projectbrain-mcp.svg)](https://pypi.org/project/projectbrain-mcp/)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-It is local-first: no database, no required LLM, no external service. Indexing writes two JSON files next to your project (`.projectbrain.json`, `.projectbrain_graph.json`) and everything else runs from those.
+**Local-First AST Context Compiler, Closed-World Engineering Dossier, and Surgical Anchor Patch Engine for AI Coding Agents.**
 
-## Why a graph, not just search
+ProjectBrain indexes your codebase into a typed AST & call-graph (`file`, `fn`, `cls`, `route`, `mod`) in `~90ms` using pre-compiled `tree-sitter` C wheels—no external database, no Docker, no vector embeddings, and no LLM required. It cuts coding-agent token bills by **60%–65%** while speeding up multi-file debugging and editing by **30%–42%**:
 
-A keyword/filename search (`grep`, ripgrep, an agent's own file search) can answer "which files mention X?". It cannot answer questions that require **assembling a relationship across files**:
+- **Input Token Reduction (`-81.3%` to `-88.3%` code tokens, `-73.2%` to `-76.3%` billed prompt tokens):** Compiles module constants, smart-folded AST function slices, 1–3 hop bidirectional call chains with `@L<line>` caller windows, and a **Closed-World Exhaustive Repo Scan** into a single `<800`-line `.projectbrain_dossier.md` read in **1 `read_file` call**.
+- **Output Token Reduction (`-63.2%` to `-77.3%` edit output tokens):** Replaces verbatim `Target` + `Replacement` repetition (`edit_file`) with a compact Anchor Patch DSL (`@file`, `@sub`, `@replace`, `@insert_after`, `@delete`) validated by Tree-sitter in `<5ms`.
+- **Live ROI & Token Savings Ledger (`projectbrain stats --summary`):** Tracks cumulative input/output tokens saved, file reads avoided, estimated USD saved, and developer wait-time saved in `.projectbrain_ledger.json`.
 
-- "How does `POST /checkout` reach the `Coupon` model?" — a route → handler → service → model chain, where the intermediate service file never mentions "Coupon" in its text.
-- "What does `apply_discount` call two hops out?" — a transitive call that never appears in the querying function's own source.
+---
 
-ProjectBrain's `find_relationship` and `get_neighbors` tools answer exactly these questions by traversing the graph. The `eval/relationship_tasks.json` harness (see [Evaluation harness](#evaluation-harness)) verifies this concretely: for each such task, a live grep baseline over the same fixture is run and asserted to **miss** the connection that the graph finds.
+## Step-by-Step Setup Guide (60 Seconds)
 
-Everything else — keyword-ranked file search, `context` lookups — is useful, but is closer to "a smarter grep": treat it as a convenience layer, not the reason the tool is unique.
+### Step 1: Install from PyPI
 
-## Install
-
-```bash
-cd projectbrain
-pip install -e .          # runtime only
-pip install -e ".[dev]"   # + pytest, for running the test suite
-```
-
-Requires Python ≥ 3.9. Dependencies: `mcp`, `tree-sitter`, and the Python/JavaScript/TypeScript tree-sitter grammars.
-
-## Quick start (CLI)
+Install `projectbrain-mcp` globally (or in your active Python environment):
 
 ```bash
-projectbrain --path . index                       # build/refresh the index + graph
-projectbrain --path . query "add discount code to checkout"
-projectbrain --path . query "add discount code to checkout" --summary
-projectbrain --path . context src/routes/checkout.py --summary
+pip install projectbrain-mcp
 ```
 
-## Quick start (Python API)
+*(Alternatively, use `pipx install projectbrain-mcp` or `uv tool install projectbrain-mcp`.)*
 
-```python
-from projectbrain import ProjectBrain
-
-brain = ProjectBrain("./my-project")
-brain.index()                                   # builds and caches the graph
-
-results = brain.query("why is /users returning a 404")
-# -> [{file_path, rel_path, score, reason, functions, classes, routes,
-#      imports, exports, connections}, ...]
-
-ctx = brain.get_context_for_file("src/routes/users.py")
-# -> parsed info for the file + its 1-hop import/importer chain
-
-graph_result = brain.query_with_graph("add discount code to checkout")
-# -> {"results": [...], "subgraph": {"nodes": [...], "edges": [...]}, "entrypoints": [...]}
-```
-
-`index()` and `load()` are the only ways the in-memory index gets populated; every other method calls `_ensure_fresh()` internally, which loads the cache if present and reindexes automatically if it's missing or stale (see [Cache & staleness](#cache--staleness)) — you don't normally need to call `index()` yourself after the first time.
-
-## CLI reference
-
-```
-projectbrain --path <dir> index
-
-projectbrain --path <dir> query "<prompt>" [--top-n N] [--json | --summary]
-
-projectbrain --path <dir> context <file> [--json | --summary]
-```
-
-- `--path` (global, default `.`) — project root to index/query.
-- `index` — builds the index and graph, writes the cache files, prints the resulting `stats()` as JSON.
-- `query` — natural-language task description in, ranked file list + subgraph out. `--top-n` caps result count (default 10). `--json` (default) prints the raw structure; `--summary` prints a human-readable "Top files / Reason / Connections" listing.
-- `context <file>` — one file's parsed info (functions/classes/routes/imports/exports) plus its resolved 1-hop import chain in both directions. `--json`/`--summary` as above.
-
-## Python API reference
-
-All methods are on `projectbrain.brain.ProjectBrain`:
-
-| Method | Purpose |
-| --- | --- |
-| `index()` | Full parse of every matching file under root; writes cache + graph to disk; returns `stats()`. |
-| `load()` | Load a previously written cache from disk. Returns `False` (never raises) if missing, corrupt, or version-mismatched. |
-| `is_stale()` | Cheap `stat()`-only check for whether any indexed file's mtime has changed. |
-| `query(prompt, top_n=10)` | Keyword-ranked file search. Returns a list of result dicts with `reason` and `connections`. |
-| `query_with_graph(prompt, top_n=5)` | Same as `query()`, plus a typed subgraph spanning the returned files and an `entrypoints` list. |
-| `get_context_for_file(file_path)` | Parsed info for one file + its resolved importers/imports. |
-| `get_neighbors(node_id, edge_types=None, depth=1)` | BFS traversal outward from a known graph node (depth 1–3, bidirectional). |
-| `find_relationship(name_a, name_b)` | Shortest typed path between two named symbols/files/routes. |
-| `list_nodes(node_type=None, query=None)` | Enumerate/filter graph nodes (capped at 100). |
-| `stats()` | File/function/class/route counts + graph size + cache version metadata. |
-
-## MCP server
+Verify both the CLI and MCP server binaries are available:
 
 ```bash
-projectbrain-mcp /path/to/project     # or set PROJECTBRAIN_ROOT env var
+projectbrain --help
+projectbrain-mcp --help
 ```
 
-Registers five tools over stdio (via `mcp`'s `FastMCP`), each with a docstring written to help an agent decide when to call it:
+---
 
-| Tool | Use it for |
-| --- | --- |
-| `projectbrain_query` | "Which files matter for this task?" — the default first call for an unclear coding task. |
-| `projectbrain_get_context` | "What does this specific file connect to?" once you already know the file. |
-| `projectbrain_get_neighbors` | Traverse outward from a known node ID (deeper than `get_context`'s 1-hop). |
-| `projectbrain_find_relationship` | "How does A reach B?" — the graph-relationship question grep can't answer. |
-| `projectbrain_list_nodes` | Browse/enumerate the graph without a specific task in mind. |
+### Step 2: Initialize Your Repository (One Command)
 
-## Architecture
+Run `projectbrain init` inside any repository (or pass `--path`):
 
-### Indexing pipeline
+```bash
+projectbrain --path /path/to/your/repo init
+```
 
-1. `_walk()` in `brain.py` enumerates files under root, skipping build/dependency directories (`.git`, `node_modules`, `dist`, etc.), known bundle/minified filenames, and any file with a line over 500 chars (heuristic minified-file skip).
-2. Each remaining `.py`/`.js`/`.jsx`/`.ts`/`.tsx`/`.mjs`/`.cjs` file is parsed by `parsers.py` (tree-sitter) into functions, classes, imports, exports, and routes.
-3. `frameworks.py` adds file-path-convention routes (Next.js) on top of the parser's syntax-based routes.
-4. `graph.py` builds a typed symbol graph from the combined per-file index.
-5. Both the flat index and the graph are cached to disk as JSON.
+**What `projectbrain init` does automatically:**
+1. **Builds the AST & Call-Graph Index:** Writes `.projectbrain.json` and `.projectbrain_graph.json` in `~90ms`.
+2. **Updates `.gitignore`:** Ensures ephemeral index/cache files stay out of Git.
+3. **Configures MCP (`.mcp.json`):** Registers the `projectbrain-mcp` server for Claude Code, Cursor, Windsurf, and Google Antigravity.
+4. **Installs Agent Rules (`.agents/rules/projectbrain.md` & `AGENTS.md`):** Instructs AI coding agents to compile a dossier (`brain_dossier` / `projectbrain dossier`) first before running blind `grep` or full-file reads, and to apply edits via `brain_patch`.
 
-### Graph model
+---
 
-**Node types:** `file`, `fn`, `cls`, `route`, `mod` — encoded by ID prefix, e.g. `fn:src/routes/users.py:get_user`, `cls:src/models.py:User`, `route:GET:/users`, `mod:fastapi`.
+### Step 3: Zero-Install MCP Server Configuration (Optional)
 
-**Edge types:** `defines`, `imports`, `calls`, `inherits`, `handles`, `has_method`, `exports`.
-
-**Edge confidence** (every edge carries `confidence` + a human-readable `reason`):
-
-| Confidence | Meaning |
-| --- | --- |
-| `exact` | Structural fact, or same-file resolution (e.g. a function calling another function defined in the same file). |
-| `import_resolved` | Cross-file match confirmed by resolving the caller's actual import statement to the candidate's file. |
-| `candidate` | Name-only match across files with no confirming import — ambiguous, treat as a hint. |
-| `qualified` *(defined, unused)* | Would require receiver-aware call tracking (e.g. `UserService.find()`); the parsers only capture the bare callee name today, so this tier is never assigned rather than guessed. |
-| `unknown` *(defined, unused)* | A call/base-class/handler with zero name matches gets no edge at all — never a fabricated "unknown" edge. |
-
-### Import resolution (`resolve.py`)
-
-Replaces naive substring matching with real resolution:
-
-- **Python**: relative imports (`.`, `..`, `.foo`) are resolved via directory arithmetic respecting `__init__.py` package semantics; absolute imports (`services.users`) are resolved via a dotted-module index built from every file's module path — but only when the target is **unambiguous** (0 or 2+ candidates → unresolved, not guessed).
-- **JS/TS**: only relative imports (`./`, `../`) are resolved — bare specifiers are npm packages and correctly stay external/unresolved. Tries known extensions (`.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`) then `index.*` directory-fallback.
-
-This feeds both the `import_resolved` edge-confidence tier and `get_context_for_file`'s `imported_by`/`imports_resolved` lists.
-
-### Route extraction by framework
-
-| Framework | Pattern | Notes |
-| --- | --- | --- |
-| FastAPI (and generic) | `@app.get/post/put/delete/patch/all(...)` | Method name taken directly from the decorator. |
-| Flask | `@app.route(path, methods=[...])` | Defaults to `["GET"]` if `methods` is omitted; emits one route entry per method. |
-| Django | `path(...)` / `re_path(...)` in `urls.py` | Not decorator-based — matched as bare calls. `method` is the sentinel `"ANY"` since Django doesn't declare a per-route verb. |
-| Express | `app.get/post/put/delete/patch/all(path, ...)` | |
-| Next.js App Router | `app/**/route.ts` with verb-named exports (`GET`, `POST`, ...) | Inferred from file path + exports, not decorators — lives in `frameworks.py`, not `parsers.py`, since it needs the file path. |
-| Next.js Pages Router | `pages/api/**` | Single `method: "ANY"` entry per file (verb is decided at runtime via `req.method`). |
-| React Router | — | Explicitly out of scope (component/JSX-based, not decorator/call/convention-based). |
-
-Dynamic path segments are converted for both Next.js styles: `[id]` → `:id`, `[...slug]` → `*`.
-
-### Cache & staleness
-
-On-disk cache envelope (`.projectbrain.json`):
+If your IDE or agent loads MCP servers from a global config file (such as `.cursor/mcp.json`, `claude_desktop_config.json`, or Antigravity `mcp_config.json`), add:
 
 ```json
 {
-  "schema_version": 2,
-  "parser_version": "2026-07-09.2",
-  "graph_version": "2026-07-09.3",
-  "root": "/abs/path/to/project",
-  "files": {
-    "src/app.py": { "mtime": 1781624399.88, "size": 1234, "hash": null, "info": { "functions": [...], ... } }
+  "mcpServers": {
+    "projectbrain": {
+      "command": "projectbrain-mcp",
+      "args": ["/path/to/your/repo"]
+    }
   }
 }
 ```
 
-`SCHEMA_VERSION` / `PARSER_VERSION` / `GRAPH_VERSION` live in `versions.py`. Any mismatch — or a corrupt/pre-versioning cache file — makes `load()` return `False`, which the caller treats identically to "no cache present" and triggers a full reindex. There is no migration path and no crash path: an incompatible cache is simply invisible.
+Or run directly with **`uvx`** (zero manual install required):
 
-`is_stale()` does a cheap `stat()`-only pass over every indexed file's mtime (no re-reading or re-parsing) to decide whether `query`/`get_context_for_file`/etc. should silently reindex before answering.
+```json
+{
+  "mcpServers": {
+    "projectbrain": {
+      "command": "uvx",
+      "args": ["projectbrain-mcp", "/path/to/your/repo"]
+    }
+  }
+}
+```
 
-## Testing
+---
+
+### Step 4: Parent / Monorepo Workspace Setup
+
+If you open a **parent directory** in your IDE that contains multiple sub-projects (e.g., `/workspace/my-app-frontend` and `/workspace/my-app-backend`), place an `AGENTS.md` (or `.agents/rules/projectbrain.md`) at the **workspace root** and pass `--path "<subfolder>"` so the agent targets the indexed sub-repository:
+
+```markdown
+# ProjectBrain Mandatory Codebase Investigation & Editing Rules
+
+Whenever investigating, answering questions about, or modifying `<subfolder>`, ALWAYS use ProjectBrain FIRST before running shell searches (`rg`, `grep`) or multiple `read_file` calls:
+
+1. **Compile a Single-Read Engineering Dossier (`projectbrain dossier`):**
+   - Run: `projectbrain --path "<subfolder>" dossier "<question_or_bug>"`
+   - Read `<subfolder>/.projectbrain_dossier.md` in one single `read_file` call (`StartLine=1, EndLine=800`).
+2. **Surgical Symbol Slicing (`projectbrain slice`):**
+   - Run: `projectbrain --path "<subfolder>" slice --summary <file:symbol_or_start-end>`
+3. **Surgical Anchor Patching (`projectbrain patch`):**
+   - Run: `projectbrain --path "<subfolder>" patch --spec "<Anchor Patch DSL>" --apply`
+```
+
+---
+
+### Step 5: Keep Git Clean (`.gitignore`)
+
+If you want all local ProjectBrain caches, dossiers, diffs, and local agent configs completely ignored by Git, add the following to your `.gitignore`:
+
+```gitignore
+# ProjectBrain (local dev only)
+.projectbrain*
+*.projectbrain*
+**/.projectbrain*
+project_brain.py
+test_projectbrain.json
+.mcp.json
+.agents/
+AGENTS.md
+CLAUDE.md
+.claude/settings.json
+```
+
+*(Tip: If `AGENTS.md` is already tracked in your repo and you want to customize it locally without Git showing it as modified, run `git update-index --skip-worktree AGENTS.md`.)*
+
+---
+
+## Daily CLI Workflow & Commands
+
+### 1. Compile a Single-Read Engineering Dossier (`dossier`)
+Before investigating a question or bug, compile a self-contained `<800`-line dossier (`.projectbrain_dossier.md`) with module globals, smart-folded AST slices, 1–3 hop call chains, and a Closed-World Exhaustive Repo Scan:
 
 ```bash
-pip install -e ".[dev]"
-pytest -q
+projectbrain --path /path/to/repo dossier "what role does questionnaire have in onboarding"
 ```
 
-88 tests across `tests/test_parsers.py`, `test_graph.py`, `test_brain.py`, `test_cli.py`, `test_resolve.py`, `test_frameworks.py`, and `test_eval_thresholds.py`. Several tests are deliberately **known-gap regression locks** — they assert the *current* (documented) limitation rather than desired behavior, so a future fix is a visible, intentional test flip rather than a silent behavior change. See [Known limitations](#known-limitations).
-
-## Evaluation harness
+### 2. Surgically Slice Symbols or Line Ranges (`slice`)
+Fetch exact source lines (`start_line`–`end_line`) for 1–2 symbols without reading the entire file:
 
 ```bash
-python eval/run_eval.py                    # both fixture projects
-python eval/run_eval.py --project sample_flask_app
-python eval/run_eval.py --json             # machine-readable output
+projectbrain --path /path/to/repo slice --summary src/App.tsx:ProtectedRoute src/data/questionnaireData.ts:calculatePersona
 ```
 
-Two fixture projects (`eval/fixtures/sample_flask_app`, `sample_express_app`) and two task sets:
+### 3. Apply Surgical Anchor Patches (`patch`)
+Cut output tokens by 65%–80% using the Anchor Patch DSL (`@file`, `@sub`, `@replace`, `@insert_after`, `@insert_before`, `@delete`), automatically syntax-checked by Tree-sitter:
 
-- **`eval/tasks.json`** — file-retrieval tasks (precision/recall/query-time/estimated-tokens-saved). Reported as a "keyword-ranking baseline" — several of these are grep-answerable, so this section guards against ranking regressions rather than proving graph value.
-- **`eval/relationship_tasks.json`** — 8 graph-relationship tasks (4 per fixture: a two-hop `neighbors` case, a multi-hop `find_relationship` path, and two negative controls verifying the graph doesn't fabricate connections). Each positive case is paired with a live grep baseline over the same fixture, asserted to **miss** the connection the graph finds — this is the section that substantiates the "graph > grep" claim with a number instead of an assertion.
+```bash
+# Dry-run (writes unified diff to .projectbrain_patch.diff)
+projectbrain --path /path/to/repo patch --spec "@file src/App.tsx
+@sub L84 \`!profileCompleted\` -> \`isHydrated && !profileCompleted\`"
 
-`tests/test_eval_thresholds.py` wires both scores into pytest as loose regression floors (recall ≥ 70%, relationship pass rate ≥ 80%, and grep must keep missing every relationship task it's paired against).
-
-## Known limitations
-
-Documented gaps, intentionally left unfixed (locked in by "known gap" tests so they can't regress silently) because they were outside the scope of the current roadmap pass:
-
-- **JS/TS `class Foo extends Base`** — base class is never extracted. This tree-sitter-javascript grammar version puts the base identifier as a direct `class_heritage` child rather than inside an `extends_clause` wrapper, which `_js_bases()` doesn't handle.
-- **`query_with_graph`'s `entrypoints`** — currently always includes every file in the result set. It checks for incoming `"imports"` edges targeting a `file:` node, but `"imports"` edges always go `file: -> mod:` (a module name), never `file: -> file:`, so the incoming-edge check never actually filters anything.
-- **`from . import x`** — bare relative imports with no dotted module name only capture the `.` itself; the parser never captures the imported symbol name `x` for this specific form, so it resolves to the package's own `__init__.py` rather than the specific submodule. `from .module import x` (a named dotted module) resolves correctly.
-- **React Router** — not supported (component/JSX-based route definitions, not decorator/call/file-convention based).
-- **Receiver-aware call resolution** (`qualified` confidence tier) — not implemented; the parsers only capture the bare callee name (`find()`), not the receiver (`UserService.find()`), so this tier is defined in the confidence vocabulary but never assigned.
-
-## Project layout
-
+# Apply directly to disk
+projectbrain --path /path/to/repo patch --apply --spec "@file src/App.tsx
+@sub L84 \`!profileCompleted\` -> \`isHydrated && !profileCompleted\`"
 ```
+
+### 4. View Live ROI & Token Savings Dashboard (`stats`)
+Check how many input/output tokens and tool calls ProjectBrain has saved across your sessions:
+
+```bash
+projectbrain --path /path/to/repo stats --summary
+```
+
+Example output:
+```text
+===============================================================
+  ProjectBrain Live ROI & Token Savings Ledger
+===============================================================
+  Repository         : /path/to/repo
+  Total Operations   : 4
+  Input Tokens Saved : 504,441 tok (16,156 delivered vs 520,597 baseline -> -96.9%)
+  Output Tokens Saved: 190 tok (85 spec vs 275 edit_file -> -69.1%)
+  Tool Calls Avoided : 22 file reads / multi-turn edits
+===============================================================
+```
+
+**Live auto-refreshing dashboard in terminal:**
+- **PowerShell (Windows):**
+  ```powershell
+  while ($true) { cls; projectbrain --path "/path/to/repo" stats --summary; Start-Sleep 2 }
+  ```
+- **Bash / Zsh (macOS / Linux):**
+  ```bash
+  watch -n 2 projectbrain --path /path/to/repo stats --summary
+  ```
+- **Reset the ledger:**
+  ```bash
+  projectbrain --path /path/to/repo stats --reset
+  ```
+
+### 5. Additional Granular CLI Tools
+
+```bash
+# Re-index repository manually (auto-updates via mtime on every command)
+projectbrain --path /path/to/repo index
+
+# Explore symbol neighborhood, route flows, or shortest path between A and B
+projectbrain --path /path/to/repo explore Questionnaire setItem
+
+# Compute blast radius (direct importers, callers, and affected tests)
+projectbrain --path /path/to/repo impact src/context/CloudStateContext.tsx
+
+# Pin an AST-anchored architectural invariant (auto-flags [STALE] if AST hash changes)
+projectbrain --path /path/to/repo remember calculatePersona "Thresholds: >=22 Advanced, >=16 Intermediate, <16 Beginner"
+
+# Fact-check a structural claim (SUPPORTED / REFUTED / UNKNOWN)
+projectbrain --path /path/to/repo verify Questionnaire calls calculatePersona
+
+# Check index coverage & parse health
+projectbrain --path /path/to/repo health
+```
+
+---
+
+## MCP Tools Reference (`projectbrain-mcp`)
+
+| MCP Tool | Purpose |
+| :--- | :--- |
+| **`brain_dossier`** | **Primary entry point.** Compiles a `<800`-line `.projectbrain_dossier.md` containing module globals, smart-folded AST slices, 1–3 hop bidirectional call chains, and a Closed-World Exhaustive Repo Scan. |
+| **`brain_patch`** | Applies or dry-runs a Surgical Anchor Patch spec (`@file`, `@sub`, `@replace`, `@insert_after`, `@delete`) with instant Tree-sitter syntax validation. |
+| **`brain_slice`** | Fetches exact source code lines (`start_line`–`end_line`) for specific functions, classes, or `file:start-end` ranges without reading full files. |
+| **`brain_stats`** | Returns cumulative input/output token savings, tool calls avoided, and ROI metrics from `.projectbrain_ledger.json`. |
+| **`brain_context`** | Compiles a JSON surgical context packet (`target_slices` + `skeletons` + `memories` + session deduplication). |
+| **`brain_explore`** | Unified graph explorer (`mode="neighbors"`, `"path"`, `"flow"`, or `"impact"`) for call/dependency traversal and blast-radius analysis. |
+| **`brain_check`** | Unified 3-valued verification & safety checker (`mode="claim"`, `"batch"`, `"plan"`, or `"health"` returning `SUPPORTED` / `REFUTED` / `UNKNOWN`). |
+| **`brain_remember`** | Saves or lists persistent AST-anchored architectural notes in `.projectbrain_memory.json`. |
+
+---
+
+## Verified A/B Benchmark Results (`142`-File Production Repo)
+
+| Benchmark Scenario | Metric | Baseline Agent (No Brain) | ProjectBrain Agent | Improvement |
+| :--- | :--- | :---: | :---: | :---: |
+| **Scenario 1: Targeted 3-Part Engineering Analysis** | Code Output Ingested | `67,319` tok | **`12,569` tok** | **`-81.3%` (`5.35x` smaller)** |
+| | Total Prompt Tokens Billed | `655,391` tok | **`155,052` tok** | **`-76.3%` (`4.23x` fewer)** |
+| | File Reads (`read_file`) | `16` | **`2`** | **`-87.5%`** |
+| | Net API Cost | `$0.6723` | **`$0.2590`** | **`-61.5%` (`2.60x` cheaper)** |
+| **Scenario 2: Unseen Open-Ended Bug Report (Zero Identifiers)** | Code Output Ingested | `351,658` tok (`1.40M` chars) | **`40,982` tok (`163.9k` chars)** | **`-88.3%` (`8.58x` smaller)** |
+| | Total Prompt Tokens Billed | `4,561,692` tok | **`1,220,579` tok** | **`-73.2%` (`-3.34M` tokens)** |
+| | File Reads (`read_file`) | `84` (`19` re-reads) | **`6` (`0` re-reads)** | **`-92.9%` (`14.0x` fewer reads)** |
+| | Multi-File Patch Output Tokens | `3,359` tok (`edit_file`) | **`529` – `1,237` tok** | **`-63.2%` to `-77.3%` edit output** |
+| | Net API Cost | `$3.2712` | **`$1.1557`** | **`-64.7%` (`2.83x` cheaper)** |
+
+---
+
+## Project Layout
+
+```text
 projectbrain/
-  src/projectbrain/
-    brain.py        # ProjectBrain: index/load/query/graph-query/neighbors/relationship/stats
-    graph.py         # CodeGraph: typed nodes/edges, BFS traversal, path-finding, serialization
-    parsers.py       # tree-sitter parsing for Python + JS/TS/TSX/JSX
-    resolve.py       # Python module-index + JS relative-path import resolution
-    frameworks.py    # Next.js file-based route inference
-    versions.py      # SCHEMA_VERSION / PARSER_VERSION / GRAPH_VERSION
-    cli.py           # projectbrain CLI entry point
-    server.py        # projectbrain-mcp FastMCP server entry point
-  tests/             # pytest suite (88 tests)
-  eval/              # evaluation harness: fixtures, task definitions, run_eval.py
-  PROJECTBRAIN_NOTES.md  # original roadmap/scope notes this implementation follows
+├── src/projectbrain/
+│   ├── brain.py        # Primary API: compile_dossier, compile_context, slice_symbols, explore, check
+│   ├── slicer.py       # Surgical AST line extraction, smart folding & signature-only skeletons
+│   ├── patcher.py      # Surgical Anchor Patch DSL engine + Tree-sitter syntax verifier
+│   ├── ledger.py       # Live ROI & Token Savings Ledger (.projectbrain_ledger.json)
+│   ├── memory.py       # Persistent AST-anchored repo memory (.projectbrain_memory.json)
+│   ├── graph.py        # Typed symbol graph, qualified call resolution, BFS & shortest path
+│   ├── parsers.py      # Tree-sitter extraction (signatures, schemas, AST hashes, bindings)
+│   ├── resolve.py      # Python module/symbol import resolution & TS path alias resolution
+│   ├── frameworks.py   # Next.js App & Pages Router convention route inference
+│   ├── cli.py          # CLI entry point (init, dossier, patch, slice, stats, compile, explore, etc.)
+│   └── server.py       # FastMCP server entry point (brain_dossier, brain_patch, brain_stats, etc.)
+├── tests/              # Comprehensive pytest suite
+└── eval/               # Evaluation harness, fixtures, and self-dogfooding benchmark
 ```

@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import json
 from collections import deque
-from pathlib import Path
 
 
 # ── Node ID helpers ─────────────────────────────────────────────────────────
@@ -62,9 +61,15 @@ class CodeGraph:
         self.edges.append(edge)
 
     @classmethod
-    def build(cls, index: dict, import_targets: dict[str, list[str]] | None = None) -> "CodeGraph":
+    def build(
+        cls,
+        index: dict,
+        import_targets: dict[str, list[str]] | None = None,
+        symbol_imports: dict[str, dict[str, str]] | None = None,
+    ) -> "CodeGraph":
         g = cls()
         import_targets = import_targets or {}
+        symbol_imports = symbol_imports or {}
         registry: dict[str, list[str]] = {}  # name → [node_id, ...]
 
         def _reg(name: str, node_id: str) -> None:
@@ -82,10 +87,12 @@ class CodeGraph:
                     "type": "fn",
                     "rel_path": rel_path,
                     "name": fn["name"],
+                    "signature": fn.get("signature", ""),
                     "line_start": fn.get("line_start"),
                     "line_end": fn.get("line_end"),
                     "is_method": fn.get("is_method", False),
                     "parent_class": parent,
+                    "ast_hash": fn.get("ast_hash", ""),
                 }
                 _reg(fn["name"], nid)
                 if parent:
@@ -97,8 +104,11 @@ class CodeGraph:
                     "type": "cls",
                     "rel_path": rel_path,
                     "name": c["name"],
+                    "signature": c.get("signature", ""),
                     "line_start": c.get("line_start"),
                     "line_end": c.get("line_end"),
+                    "fields": c.get("fields", []),
+                    "ast_hash": c.get("ast_hash", ""),
                 }
                 _reg(c["name"], nid)
 
@@ -119,35 +129,116 @@ class CodeGraph:
                     g.nodes[nid] = {"type": "mod", "name": imp}
 
         # ── Pass 2: edges ────────────────────────────────────────────────────
-        # Confidence vocabulary: exact / qualified / import_resolved / candidate / unknown.
-        # This pass only assigns "exact" (structural facts, or same-file resolution)
-        # and "candidate" (name-only match, ambiguous target). "import_resolved"
-        # is assigned later by a second build pass once an import resolver is
-        # available. "qualified" (receiver-aware, e.g. UserService.find()) is not
-        # assignable at all today — the parsers only capture the bare callee name,
-        # not the receiver — so it stays defined but unused rather than guessed.
-        # "unknown" likewise stays unused: a call/base/handler with zero name
-        # matches gets no edge at all, never a fabricated "unknown" edge.
         for rel_path, info in index.items():
             fid = file_id(rel_path)
+            file_imports = set(import_targets.get(rel_path, []))
+            file_sym_map = symbol_imports.get(rel_path, {})
 
             for fn in info.get("functions", []):
                 parent = fn.get("parent_class")
                 nid = fn_id(rel_path, fn["name"], parent)
                 g._add_edge(fid, nid, "defines", "exact", "direct definition in file")
 
-                # calls edges (name-based, capped at 2 per name)
                 call_sites = fn.get("call_sites", {})
+                qualified_calls = fn.get("qualified_calls", {})
+                added_call_dsts: set[str] = set()
+
+                # 1. Resolve receiver-qualified calls first (e.g. self.foo(), ClassName.foo(), mod.foo())
+                for qual_expr, q_line in qualified_calls.items():
+                    parts = qual_expr.split(".")
+                    if len(parts) < 2:
+                        continue
+                    receiver = parts[0]
+                    callee_name = parts[-1]
+
+                    # Case A: `self.method()` or `this.method()` inside a class method
+                    if receiver in ("self", "this", "cls") and parent:
+                        same_cls_id = fn_id(rel_path, callee_name, parent)
+                        if same_cls_id in g.nodes and same_cls_id != nid:
+                            g._add_edge(
+                                nid, same_cls_id, "calls", "exact",
+                                f"'{qual_expr}()' resolved to method on enclosing class {parent}",
+                                line=q_line,
+                            )
+                            added_call_dsts.add(same_cls_id)
+                            continue
+
+                    # Case B: `ReceiverClass.method()` or `receiver_instance.method()`
+                    # Check if receiver is an imported module/symbol
+                    if receiver in file_sym_map:
+                        target_file = file_sym_map[receiver]
+                        # Could be `module.func()` or `ImportedClass.method()`
+                        direct_fn = fn_id(target_file, callee_name)
+                        qual_fn = fn_id(target_file, callee_name, receiver)
+                        if qual_fn in g.nodes and qual_fn != nid:
+                            g._add_edge(
+                                nid, qual_fn, "calls", "import_resolved",
+                                f"'{qual_expr}()' resolved via imported class '{receiver}' from {target_file}",
+                                line=q_line,
+                            )
+                            added_call_dsts.add(qual_fn)
+                            continue
+                        if direct_fn in g.nodes and direct_fn != nid:
+                            g._add_edge(
+                                nid, direct_fn, "calls", "import_resolved",
+                                f"'{qual_expr}()' resolved via imported module '{receiver}' from {target_file}",
+                                line=q_line,
+                            )
+                            added_call_dsts.add(direct_fn)
+                            continue
+
+                    # Case C: Qualified match by class name (`ClassName.method` in registry)
+                    qual_candidates = registry.get(f"{receiver}.{callee_name}", [])
+                    if len(qual_candidates) == 1:
+                        cand = qual_candidates[0]
+                        if cand != nid and cand not in added_call_dsts:
+                            cand_file = g.nodes.get(cand, {}).get("rel_path")
+                            conf = "exact" if cand_file == rel_path else (
+                                "import_resolved" if cand_file in file_imports else "qualified"
+                            )
+                            g._add_edge(
+                                nid, cand, "calls", conf,
+                                f"'{qual_expr}()' matched uniquely to {receiver}.{callee_name}",
+                                line=q_line,
+                            )
+                            added_call_dsts.add(cand)
+
+                # 2. Resolve bare/remaining calls
                 for callee_name in fn.get("calls", []):
                     line = call_sites.get(callee_name)
-                    candidates = registry.get(callee_name, [])
-                    for cand in candidates[:2]:
-                        if cand == nid:
+                    candidates = [c for c in registry.get(callee_name, []) if c != nid]
+                    if not candidates:
+                        continue
+
+                    same_file = [
+                        cand for cand in candidates
+                        if g.nodes.get(cand, {}).get("rel_path") == rel_path
+                    ]
+                    cross_file = [
+                        cand for cand in candidates
+                        if g.nodes.get(cand, {}).get("rel_path") != rel_path
+                    ]
+
+                    for cand in same_file:
+                        if cand not in added_call_dsts:
+                            g._add_edge(nid, cand, "calls", "exact", "same-file function call", line=line)
+                            added_call_dsts.add(cand)
+
+                    cross_file.sort(
+                        key=lambda c: (
+                            0
+                            if (
+                                g.nodes.get(c, {}).get("rel_path") in file_imports
+                                or file_sym_map.get(callee_name) == g.nodes.get(c, {}).get("rel_path")
+                            )
+                            else 1
+                        )
+                    )
+                    for cand in cross_file[:2]:
+                        if cand in added_call_dsts:
                             continue
                         cand_rel_path = g.nodes.get(cand, {}).get("rel_path")
-                        if cand_rel_path == rel_path:
-                            g._add_edge(nid, cand, "calls", "exact", "same-file function call", line=line)
-                        elif cand_rel_path in import_targets.get(rel_path, []):
+                        if cand_rel_path in file_imports or file_sym_map.get(callee_name) == cand_rel_path:
                             g._add_edge(
                                 nid, cand, "calls", "import_resolved",
                                 f"'{callee_name}' resolved via import from {cand_rel_path}",
@@ -156,10 +247,11 @@ class CodeGraph:
                         else:
                             g._add_edge(
                                 nid, cand, "calls", "candidate",
-                                f"'{callee_name}' matches {len(candidates)} function(s) by "
+                                f"'{callee_name}' matches {len(candidates)} symbol(s) by "
                                 "name; target ambiguous without import resolution",
                                 line=line,
                             )
+                        added_call_dsts.add(cand)
 
             for c in info.get("classes", []):
                 cid = cls_id(rel_path, c["name"])
@@ -174,16 +266,14 @@ class CodeGraph:
                             "method defined directly in class body",
                         )
 
-                # inherits edges (capped at 2 per base name)
+                # inherits edges
                 for base_name in c.get("bases", []):
-                    candidates = registry.get(base_name, [])
+                    candidates = [cand for cand in registry.get(base_name, []) if cand != cid]
                     for cand in candidates[:2]:
-                        if cand == cid:
-                            continue
                         cand_rel_path = g.nodes.get(cand, {}).get("rel_path")
                         if cand_rel_path == rel_path:
                             g._add_edge(cid, cand, "inherits", "exact", "same-file base class")
-                        elif cand_rel_path in import_targets.get(rel_path, []):
+                        elif cand_rel_path in file_imports or file_sym_map.get(base_name) == cand_rel_path:
                             g._add_edge(
                                 cid, cand, "inherits", "import_resolved",
                                 f"'{base_name}' resolved via import from {cand_rel_path}",
@@ -211,7 +301,6 @@ class CodeGraph:
                 rid = route_id(r["method"], r["path"])
                 handler = r.get("handler")
                 if handler:
-                    # prefer same-file handler
                     local = fn_id(rel_path, handler)
                     if local in g.nodes:
                         g._add_edge(
@@ -221,10 +310,11 @@ class CodeGraph:
                         )
                     else:
                         for cand in registry.get(handler, [])[:1]:
+                            cand_file = g.nodes.get(cand, {}).get("rel_path")
+                            conf = "import_resolved" if cand_file in file_imports else "candidate"
                             g._add_edge(
-                                rid, cand, "handles", "candidate",
-                                f"handler '{handler}' matched by name in another file "
-                                "(not import-verified)",
+                                rid, cand, "handles", conf,
+                                f"handler '{handler}' matched in {cand_file}",
                                 line=r.get("line"),
                             )
 
@@ -309,13 +399,7 @@ class CodeGraph:
     def find_directed_path(
         self, from_id: str, to_id: str, edge_types: set[str] | None = None
     ) -> list[dict]:
-        """BFS shortest path following edges in the FORWARD direction only.
-
-        Unlike find_path (which walks both directions to answer "are these
-        connected at all"), this answers "does control actually flow from A to B"
-        — the honest basis for a `reaches` claim. Restrict to `edge_types`
-        (e.g. {"calls", "handles"}) to follow real call flow, not definitions.
-        """
+        """BFS shortest path following edges in the FORWARD direction only."""
         if from_id not in self.nodes or to_id not in self.nodes or from_id == to_id:
             return []
         queue: deque = deque([(from_id, [])])
@@ -347,18 +431,25 @@ class CodeGraph:
         }
 
     def find_nodes_by_name(self, name: str) -> list[str]:
-        name_lower = name.lower()
-        matches = []
+        name_lower = name.lower().strip()
+        exact_matches = []
+        partial_matches = []
         for node_id, nd in self.nodes.items():
+            nd_name = (nd.get("name") or nd.get("path") or nd.get("rel_path") or "").lower()
+            route_label = f"{nd.get('method', '')} {nd.get('path', '')}".strip().lower()
+            if nd_name == name_lower or node_id.lower() == name_lower or (route_label and route_label == name_lower):
+                exact_matches.append(node_id)
+                continue
             searchable = " ".join([
                 node_id,
                 nd.get("name", ""),
                 nd.get("rel_path", ""),
-                nd.get("path", ""),     # route path field
+                nd.get("path", ""),
+                route_label,
             ]).lower()
             if name_lower in searchable:
-                matches.append(node_id)
-        return matches
+                partial_matches.append(node_id)
+        return exact_matches + partial_matches
 
     # ── serialization ────────────────────────────────────────────────────────
 

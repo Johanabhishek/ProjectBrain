@@ -77,3 +77,18 @@ def test_claim_decisiveness_floor():
 
     decisive = sum(c["actual"] != "UNKNOWN" for c in claims) / len(claims)
     assert decisive >= 0.6, f"claim decisiveness regressed: {decisive:.0%}"
+
+
+def test_dogfood_context_compiler_token_savings_and_recall_floor():
+    """Verify that ProjectBrain v2's surgical AST context compiler achieves high
+    symbol recall (>= 80%) and massive token savings (>= 75% vs reading full
+    matched files) when dogfooding on ProjectBrain's own codebase."""
+    data = run()
+    dogfood = data.get("dogfood_context_compiler", [])
+    assert dogfood
+
+    avg_recall = sum(d["symbol_recall"] for d in dogfood) / len(dogfood)
+    avg_saved = sum(d["tokens_saved_vs_matched_files_pct"] for d in dogfood) / len(dogfood)
+    assert avg_recall >= 0.8, f"dogfood context compiler recall regressed: {avg_recall:.0%}"
+    assert avg_saved >= 75.0, f"dogfood token savings regressed: {avg_saved:.1f}%"
+

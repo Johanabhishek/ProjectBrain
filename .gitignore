@@ -4,6 +4,15 @@ __pycache__/
 build/
 dist/
 
+# Secrets & Environment Variables
+.env
+.env.*
+.pypirc
+
 # ProjectBrain regenerable cache/index artifacts
 .projectbrain.json
 .projectbrain_graph.json
+.projectbrain_session.json
+.projectbrain_ledger.json
+.projectbrain_dossier.md
+.projectbrain_patch.diff

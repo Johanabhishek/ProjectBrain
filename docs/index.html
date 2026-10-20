@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ProjectBrain — Codebase Intelligence for AI Agents</title>
-  <meta name="description" content="A local-first intelligence layer that helps AI coding agents find the right files, in the right order, with reasons — instead of scanning blindly." />
+  <title>ProjectBrain (projectbrain-mcp) — AST Context Compiler & Setup Guide for AI Agents</title>
+  <meta name="description" content="Local-first AST Context Compiler, Closed-World Engineering Dossier, and Surgical Anchor Patch Engine for AI Coding Agents. Cuts token bills by 60–65%." />
   <style>
     /* ── Reset & Base ──────────────────────────────────────────────── */
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -22,7 +22,7 @@
       --code-bg:   #161b22;
       --code-text: #c9d1d9;
       --radius:    8px;
-      --max-w:     960px;
+      --max-w:     980px;
     }
 
     html { scroll-behavior: smooth; font-size: 16px; }
@@ -76,7 +76,7 @@
     .container { max-width: var(--max-w); margin: 0 auto; padding: 0 1.5rem; }
 
     section {
-      padding: 5rem 0;
+      padding: 4.5rem 0;
       border-bottom: 1px solid var(--border);
     }
 
@@ -87,7 +87,7 @@
       position: sticky;
       top: 0;
       z-index: 100;
-      background: rgba(11, 15, 25, 0.85);
+      background: rgba(11, 15, 25, 0.88);
       backdrop-filter: blur(12px);
       -webkit-backdrop-filter: blur(12px);
       border-bottom: 1px solid var(--border);
@@ -98,6 +98,8 @@
       display: flex;
       align-items: center;
       justify-content: space-between;
+      flex-wrap: wrap;
+      gap: 1rem;
     }
 
     .nav-brand {
@@ -107,7 +109,7 @@
       letter-spacing: -0.01em;
     }
 
-    .nav-links { display: flex; gap: 1.75rem; }
+    .nav-links { display: flex; gap: 1.5rem; flex-wrap: wrap; }
 
     .nav-links a {
       color: var(--text-dim);
@@ -120,21 +122,27 @@
 
     /* ── Hero ───────────────────────────────────────────────────────── */
     .hero {
-      padding: 7rem 0 5rem;
+      padding: 6.5rem 0 4.5rem;
       text-align: center;
       border-bottom: 1px solid var(--border);
     }
 
-    .hero h1 { margin-bottom: 1.5rem; }
-
+    .hero h1 { margin-bottom: 1.25rem; }
     .hero h1 span { color: var(--accent); }
 
     .hero .subtitle {
-      font-size: 1.2rem;
+      font-size: 1.15rem;
       color: var(--text-dim);
-      max-width: 640px;
-      margin: 0 auto 2.5rem;
+      max-width: 720px;
+      margin: 0 auto 2.25rem;
       line-height: 1.65;
+    }
+
+    .hero-install-group {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 0.75rem;
     }
 
     .hero-install {
@@ -142,24 +150,64 @@
       background: var(--code-bg);
       border: 1px solid var(--border);
       border-radius: var(--radius);
-      padding: 0.75rem 1.75rem;
+      padding: 0.85rem 1.75rem;
       font-family: "JetBrains Mono", "Fira Code", monospace;
-      font-size: 1rem;
+      font-size: 0.95rem;
       color: var(--accent-2);
       letter-spacing: 0.01em;
+      text-align: left;
     }
 
     .hero-badges {
       margin-top: 1.75rem;
       display: flex;
       justify-content: center;
-      gap: 2rem;
+      gap: 1.75rem;
       flex-wrap: wrap;
       font-size: 0.85rem;
       color: var(--text-dim);
     }
 
     .hero-badges span { white-space: nowrap; }
+
+    /* ── Setup Steps ────────────────────────────────────────────────── */
+    .setup-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.75rem;
+      margin-top: 1.5rem;
+    }
+
+    .setup-card h3 {
+      display: flex;
+      align-items: center;
+      gap: 0.75rem;
+      margin-bottom: 0.75rem;
+      color: var(--heading);
+    }
+
+    .setup-step-badge {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(88, 166, 255, 0.15);
+      color: var(--accent);
+      font-size: 0.75rem;
+      font-weight: 700;
+      padding: 0.2rem 0.65rem;
+      border-radius: 999px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+    }
+
+    .setup-card p {
+      color: var(--text-dim);
+      font-size: 0.95rem;
+      margin-bottom: 1rem;
+    }
+
+    .setup-card pre { margin-bottom: 0.5rem; }
 
     /* ── Problem ────────────────────────────────────────────────────── */
     .problem-grid {
@@ -184,7 +232,7 @@
     .steps {
       display: grid;
       grid-template-columns: repeat(3, 1fr);
-      gap: 2rem;
+      gap: 1.75rem;
       margin-top: 2rem;
     }
 
@@ -192,7 +240,7 @@
       background: var(--surface);
       border: 1px solid var(--border);
       border-radius: var(--radius);
-      padding: 2rem 1.5rem;
+      padding: 1.75rem 1.5rem;
     }
 
     .step-number {
@@ -243,13 +291,13 @@
 
     .tag-core     { background: rgba(88,166,255,0.15); color: var(--accent); }
     .tag-unique   { background: rgba(210,168,255,0.15); color: var(--accent-3); }
-    .tag-planned  { background: rgba(63,185,80,0.15); color: var(--accent-2); }
+    .tag-roi      { background: rgba(63,185,80,0.15); color: var(--accent-2); }
 
-    /* ── Comparison ────────────────────────────────────────────────── */
+    /* ── Comparison / Benchmarks ───────────────────────────────────── */
     .comparison-table {
       width: 100%;
       border-collapse: collapse;
-      margin-top: 2rem;
+      margin-top: 1.5rem;
       font-size: 0.9rem;
     }
 
@@ -270,12 +318,12 @@
 
     .comparison-table td:first-child { color: var(--heading); font-weight: 500; }
 
-    .check  { color: var(--accent-2); }
-    .cross  { color: var(--text-dim); }
+    .check   { color: var(--accent-2); font-weight: 600; }
+    .cross   { color: var(--text-dim); }
     .partial { color: #d29922; }
 
     /* ── Code Demo ─────────────────────────────────────────────────── */
-    .demo-block { margin-top: 2rem; }
+    .demo-block { margin-top: 1.75rem; }
 
     .demo-block .demo-label {
       font-size: 0.75rem;
@@ -293,43 +341,6 @@
     .param   { color: #ffa657; }
     .type    { color: #79c0ff; }
 
-    /* ── Architecture ──────────────────────────────────────────────── */
-    .arch-layers {
-      display: grid;
-      grid-template-columns: 1fr;
-      gap: 1rem;
-      margin-top: 2rem;
-    }
-
-    .arch-layer {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 1.25rem 1.5rem;
-      display: flex;
-      align-items: flex-start;
-      gap: 1.25rem;
-    }
-
-    .arch-layer-label {
-      flex-shrink: 0;
-      font-size: 0.7rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      padding: 0.25em 0.7em;
-      border-radius: 4px;
-      white-space: nowrap;
-      margin-top: 0.1rem;
-    }
-
-    .arch-layer p { margin-bottom: 0; font-size: 0.925rem; }
-
-    .layer-surface   .arch-layer-label { background: rgba(88,166,255,0.15); color: var(--accent); }
-    .layer-intel     .arch-layer-label { background: rgba(210,168,255,0.15); color: var(--accent-3); }
-    .layer-session   .arch-layer-label { background: rgba(63,185,80,0.15); color: var(--accent-2); }
-    .layer-core      .arch-layer-label { background: rgba(255,123,114,0.15); color: #ff7b72; }
-
     /* ── CTA ────────────────────────────────────────────────────────── */
     .cta {
       text-align: center;
@@ -337,7 +348,7 @@
     }
 
     .cta h2 { margin-bottom: 1rem; }
-    .cta p  { color: var(--text-dim); max-width: 540px; margin: 0 auto 2rem; }
+    .cta p  { color: var(--text-dim); max-width: 580px; margin: 0 auto 2rem; }
 
     .cta-buttons {
       display: flex;
@@ -394,13 +405,14 @@
   <!-- ── Nav ─────────────────────────────────────────────────────── -->
   <nav>
     <div class="container">
-      <div class="nav-brand">ProjectBrain</div>
+      <div class="nav-brand">ProjectBrain <code>projectbrain-mcp</code></div>
       <div class="nav-links">
-        <a href="#problem">Problem</a>
-        <a href="#how">How It Works</a>
-        <a href="#features">Features</a>
+        <a href="#setup">Setup Guide</a>
+        <a href="#workflow">Daily Workflow</a>
+        <a href="#benchmarks">Benchmarks</a>
+        <a href="#features">Capabilities</a>
         <a href="#compare">Comparison</a>
-        <a href="#api">API</a>
+        <a href="https://pypi.org/project/projectbrain-mcp/" target="_blank">PyPI</a>
         <a href="https://github.com/Johanabhishek/ProjectBrain" target="_blank">GitHub</a>
       </div>
     </div>
@@ -409,116 +421,285 @@
   <!-- ── Hero ────────────────────────────────────────────────────── -->
   <header class="hero">
     <div class="container">
-      <h1>Codebase intelligence<br />for <span>AI agents</span></h1>
+      <h1>Surgical AST Context &amp; Patching<br />for <span>AI Coding Agents</span></h1>
       <p class="subtitle">
-        A local-first intelligence layer that helps AI coding agents find the right files,
-        in the right order, with reasons &mdash; instead of scanning blindly.
+        Local-first AST Context Compiler, Closed-World Engineering Dossier, and Surgical Anchor Patch Engine.
+        Cuts AI agent token bills by <strong>60%&ndash;65%</strong> and speeds up multi-file debugging by <strong>30%&ndash;42%</strong>.
       </p>
-      <div class="hero-install">pip install projectbrain</div>
+      <div class="hero-install-group">
+        <div class="hero-install">
+          pip install projectbrain-mcp<br />
+          projectbrain --path /path/to/your/repo init
+        </div>
+      </div>
       <div class="hero-badges">
-        <span>Local-first</span>
-        <span>No LLM required</span>
-        <span>Works with any agent</span>
-        <span>Python + JS/TS</span>
+        <span>&#9889; ~90ms Tree-sitter Index</span>
+        <span>&#128274; 100% Local &amp; Offline</span>
+        <span>&#128176; -81% to -88% Input Tokens</span>
+        <span>&#9986; -63% to -77% Edit Output Tokens</span>
+        <span>&#129302; Claude Code &bull; Cursor &bull; Windsurf &bull; Antigravity</span>
       </div>
     </div>
   </header>
 
-  <!-- ── Problem ─────────────────────────────────────────────────── -->
-  <section id="problem">
+  <!-- ── Complete Setup Guide ────────────────────────────────────── -->
+  <section id="setup">
     <div class="container">
-      <h2>The problem</h2>
-      <p>AI coding agents waste massive amounts of tokens and time doing blind file reads. A simple 5-line fix can trigger reading 40+ files because the agent does not know where things live or how they connect.</p>
+      <h2>Complete Setup Guide (60 Seconds)</h2>
+      <p>Set up ProjectBrain on any repository so your AI coding agent stops running blind <code>grep</code> loops and full-file reads.</p>
 
-      <div class="problem-grid">
-        <div class="problem-card">
-          <h3>Without ProjectBrain</h3>
-          <p>
-            Agent receives: <span class="highlight">"add discount code to checkout"</span><br /><br />
-            Reads 38 files. Scans routes, services, models, utilities, configs, tests.
-            Burns through context window. Takes 90 seconds before writing a single line of code.
-          </p>
-        </div>
-        <div class="problem-card">
-          <h3>With ProjectBrain</h3>
-          <p>
-            Agent queries ProjectBrain first.<br /><br />
-            Gets back <span class="highlight">3 files</span> with line ranges, reasons, and reading order.
-            Reads only what it needs. Starts writing code in under 5 seconds.
-          </p>
-        </div>
+      <div class="setup-card">
+        <h3><span class="setup-step-badge">Step 1</span> Install from PyPI</h3>
+        <p>Install the official <code>projectbrain-mcp</code> package globally (exposes both the <code>projectbrain</code> CLI and <code>projectbrain-mcp</code> server):</p>
+        <pre><code>pip install projectbrain-mcp
+
+<span class="comment"># Verify CLI and MCP server binaries are on PATH:</span>
+projectbrain --help
+projectbrain-mcp --help</code></pre>
+      </div>
+
+      <div class="setup-card">
+        <h3><span class="setup-step-badge">Step 2</span> Initialize Your Repository in One Command</h3>
+        <p>Run <code>projectbrain init</code> inside your repository (or pass <code>--path</code>):</p>
+        <pre><code>projectbrain --path /path/to/your/repo init</code></pre>
+        <p style="margin-top: 0.75rem; margin-bottom: 0;">
+          <strong>What <code>init</code> automatically sets up:</strong><br />
+          1. Indexes your codebase into <code>.projectbrain.json</code> and <code>.projectbrain_graph.json</code> in ~90ms.<br />
+          2. Updates <code>.gitignore</code> so index caches never pollute Git.<br />
+          3. Creates <code>.mcp.json</code> for Claude Code, Cursor, Windsurf, and Google Antigravity.<br />
+          4. Creates <code>.agents/rules/projectbrain.md</code> and <code>AGENTS.md</code> so agents automatically compile a single-read dossier first.
+        </p>
+      </div>
+
+      <div class="setup-card">
+        <h3><span class="setup-step-badge">Step 3</span> MCP Server Configuration (or Zero-Install via <code>uvx</code>)</h3>
+        <p>If your IDE uses a global MCP config file (<code>.cursor/mcp.json</code>, <code>claude_desktop_config.json</code>, or Antigravity <code>mcp_config.json</code>), add:</p>
+        <pre><code>{
+  <span class="string">"mcpServers"</span>: {
+    <span class="string">"projectbrain"</span>: {
+      <span class="string">"command"</span>: <span class="string">"projectbrain-mcp"</span>,
+      <span class="string">"args"</span>: [<span class="string">"/path/to/your/repo"</span>]
+    }
+  }
+}
+
+<span class="comment">// Or run with zero manual install via uvx:</span>
+{
+  <span class="string">"mcpServers"</span>: {
+    <span class="string">"projectbrain"</span>: {
+      <span class="string">"command"</span>: <span class="string">"uvx"</span>,
+      <span class="string">"args"</span>: [<span class="string">"projectbrain-mcp"</span>, <span class="string">"/path/to/your/repo"</span>]
+    }
+  }
+}</code></pre>
+      </div>
+
+      <div class="setup-card">
+        <h3><span class="setup-step-badge">Step 4</span> Parent / Monorepo Workspace Rule (Important for Nested Repos)</h3>
+        <p>If you open a <strong>parent directory</strong> in your IDE (e.g., <code>/workspace</code> containing <code>/workspace/my-app</code>), place an <code>AGENTS.md</code> (or <code>.agents/rules/projectbrain.md</code>) at the <strong>workspace root</strong> and pass <code>--path "&lt;subfolder&gt;"</code> so the agent always triggers ProjectBrain from the parent folder:</p>
+        <pre><code><span class="comment"># ProjectBrain Mandatory Codebase Investigation &amp; Editing Rules</span>
+
+1. <span class="keyword">Compile a Single-Read Engineering Dossier:</span>
+   projectbrain --path <span class="string">"&lt;subfolder&gt;"</span> dossier <span class="string">"&lt;question_or_bug&gt;"</span>
+   Immediately read <span class="string">&lt;subfolder&gt;/.projectbrain_dossier.md</span> in one read_file call (StartLine=1, EndLine=800).
+
+2. <span class="keyword">Surgical Symbol Slicing:</span>
+   projectbrain --path <span class="string">"&lt;subfolder&gt;"</span> slice --summary &lt;file:symbol_or_start-end&gt;
+
+3. <span class="keyword">Surgical Anchor Patching:</span>
+   projectbrain --path <span class="string">"&lt;subfolder&gt;"</span> patch --spec <span class="string">"&lt;Anchor Patch DSL&gt;"</span> --apply</code></pre>
+      </div>
+
+      <div class="setup-card">
+        <h3><span class="setup-step-badge">Step 5</span> Keep Git Clean (<code>.gitignore</code>)</h3>
+        <p>Add these patterns to <code>.gitignore</code> to keep all local ProjectBrain caches, dossiers, diffs, and agent rule files untracked:</p>
+        <pre><code><span class="comment"># ProjectBrain (local dev only)</span>
+.projectbrain*
+*.projectbrain*
+**/.projectbrain*
+project_brain.py
+test_projectbrain.json
+.mcp.json
+.agents/
+AGENTS.md
+CLAUDE.md
+.claude/settings.json</code></pre>
       </div>
     </div>
   </section>
 
-  <!-- ── How It Works ────────────────────────────────────────────── -->
-  <section id="how">
+  <!-- ── Daily Workflow & Live ROI Dashboard ─────────────────────── -->
+  <section id="workflow">
     <div class="container">
-      <h2>How it works</h2>
-      <div class="steps">
-        <div class="step">
-          <div class="step-number">1</div>
-          <h3>Index</h3>
-          <p>Tree-sitter parses your codebase and extracts functions, classes, routes, imports, exports, and relationships into a typed graph.</p>
-        </div>
-        <div class="step">
-          <div class="step-number">2</div>
-          <h3>Query</h3>
-          <p>Describe your task in plain language. The query engine matches routes, symbols, imports, and traverses the graph to find connected files.</p>
-        </div>
-        <div class="step">
-          <div class="step-number">3</div>
-          <h3>Navigate</h3>
-          <p>Get back a focused set of files with line ranges, relevance reasons, connection chains, and a suggested reading order.</p>
-        </div>
+      <h2>Daily CLI Workflow &amp; Live ROI Dashboard</h2>
+      <p>Use ProjectBrain directly from your terminal or let your AI coding agent invoke it automatically via CLI or MCP.</p>
+
+      <div class="demo-block">
+        <div class="demo-label">1. Compile a Single-Read Engineering Dossier (<code>dossier</code>)</div>
+        <pre><code><span class="comment"># Compiles module constants, folded AST slices, 1-3 hop call chains,</span>
+<span class="comment"># and a Closed-World Exhaustive Repo Scan into .projectbrain_dossier.md (&lt;800 lines)</span>
+$ projectbrain --path /path/to/repo dossier <span class="string">"what role does questionnaire have in onboarding"</span></code></pre>
+      </div>
+
+      <div class="demo-block">
+        <div class="demo-label">2. Surgically Slice Specific Symbols (<code>slice</code>)</div>
+        <pre><code><span class="comment"># Extract exact AST lines for 1-2 symbols without reading full files</span>
+$ projectbrain --path /path/to/repo slice --summary src/App.tsx:ProtectedRoute src/data/questionnaireData.ts:calculatePersona</code></pre>
+      </div>
+
+      <div class="demo-block">
+        <div class="demo-label">3. Apply Surgical Anchor Patches (<code>patch</code>)</div>
+        <pre><code><span class="comment"># Cuts edit output tokens by 65-80% with instant Tree-sitter syntax validation</span>
+$ projectbrain --path /path/to/repo patch --apply --spec <span class="string">"@file src/App.tsx
+@sub L84 \`!profileCompleted\` -&gt; \`isHydrated &amp;&amp; !profileCompleted\`"</span></code></pre>
+      </div>
+
+      <div class="demo-block">
+        <div class="demo-label">4. Live ROI &amp; Token Savings Dashboard (<code>stats --summary</code>)</div>
+        <pre><code>$ projectbrain --path /path/to/repo stats --summary
+===============================================================
+  ProjectBrain Token Reduction Ledger
+===============================================================
+  Repository         : /path/to/repo
+  Total Operations   : 4
+  Input Tokens Saved : 504,441 tok (16,156 delivered vs 520,597 baseline -&gt; -96.9%)
+  Output Tokens Saved: 190 tok (85 spec vs 275 edit_file -&gt; -69.1%)
+  Tool Calls Avoided : 22 file reads / multi-turn edits
+===============================================================
+
+<span class="comment"># Auto-refresh every 2 seconds in PowerShell:</span>
+$ while ($true) { cls; projectbrain --path <span class="string">"/path/to/repo"</span> stats --summary; Start-Sleep 2 }
+
+<span class="comment"># Auto-refresh every 2 seconds in Bash/Zsh:</span>
+$ watch -n 2 projectbrain --path /path/to/repo stats --summary
+
+<span class="comment"># Reset ledger:</span>
+$ projectbrain --path /path/to/repo stats --reset</code></pre>
       </div>
     </div>
   </section>
 
-  <!-- ── Features ────────────────────────────────────────────────── -->
+  <!-- ── Verified A/B Benchmarks ─────────────────────────────────── -->
+  <section id="benchmarks">
+    <div class="container">
+      <h2>Verified A/B Benchmark Results (142-File Production Repo)</h2>
+      <p>Measured across real multi-turn agent trajectories comparing a baseline agent (without ProjectBrain) against a ProjectBrain-enabled agent.</p>
+
+      <div style="overflow-x: auto;">
+        <table class="comparison-table">
+          <thead>
+            <tr>
+              <th>Benchmark Scenario</th>
+              <th>Metric</th>
+              <th>Baseline Agent (No Brain)</th>
+              <th>ProjectBrain Agent</th>
+              <th>Improvement</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td><strong>Scenario 1: Targeted 3-Part Analysis</strong></td>
+              <td>Code Output Ingested</td>
+              <td><code>67,319</code> tok</td>
+              <td><strong><code>12,569</code> tok</strong></td>
+              <td class="check">-81.3% (5.35x smaller)</td>
+            </tr>
+            <tr>
+              <td></td>
+              <td>Total Prompt Tokens Billed</td>
+              <td><code>655,391</code> tok</td>
+              <td><strong><code>155,052</code> tok</strong></td>
+              <td class="check">-76.3% (4.23x fewer)</td>
+            </tr>
+            <tr>
+              <td></td>
+              <td>File Reads (<code>read_file</code>)</td>
+              <td><code>16</code></td>
+              <td><strong><code>2</code></strong></td>
+              <td class="check">-87.5%</td>
+            </tr>
+            <tr>
+              <td></td>
+              <td>Net API Cost</td>
+              <td><code>$0.6723</code></td>
+              <td><strong><code>$0.2590</code></strong></td>
+              <td class="check">-61.5% (2.60x cheaper)</td>
+            </tr>
+            <tr>
+              <td><strong>Scenario 2: Open-Ended Bug Report</strong></td>
+              <td>Code Output Ingested</td>
+              <td><code>351,658</code> tok</td>
+              <td><strong><code>40,982</code> tok</strong></td>
+              <td class="check">-88.3% (8.58x smaller)</td>
+            </tr>
+            <tr>
+              <td></td>
+              <td>Total Prompt Tokens Billed</td>
+              <td><code>4,561,692</code> tok</td>
+              <td><strong><code>1,220,579</code> tok</strong></td>
+              <td class="check">-73.2% (-3.34M tokens)</td>
+            </tr>
+            <tr>
+              <td></td>
+              <td>File Reads (<code>read_file</code>)</td>
+              <td><code>84</code> (19 re-reads)</td>
+              <td><strong><code>6</code> (0 re-reads)</strong></td>
+              <td class="check">-92.9% (14.0x fewer)</td>
+            </tr>
+            <tr>
+              <td></td>
+              <td>Multi-File Patch Output Tokens</td>
+              <td><code>3,359</code> tok (<code>edit_file</code>)</td>
+              <td><strong><code>529 &ndash; 1,237</code> tok</strong></td>
+              <td class="check">-63.2% to -77.3%</td>
+            </tr>
+            <tr>
+              <td></td>
+              <td>Net API Cost</td>
+              <td><code>$3.2712</code></td>
+              <td><strong><code>$1.1557</code></strong></td>
+              <td class="check">-64.7% (2.83x cheaper)</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </section>
+
+  <!-- ── Core Capabilities ───────────────────────────────────────── -->
   <section id="features">
     <div class="container">
-      <h2>Core capabilities</h2>
+      <h2>Core Capabilities</h2>
       <div class="features-grid">
         <div class="feature">
-          <div class="feature-tag tag-core">Core</div>
-          <h3>Graph-Aware Code Map</h3>
-          <p>Goes beyond file search. Understands imports, function calls, inheritance, route-to-handler chains, and database model relationships.</p>
+          <div class="feature-tag tag-core">Input Saver</div>
+          <h3>Single-Read Engineering Dossier (<code>brain_dossier</code>)</h3>
+          <p>Compiles module globals, smart-folded AST function slices, 1&ndash;3 hop bidirectional call chains, and a Closed-World Exhaustive Repo Scan into a single <code>&lt;800</code>-line <code>.projectbrain_dossier.md</code>.</p>
         </div>
         <div class="feature">
-          <div class="feature-tag tag-core">Core</div>
-          <h3>Explainable Results</h3>
-          <p>Every result includes a reason ("defines POST /checkout", "imported by CheckoutService") and a confidence level. No black-box rankings.</p>
+          <div class="feature-tag tag-unique">Output Saver</div>
+          <h3>Surgical Anchor Patching (<code>brain_patch</code>)</h3>
+          <p>Replaces verbose before/after blocks in <code>edit_file</code> with compact anchor specs (<code>@file</code>, <code>@sub</code>, <code>@replace</code>, <code>@insert_after</code>, <code>@delete</code>) validated by Tree-sitter in <code>&lt;5ms</code>.</p>
         </div>
         <div class="feature">
-          <div class="feature-tag tag-unique">Unique</div>
-          <h3>Claim Verification</h3>
-          <p>Verify agent assumptions against the actual code graph before they become commits. Catches hallucinations like "getUserProfile is in auth.ts" when it is not.</p>
+          <div class="feature-tag tag-roi">Telemetry</div>
+          <h3>Live ROI &amp; Savings Ledger (<code>brain_stats</code>)</h3>
+          <p>Automatically records every dossier, slice, and patch operation to <code>.projectbrain_ledger.json</code>, reporting input/output tokens saved and tool calls avoided.</p>
         </div>
         <div class="feature">
-          <div class="feature-tag tag-unique">Unique</div>
-          <h3>Stateful Sessions</h3>
-          <p>Tracks what the agent has already read and edited. Follow-up queries return only the files the agent has not seen yet.</p>
+          <div class="feature-tag tag-unique">Anti-Hallucination</div>
+          <h3>3-Valued Verification (<code>brain_check</code>)</h3>
+          <p>Verifies structural claims (<code>SUPPORTED</code>, <code>REFUTED</code>, <code>UNKNOWN</code>) and edit plans against the parsed code graph with zero false refutations.</p>
         </div>
         <div class="feature">
-          <div class="feature-tag tag-core">Core</div>
-          <h3>Agent-Native Surfaces</h3>
-          <p>Python API, CLI, and MCP server. Works with Codex, Claude Code, Cursor, Copilot, Antigravity, or any MCP-compatible agent.</p>
+          <div class="feature-tag tag-core">Memory</div>
+          <h3>AST-Anchored Repo Memory (<code>brain_remember</code>)</h3>
+          <p>Pins architectural invariants to specific symbols in <code>.projectbrain_memory.json</code> and automatically flags <code>[STALE WARNING]</code> when a function's AST hash changes.</p>
         </div>
         <div class="feature">
-          <div class="feature-tag tag-planned">Planned</div>
-          <h3>Cross-Language Flow Tracing</h3>
-          <p>Trace a user action from React button click through fetch call to Express route to database query. Follows the flow across language boundaries.</p>
-        </div>
-        <div class="feature">
-          <div class="feature-tag tag-core">Core</div>
-          <h3>Edge Confidence</h3>
-          <p>Every relationship is labeled: exact, qualified, import-resolved, candidate, or unknown. Dynamic dispatch is flagged as approximate, not presented as fact.</p>
-        </div>
-        <div class="feature">
-          <div class="feature-tag tag-planned">Planned</div>
-          <h3>Context Compression</h3>
-          <p>Fits context into a token budget. Focus files get full content, connected files get signatures only, distant files get one-line summaries.</p>
+          <div class="feature-tag tag-core">Graph</div>
+          <h3>Cross-Framework Route &amp; Import Resolution</h3>
+          <p>Resolves Python relative/symbol imports, TypeScript path aliases (<code>@/</code>, <code>~/</code>), and FastAPI, Flask, Django, Express, and Next.js routes out of the box.</p>
         </div>
       </div>
     </div>
@@ -527,83 +708,60 @@
   <!-- ── Comparison ──────────────────────────────────────────────── -->
   <section id="compare">
     <div class="container">
-      <h2>How it compares</h2>
+      <h2>How ProjectBrain Compares</h2>
       <div style="overflow-x: auto;">
         <table class="comparison-table">
           <thead>
             <tr>
               <th>Capability</th>
-              <th>Aider repo-map</th>
+              <th>Aider Repo-Map</th>
+              <th>Serena (LSP)</th>
               <th>CodeGraph</th>
-              <th>Sourcegraph</th>
-              <th>Cursor</th>
-              <th>ProjectBrain</th>
+              <th>ProjectBrain (<code>projectbrain-mcp</code>)</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td>Local-first, no infra</td>
-              <td class="check">Yes</td>
-              <td class="check">Yes</td>
-              <td class="cross">No</td>
-              <td class="partial">Embedded</td>
-              <td class="check">Yes</td>
+              <td>Zero-setup speed</td>
+              <td class="check">Fast (Tree-sitter)</td>
+              <td class="cross">Heavy LSP startup</td>
+              <td class="check">Fast</td>
+              <td class="check">~90ms (Tree-sitter C wheels)</td>
             </tr>
             <tr>
-              <td>Works with any agent</td>
-              <td class="cross">Aider only</td>
-              <td class="check">MCP</td>
-              <td class="cross">Own UI</td>
-              <td class="cross">Cursor only</td>
-              <td class="check">API + CLI + MCP</td>
+              <td>Single-read &lt;800-line Dossier</td>
+              <td class="cross">Signatures only</td>
+              <td class="cross">Symbol bodies</td>
+              <td class="cross">Graph nodes only</td>
+              <td class="check">Folded AST slices + Call chains + Globals</td>
             </tr>
             <tr>
-              <td>Typed code graph</td>
-              <td class="partial">File-level</td>
-              <td class="check">Yes</td>
-              <td class="check">Yes</td>
-              <td class="cross">Embeddings</td>
-              <td class="check">Yes</td>
+              <td>Closed-world state/route scan</td>
+              <td class="cross">No</td>
+              <td class="cross">No</td>
+              <td class="cross">No</td>
+              <td class="check">Yes (Exhaustive Guarantee)</td>
             </tr>
             <tr>
-              <td>Explains why</td>
+              <td>Surgical Anchor Patch Engine</td>
               <td class="cross">No</td>
               <td class="cross">No</td>
               <td class="cross">No</td>
-              <td class="cross">No</td>
-              <td class="check">Yes</td>
+              <td class="check">Yes (-63% to -77% output tokens)</td>
             </tr>
             <tr>
-              <td>Edge confidence</td>
+              <td>AST-anchored persistent memory</td>
               <td class="cross">No</td>
+              <td class="partial">Manual markdown</td>
               <td class="cross">No</td>
-              <td class="cross">No</td>
-              <td class="cross">No</td>
-              <td class="check">Yes</td>
+              <td class="check">Yes (auto-flags stale AST hashes)</td>
             </tr>
             <tr>
-              <td>Session state</td>
-              <td class="cross">Rebuilt per chat</td>
-              <td class="cross">Stateless</td>
-              <td class="cross">No</td>
-              <td class="cross">No</td>
-              <td class="check">Yes</td>
-            </tr>
-            <tr>
-              <td>Claim verification</td>
+              <td>Live Token &amp; ROI Ledger</td>
               <td class="cross">No</td>
               <td class="cross">No</td>
               <td class="cross">No</td>
-              <td class="cross">No</td>
-              <td class="check">Yes</td>
-            </tr>
-            <tr>
-              <td>No LLM required</td>
-              <td class="cross">Needs LLM</td>
-              <td class="check">Yes</td>
-              <td class="check">Yes</td>
-              <td class="cross">Needs LLM</td>
-              <td class="check">Yes</td>
+              <td class="check">Yes (<code>projectbrain stats --summary</code>)</td>
             </tr>
           </tbody>
         </table>
@@ -611,139 +769,14 @@
     </div>
   </section>
 
-  <!-- ── API Demo ────────────────────────────────────────────────── -->
-  <section id="api">
-    <div class="container">
-      <h2>Simple API</h2>
-      <p>Three lines to go from a task description to the exact files you need.</p>
-
-      <div class="demo-block">
-        <div class="demo-label">Python</div>
-        <pre><code><span class="keyword">from</span> projectbrain <span class="keyword">import</span> ProjectBrain
-
-brain = ProjectBrain(<span class="string">"./my-project"</span>)
-brain.index()
-
-<span class="comment"># Natural language query — any task, not just bugs</span>
-context = brain.query(<span class="string">"add discount code to checkout"</span>)
-
-<span class="comment"># Returns focused results with reasons</span>
-<span class="keyword">for</span> result <span class="keyword">in</span> context.results:
-    <span class="fn">print</span>(result.file_path, result.reason)
-    <span class="comment"># src/routes/checkout.ts   "defines POST /checkout"</span>
-    <span class="comment"># src/services/checkout.ts "handles checkout logic, imports CouponModel"</span>
-    <span class="comment"># src/models/Coupon.ts     "coupon schema — likely needs new field"</span></code></pre>
-      </div>
-
-      <div class="demo-block">
-        <div class="demo-label">CLI</div>
-        <pre><code><span class="comment"># Index and query from the terminal</span>
-$ projectbrain index ./my-project
-$ projectbrain query <span class="string">"why is /users returning 404"</span>
-
-<span class="comment"># Structured output for piping to other tools</span>
-$ projectbrain query <span class="string">"add discount code to checkout"</span> --json
-
-<span class="comment"># Verify an agent's claim against the code graph</span>
-$ projectbrain verify <span class="string">"auth.ts defines getUserProfile"</span>
-<span class="comment"># REFUTED: getUserProfile is defined in userService.ts</span></code></pre>
-      </div>
-
-      <div class="demo-block">
-        <div class="demo-label">MCP (for AI agents)</div>
-        <pre><code><span class="comment">// Agent calls ProjectBrain via MCP before reading any files</span>
-{
-  <span class="string">"tool"</span>: <span class="string">"projectbrain_query"</span>,
-  <span class="string">"arguments"</span>: {
-    <span class="string">"prompt"</span>: <span class="string">"cart total not updating after coupon applied"</span>,
-    <span class="string">"max_results"</span>: <span class="type">5</span>
-  }
-}
-
-<span class="comment">// Response: 3 files, line ranges, reasons, reading order</span>
-<span class="comment">// Agent reads only those files instead of scanning 40+</span></code></pre>
-      </div>
-    </div>
-  </section>
-
-  <!-- ── Architecture ────────────────────────────────────────────── -->
-  <section id="arch">
-    <div class="container">
-      <h2>Architecture</h2>
-      <p>Four layers, each building on the one below.</p>
-
-      <div class="arch-layers">
-        <div class="arch-layer layer-surface">
-          <span class="arch-layer-label">Surfaces</span>
-          <div>
-            <h3>CLI, Python API, MCP Server</h3>
-            <p>Multiple interfaces so any agent or developer can consume results in their preferred format.</p>
-          </div>
-        </div>
-        <div class="arch-layer layer-session">
-          <span class="arch-layer-label">Session</span>
-          <div>
-            <h3>Session Manager, Multi-Agent Coordinator, Task Memory</h3>
-            <p>Tracks what the agent has read and edited. Prevents conflicts when multiple agents work on related code.</p>
-          </div>
-        </div>
-        <div class="arch-layer layer-intel">
-          <span class="arch-layer-label">Intelligence</span>
-          <div>
-            <h3>Query Engine, Predictive Context, Claim Verifier, Context Compressor, Flow Tracer</h3>
-            <p>Turns the raw graph into actionable answers. Routes queries, predicts file sets, verifies claims, compresses context.</p>
-          </div>
-        </div>
-        <div class="arch-layer layer-core">
-          <span class="arch-layer-label">Core</span>
-          <div>
-            <h3>Tree-sitter Parser, Symbol Graph, Import Resolver, Behavioral Classifier</h3>
-            <p>Extracts functions, classes, routes, imports, exports, and relationships. Builds typed edges with confidence levels.</p>
-          </div>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <!-- ── Output Example ──────────────────────────────────────────── -->
-  <section id="output">
-    <div class="container">
-      <h2>What the output looks like</h2>
-      <p>Every query returns structured results with reasons, connections, and a suggested reading order.</p>
-      <pre><code>{
-  <span class="string">"results"</span>: [
-    {
-      <span class="string">"file_path"</span>: <span class="string">"src/routes/checkout.ts"</span>,
-      <span class="string">"score"</span>: <span class="type">8.5</span>,
-      <span class="string">"confidence"</span>: <span class="string">"high"</span>,
-      <span class="string">"reason"</span>: <span class="string">"defines POST /checkout, imports CheckoutService"</span>,
-      <span class="string">"line_ranges"</span>: [[<span class="type">12</span>, <span class="type">58</span>]],
-      <span class="string">"connections"</span>: [
-        {
-          <span class="string">"path"</span>: <span class="string">"src/services/CheckoutService.ts"</span>,
-          <span class="string">"relation"</span>: <span class="string">"imports"</span>,
-          <span class="string">"confidence"</span>: <span class="string">"import_resolved"</span>
-        }
-      ]
-    }
-  ],
-  <span class="string">"suggested_read_order"</span>: [
-    <span class="string">"src/routes/checkout.ts"</span>,
-    <span class="string">"src/services/CheckoutService.ts"</span>,
-    <span class="string">"src/models/Coupon.ts"</span>
-  ]
-}</code></pre>
-    </div>
-  </section>
-
   <!-- ── CTA ─────────────────────────────────────────────────────── -->
   <section class="cta">
     <div class="container">
-      <h2>Start using ProjectBrain</h2>
-      <p>Index your codebase in under 30 seconds. Query results in under 100ms. No cloud, no LLM, no setup beyond pip install.</p>
+      <h2>Get Started in 60 Seconds</h2>
+      <p>Install from PyPI, run <code>projectbrain init</code> on your repository, and watch your AI coding agent cut token usage by 60%&ndash;65%.</p>
       <div class="cta-buttons">
-        <a href="https://github.com/Johanabhishek/ProjectBrain" class="btn btn-primary" target="_blank">View on GitHub</a>
-        <a href="#api" class="btn btn-secondary">Read the Docs</a>
+        <a href="https://pypi.org/project/projectbrain-mcp/" class="btn btn-primary" target="_blank">Install from PyPI</a>
+        <a href="https://github.com/Johanabhishek/ProjectBrain" class="btn btn-secondary" target="_blank">View on GitHub</a>
       </div>
     </div>
   </section>
@@ -751,7 +784,7 @@ $ projectbrain verify <span class="string">"auth.ts defines getUserProfile"</spa
   <!-- ── Footer ──────────────────────────────────────────────────── -->
   <footer>
     <div class="container">
-      <p>ProjectBrain is open source. Local-first codebase intelligence for AI agents.</p>
+      <p>ProjectBrain (<code>projectbrain-mcp</code>) is open source under the MIT License. Local-first codebase intelligence for AI coding agents.</p>
     </div>
   </footer>
 

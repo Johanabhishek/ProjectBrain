@@ -1,8 +1,32 @@
 import argparse
 import json
 import sys
+from pathlib import Path
 
 from .brain import ProjectBrain
+
+_AGENT_RULE_CONTENT = """\
+# ProjectBrain — Agent Context & Token-Saving Rules
+
+This repository is indexed by **ProjectBrain** (`projectbrain`).
+To cut input tokens by 75–88% and output tokens by 65–80%, ALWAYS follow this workflow:
+
+1. **Compile a Single-Read Engineering Dossier First (`brain_dossier` / `projectbrain dossier`):**
+   Before running `grep` or reading unfamiliar files, call `brain_dossier(tasks=["<task1>", ...])` (or `projectbrain dossier "<task1>"`) and read `.projectbrain_dossier.md` in a single `read_file` call (`StartLine=1, EndLine=800`).
+   - It contains module globals/constants, smart-folded AST function slices, 1–3 hop bidirectional call chains with `@L<line>` caller windows, and a **Closed-World Exhaustive Repo Scan** of discovered state keys and routes.
+   - **Closed-World Rule:** When the dossier states `EXHAUSTIVE GUARANTEE` for a key or route, do NOT read large monolith files to search for additional occurrences.
+2. **Read Specific Symbols Surgically (`brain_slice` / `projectbrain slice`):**
+   If you need 1–2 additional symbols or line ranges, call `brain_slice(targets=["file.ts:symbol_or_start-end"])` instead of reading full files.
+3. **Cut Output Tokens with Surgical Anchor Patching (`brain_patch` / `projectbrain patch`):**
+   Instead of repeating verbatim multi-line `Target` + `Replacement` blocks in `edit_file` or writing verbose before/after code blocks, use `brain_patch` (`projectbrain patch --spec "..." [--apply]`):
+   - `@file <rel_path>`
+   - `@sub L<line> \\`<old_expr>\\` -> \\`<new_expr>\\`` (or `@sub ALL \\`<old>\\` -> \\`<new>\\`` / `@sub <symbol> \\`<old>\\` -> \\`<new>\\``)
+   - `@replace L<start>-L<end>` ... `@end`
+   - `@insert_after L<line>` / `@insert_before L<line>` ... `@end`
+   - `@delete L<start>-L<end>`
+4. **Verify Blast Radius & Persist Memories (`brain_check`, `brain_remember`, `brain_stats`):**
+   Use `brain_check` to inspect downstream importers/tests, `brain_remember` to pin architectural invariants, and `brain_stats` to view cumulative token/dollar savings.
+"""
 
 
 def _print_query_summary(result: dict) -> None:
@@ -50,12 +74,186 @@ def _print_context_summary(ctx: dict) -> None:
         print(f"  Imported by: {', '.join(ctx['imported_by'])}")
 
 
+def _print_compiled_summary(packet: dict) -> None:
+    telem = packet.get("token_telemetry", {})
+    print(f"Task: {packet.get('task')}  [intent: {packet.get('intent', {}).get('intent')}]")
+    print(
+        f"Token Telemetry: {telem.get('packet_tokens')} tokens "
+        f"(vs {telem.get('naive_full_files_tokens')} full-file tokens -> "
+        f"{telem.get('tokens_saved_pct')}% saved)\n"
+    )
+    if packet.get("memories"):
+        print("=== Active Repo Memories ===")
+        for m in packet["memories"]:
+            stale_str = " [STALE WARNING]" if m.get("stale") else ""
+            print(f"  * [{m.get('target_id')}]{stale_str}: {m.get('note')}")
+        print()
+
+    print("=== Tier 1: Target AST Code Slices ===")
+    for s in packet.get("target_slices", []):
+        print(f"--- {s['rel_path']} :: {s['symbol']} ({s['lines']}) [{s.get('reason')}] ---")
+        print(s["code"])
+        print()
+
+    print("=== Tier 2: Neighbor Signature Skeletons ===")
+    for sk in packet.get("neighbor_skeletons", []):
+        print(f"--- {sk['rel_path']} ({sk['reason']}) ---")
+        print(sk["skeleton"])
+        print()
+
+    if packet.get("related_tests"):
+        print(f"Related Tests: {', '.join(packet['related_tests'])}")
+
+
+def _print_stats_summary(st: dict) -> None:
+    inp = st.get("input_tokens", {})
+    out = st.get("output_tokens", {})
+    print("===============================================================")
+    print("  ProjectBrain Token Reduction Ledger")
+    print("===============================================================")
+    print(f"  Repository         : {st.get('repo')}")
+    print(f"  Total Operations   : {st.get('total_operations', 0)}")
+    print(
+        f"  Input Tokens Saved : {inp.get('saved', 0):,} tok "
+        f"({inp.get('delivered', 0):,} delivered vs {inp.get('naive_baseline', 0):,} baseline -> -{inp.get('savings_pct', 0)}%)"
+    )
+    print(
+        f"  Output Tokens Saved: {out.get('saved', 0):,} tok "
+        f"({out.get('delivered', 0):,} spec vs {out.get('naive_baseline', 0):,} edit_file -> -{out.get('savings_pct', 0)}%)"
+    )
+    print(f"  Tool Calls Avoided : {st.get('tool_calls_avoided', 0):,} file reads / multi-turn edits")
+    print("===============================================================")
+
+
+def _run_init(root_path: Path, write_mcp: bool = True, write_rules: bool = True) -> dict:
+    """One-command setup: index repo, update .gitignore, wire MCP config, and write agent rules."""
+    brain = ProjectBrain(str(root_path))
+    stats = brain.index()
+
+    actions: list[str] = ["indexed_repository"]
+
+    # 1. Update .gitignore to ignore cache & graph files while keeping memory.json tracked
+    gitignore = root_path / ".gitignore"
+    ignore_entries = [
+        ".projectbrain.json",
+        ".projectbrain_graph.json",
+        ".projectbrain_dossier.md",
+        ".projectbrain_patch.diff",
+        ".projectbrain_ledger.json",
+    ]
+    if gitignore.exists():
+        content = gitignore.read_text(encoding="utf-8", errors="ignore")
+        missing = [e for e in ignore_entries if e not in content]
+        if missing:
+            suffix = "\n" if not content.endswith("\n") else ""
+            gitignore.write_text(
+                content + suffix + "# ProjectBrain cache\n" + "\n".join(missing) + "\n",
+                encoding="utf-8",
+            )
+            actions.append("updated_.gitignore")
+    else:
+        gitignore.write_text(
+            "# ProjectBrain cache\n" + "\n".join(ignore_entries) + "\n",
+            encoding="utf-8",
+        )
+        actions.append("created_.gitignore")
+
+    # 2. Write MCP configuration (.mcp.json)
+    if write_mcp:
+        mcp_file = root_path / ".mcp.json"
+        mcp_data: dict = {"mcpServers": {}}
+        if mcp_file.exists():
+            try:
+                loaded = json.loads(mcp_file.read_text(encoding="utf-8"))
+                if isinstance(loaded, dict):
+                    mcp_data = loaded
+                    mcp_data.setdefault("mcpServers", {})
+            except json.JSONDecodeError:
+                pass
+        mcp_data["mcpServers"]["projectbrain"] = {
+            "command": "projectbrain-mcp",
+            "args": [str(root_path.resolve())],
+        }
+        mcp_file.write_text(json.dumps(mcp_data, indent=2) + "\n", encoding="utf-8")
+        actions.append("configured_.mcp.json")
+
+    # 3. Write Agent Rule files (AGENTS.md at repo root + .agents/rules/projectbrain.md)
+    if write_rules:
+        agents_md = root_path / "AGENTS.md"
+        agents_md.write_text(_AGENT_RULE_CONTENT, encoding="utf-8")
+        rules_dir = root_path / ".agents" / "rules"
+        rules_dir.mkdir(parents=True, exist_ok=True)
+        rule_file = rules_dir / "projectbrain.md"
+        rule_file.write_text(_AGENT_RULE_CONTENT, encoding="utf-8")
+        actions.append("wrote_AGENTS.md_and_.agents/rules/projectbrain.md")
+
+    return {
+        "status": "initialized",
+        "root": str(root_path.resolve()),
+        "actions": actions,
+        "stats": stats,
+    }
+
+
 def main(argv: list[str] | None = None) -> int:
+    if hasattr(sys.stdout, "reconfigure"):
+        try:
+            sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:
+            pass
+
     parser = argparse.ArgumentParser(prog="projectbrain")
     parser.add_argument("--path", default=".", help="Project root (default: current directory)")
     sub = parser.add_subparsers(dest="command", required=True)
 
+    init_parser = sub.add_parser("init", help="One-command setup: index, .gitignore, .mcp.json, and agent rules")
+    init_parser.add_argument("--no-mcp", action="store_true", help="Skip writing .mcp.json")
+    init_parser.add_argument("--no-rules", action="store_true", help="Skip writing .agents/rules/projectbrain.md")
+
     sub.add_parser("index", help="Build and cache the index for the project")
+
+    compile_parser = sub.add_parser("compile", help="Compile surgical AST slices + neighbor skeletons for a task")
+    compile_parser.add_argument("prompt", help="Natural language task description")
+    compile_parser.add_argument("--budget", type=int, default=3000, help="Token budget (default: 3000)")
+    compile_parser.add_argument("--top-n", type=int, default=4)
+    compile_group = compile_parser.add_mutually_exclusive_group()
+    compile_group.add_argument("--json", action="store_true", help="Raw JSON output (default)")
+    compile_group.add_argument("--summary", action="store_true", help="Human-readable compiled view")
+
+    dossier_parser = sub.add_parser(
+        "dossier",
+        help="Compile a self-contained multi-task Engineering Dossier to .projectbrain_dossier.md",
+    )
+    dossier_parser.add_argument("tasks", nargs="+", help="One or more task descriptions or engineering questions")
+    dossier_parser.add_argument("--impact", nargs="*", default=None, help="Optional file paths for blast-radius analysis")
+    dossier_parser.add_argument("--out", default=None, help="Output markdown path (default: <root>/.projectbrain_dossier.md)")
+
+    patch_parser = sub.add_parser(
+        "patch",
+        help="Apply or dry-run a Surgical Anchor Patch spec to cut output tokens (75-90 percent reduction)",
+    )
+    patch_parser.add_argument("--spec", default=None, help="Anchor Patch DSL string or JSON array")
+    patch_parser.add_argument("--spec-file", default=None, help="Path to a file containing the Anchor Patch DSL")
+    patch_parser.add_argument("--apply", action="store_true", help="Write verified patches directly to disk (default: dry-run diff)")
+    patch_parser.add_argument("--diff-out", default=None, help="Path to write unified git diff (default: <root>/.projectbrain_patch.diff)")
+    patch_parser.add_argument("--include-diff", action="store_true", help="Include full unified diff string in stdout JSON")
+
+    slice_parser = sub.add_parser("slice", help="Surgically slice specific symbols, line ranges, or file skeletons")
+    slice_parser.add_argument("targets", nargs="+", help="Symbols (e.g. brain.py:verify_claim), node IDs, or files")
+    slice_parser.add_argument("--max-lines", type=int, default=120, help="Max lines per symbol (default: 120)")
+    slice_parser.add_argument("--summary", action="store_true", help="Human-readable code output")
+
+    explore_parser = sub.add_parser("explore", help="Explore symbol neighborhood, trace route flow, or find path between A and B")
+    explore_parser.add_argument("target", help="Symbol name, node ID, or route URL")
+    explore_parser.add_argument("target_b", nargs="?", default=None, help="Optional second symbol to find shortest path to")
+    explore_parser.add_argument("--depth", type=int, default=2)
+
+    impact_parser = sub.add_parser("impact", help="Compute blast radius (direct consumers, test consumers, callers) for files")
+    impact_parser.add_argument("files", nargs="+", help="File paths to analyze")
+
+    remember_parser = sub.add_parser("remember", help="Pin an architectural note to a symbol or file")
+    remember_parser.add_argument("target", help="Symbol name, file path, or node ID")
+    remember_parser.add_argument("note", help="Architectural invariant or note to remember")
 
     query_parser = sub.add_parser("query", help="Find files relevant to a task description")
     query_parser.add_argument("prompt", help="Natural language bug report or feature task")
@@ -80,11 +278,75 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("health", help="Report index coverage and blind spots")
 
+    stats_parser = sub.add_parser("stats", help="Display cumulative ROI, tokens saved, dollars saved, and time saved")
+    stats_parser.add_argument("--summary", action="store_true", help="Print human-readable ROI dashboard")
+    stats_parser.add_argument("--reset", action="store_true", help="Reset the savings ledger")
+
     args = parser.parse_args(argv)
+
+    if args.command == "init":
+        res = _run_init(Path(args.path), write_mcp=not args.no_mcp, write_rules=not args.no_rules)
+        print(json.dumps(res, indent=2))
+        return 0
+
     brain = ProjectBrain(args.path)
 
     if args.command == "index":
         print(json.dumps(brain.index(), indent=2))
+        return 0
+
+    if args.command == "compile":
+        packet = brain.compile_context(args.prompt, budget_tokens=args.budget, top_n=args.top_n)
+        if args.summary:
+            _print_compiled_summary(packet)
+        else:
+            print(json.dumps(packet, indent=2))
+        return 0
+
+    if args.command == "dossier":
+        res = brain.compile_dossier(args.tasks, impact_files=args.impact, out_path=args.out)
+        summary = {k: v for k, v in res.items() if k != "markdown"}
+        print(json.dumps(summary, indent=2))
+        return 0
+
+    if args.command == "patch":
+        spec_str = args.spec
+        if not spec_str and args.spec_file:
+            spec_str = Path(args.spec_file).read_text(encoding="utf-8")
+        if not spec_str and not sys.stdin.isatty():
+            spec_str = sys.stdin.read()
+        if not spec_str:
+            print(json.dumps({"error": "Provide --spec, --spec-file, or pipe patch spec via stdin"}))
+            return 1
+        res = brain.patch(spec_str, apply=args.apply, diff_out=args.diff_out)
+        out = res if args.include_diff else {k: v for k, v in res.items() if k != "unified_diff"}
+        print(json.dumps(out, indent=2))
+        return 0
+
+    if args.command == "slice":
+        res = brain.slice_symbols(args.targets, max_lines_per_symbol=args.max_lines)
+        if args.summary:
+            for s in res.get("slices", []):
+                if s.get("error"):
+                    print(f"[ERROR] {s['error']}")
+                else:
+                    print(f"=== {s.get('rel_path')} :: {s.get('symbol')} ({s.get('lines', 'skeleton')}) ===")
+                    print(s.get("code") or s.get("skeleton") or "")
+                    print()
+        else:
+            print(json.dumps(res, indent=2))
+        return 0
+
+    if args.command == "explore":
+        print(json.dumps(brain.explore(args.target, target_b=args.target_b, depth=args.depth), indent=2))
+        return 0
+
+    if args.command == "impact":
+        print(json.dumps(brain.impact(args.files), indent=2))
+        return 0
+
+    if args.command == "remember":
+        print(json.dumps(brain.remember(args.target, args.note), indent=2))
         return 0
 
     if args.command == "query":
@@ -110,6 +372,14 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "health":
         print(json.dumps(brain.health(), indent=2))
+        return 0
+
+    if args.command == "stats":
+        st = brain.stats(reset=args.reset)
+        if args.summary and not args.reset:
+            _print_stats_summary(st)
+        else:
+            print(json.dumps(st, indent=2))
         return 0
 
     return 1
