@@ -37,18 +37,17 @@ projectbrain-mcp --help
 
 ### Step 2: Initialize Your Repository (One Command)
 
-Run `projectbrain init` inside any repository (or pass `--path`):
+Run `projectbrain init` inside any repository (or pass `--path` and optional `--ide {all,antigravity,claude,cursor,vscode}`):
 
 ```bash
 projectbrain --path /path/to/your/repo init
 ```
 
-**What `projectbrain init` does automatically:**
+**What `projectbrain init` does automatically across all IDEs:**
 1. **Builds the AST & Call-Graph Index:** Writes `.projectbrain.json` and `.projectbrain_graph.json` in `~90ms`.
 2. **Updates `.gitignore`:** Ensures ephemeral index/cache files stay out of Git.
-3. **Configures MCP (`.mcp.json`):** Registers the `projectbrain-mcp` server for Claude Code, Cursor, Windsurf, and Google Antigravity.
-4. **Installs Agent Rules (`.agents/rules/projectbrain.md` & `AGENTS.md`):** Instructs AI coding agents to compile a dossier (`brain_dossier` / `projectbrain dossier`) first before running blind `grep` or full-file reads, and to apply edits via `brain_patch`.
-
+3. **Configures MCP Across IDEs:** Writes/merges `.mcp.json` (Claude Code / Antigravity), `.cursor/mcp.json` (Cursor), and `.vscode/mcp.json` (VS Code Agent Mode).
+4. **Installs Agent Rules Across IDEs:** Writes `AGENTS.md`, `.agents/rules/projectbrain.md` (Antigravity), `CLAUDE.md` (Claude Code), `.cursor/rules/projectbrain.mdc` (Cursor), and `.github/copilot-instructions.md` + `.clinerules` (VS Code Copilot / Cline / Roo Code).
 ---
 
 ### Step 3: Zero-Install MCP Server Configuration (Optional)

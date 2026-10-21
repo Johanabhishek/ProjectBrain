@@ -128,6 +128,6 @@ def test_savings_ledger_and_stats(tmp_path: Path):
     st = brain.stats()
     assert st["total_operations"] == 2
     assert st["output_tokens"]["saved"] > 0
-    assert st["estimated_usd_saved"] >= 0.0
+    assert st["output_tokens"]["savings_pct"] > 0.0
 
 

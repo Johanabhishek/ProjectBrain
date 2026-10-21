@@ -125,12 +125,53 @@ def _print_stats_summary(st: dict) -> None:
     print("===============================================================")
 
 
-def _run_init(root_path: Path, write_mcp: bool = True, write_rules: bool = True) -> dict:
+_CURSOR_MDC_FRONTMATTER = """\
+---
+description: ProjectBrain Mandatory Codebase Investigation & Token-Saving Rules
+globs: *
+alwaysApply: true
+---
+"""
+
+
+def _write_or_merge_json(file_path: Path, top_key: str, server_name: str, server_cfg: dict) -> None:
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    data: dict = {top_key: {}}
+    if file_path.exists():
+        try:
+            loaded = json.loads(file_path.read_text(encoding="utf-8"))
+            if isinstance(loaded, dict):
+                data = loaded
+                data.setdefault(top_key, {})
+        except json.JSONDecodeError:
+            pass
+    data[top_key][server_name] = server_cfg
+    file_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+
+
+def _write_or_append_rule(file_path: Path, content: str) -> None:
+    file_path.parent.mkdir(parents=True, exist_ok=True)
+    if file_path.exists():
+        existing = file_path.read_text(encoding="utf-8", errors="ignore")
+        if "ProjectBrain" not in existing:
+            suffix = "\n\n" if not existing.endswith("\n") else "\n"
+            file_path.write_text(existing + suffix + content, encoding="utf-8")
+    else:
+        file_path.write_text(content, encoding="utf-8")
+
+
+def _run_init(
+    root_path: Path,
+    write_mcp: bool = True,
+    write_rules: bool = True,
+    ide: str = "all",
+) -> dict:
     """One-command setup: index repo, update .gitignore, wire MCP config, and write agent rules."""
     brain = ProjectBrain(str(root_path))
     stats = brain.index()
 
     actions: list[str] = ["indexed_repository"]
+    resolved_root = str(root_path.resolve())
 
     # 1. Update .gitignore to ignore cache & graph files while keeping memory.json tracked
     gitignore = root_path / ".gitignore"
@@ -158,38 +199,58 @@ def _run_init(root_path: Path, write_mcp: bool = True, write_rules: bool = True)
         )
         actions.append("created_.gitignore")
 
-    # 2. Write MCP configuration (.mcp.json)
+    # 2. Write MCP configurations (.mcp.json, .cursor/mcp.json, .vscode/mcp.json)
     if write_mcp:
-        mcp_file = root_path / ".mcp.json"
-        mcp_data: dict = {"mcpServers": {}}
-        if mcp_file.exists():
-            try:
-                loaded = json.loads(mcp_file.read_text(encoding="utf-8"))
-                if isinstance(loaded, dict):
-                    mcp_data = loaded
-                    mcp_data.setdefault("mcpServers", {})
-            except json.JSONDecodeError:
-                pass
-        mcp_data["mcpServers"]["projectbrain"] = {
+        stdio_cfg = {
             "command": "projectbrain-mcp",
-            "args": [str(root_path.resolve())],
+            "args": [resolved_root],
         }
-        mcp_file.write_text(json.dumps(mcp_data, indent=2) + "\n", encoding="utf-8")
-        actions.append("configured_.mcp.json")
+        if ide in ("all", "claude", "antigravity"):
+            _write_or_merge_json(root_path / ".mcp.json", "mcpServers", "projectbrain", stdio_cfg)
+            actions.append("configured_.mcp.json")
+        if ide in ("all", "cursor"):
+            _write_or_merge_json(root_path / ".cursor" / "mcp.json", "mcpServers", "projectbrain", stdio_cfg)
+            actions.append("configured_.cursor/mcp.json")
+        if ide in ("all", "vscode"):
+            vscode_cfg = {
+                "type": "stdio",
+                "command": "projectbrain-mcp",
+                "args": [resolved_root],
+            }
+            _write_or_merge_json(root_path / ".vscode" / "mcp.json", "servers", "projectbrain", vscode_cfg)
+            actions.append("configured_.vscode/mcp.json")
 
-    # 3. Write Agent Rule files (AGENTS.md at repo root + .agents/rules/projectbrain.md)
+    # 3. Write Agent Rule files across IDEs (Antigravity, Claude Code, Cursor, VS Code Copilot/Cline)
     if write_rules:
         agents_md = root_path / "AGENTS.md"
         agents_md.write_text(_AGENT_RULE_CONTENT, encoding="utf-8")
-        rules_dir = root_path / ".agents" / "rules"
-        rules_dir.mkdir(parents=True, exist_ok=True)
-        rule_file = rules_dir / "projectbrain.md"
-        rule_file.write_text(_AGENT_RULE_CONTENT, encoding="utf-8")
-        actions.append("wrote_AGENTS.md_and_.agents/rules/projectbrain.md")
+        actions.append("wrote_AGENTS.md")
+
+        if ide in ("all", "antigravity"):
+            rule_file = root_path / ".agents" / "rules" / "projectbrain.md"
+            rule_file.parent.mkdir(parents=True, exist_ok=True)
+            rule_file.write_text(_AGENT_RULE_CONTENT, encoding="utf-8")
+            actions.append("wrote_.agents/rules/projectbrain.md")
+
+        if ide in ("all", "claude"):
+            _write_or_append_rule(root_path / "CLAUDE.md", _AGENT_RULE_CONTENT)
+            actions.append("wrote_CLAUDE.md")
+
+        if ide in ("all", "cursor"):
+            cursor_rule = root_path / ".cursor" / "rules" / "projectbrain.mdc"
+            cursor_rule.parent.mkdir(parents=True, exist_ok=True)
+            cursor_rule.write_text(_CURSOR_MDC_FRONTMATTER + _AGENT_RULE_CONTENT, encoding="utf-8")
+            actions.append("wrote_.cursor/rules/projectbrain.mdc")
+
+        if ide in ("all", "vscode"):
+            _write_or_append_rule(root_path / ".github" / "copilot-instructions.md", _AGENT_RULE_CONTENT)
+            _write_or_append_rule(root_path / ".clinerules", _AGENT_RULE_CONTENT)
+            actions.append("wrote_.github/copilot-instructions.md_and_.clinerules")
 
     return {
         "status": "initialized",
-        "root": str(root_path.resolve()),
+        "root": resolved_root,
+        "ide": ide,
         "actions": actions,
         "stats": stats,
     }
@@ -206,10 +267,15 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--path", default=".", help="Project root (default: current directory)")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    init_parser = sub.add_parser("init", help="One-command setup: index, .gitignore, .mcp.json, and agent rules")
-    init_parser.add_argument("--no-mcp", action="store_true", help="Skip writing .mcp.json")
-    init_parser.add_argument("--no-rules", action="store_true", help="Skip writing .agents/rules/projectbrain.md")
-
+    init_parser = sub.add_parser("init", help="One-command setup: index, .gitignore, MCP configs, and agent rules for Antigravity, Claude, Cursor, and VS Code")
+    init_parser.add_argument("--no-mcp", action="store_true", help="Skip writing MCP configs (.mcp.json, .cursor/mcp.json, .vscode/mcp.json)")
+    init_parser.add_argument("--no-rules", action="store_true", help="Skip writing agent rule files")
+    init_parser.add_argument(
+        "--ide",
+        choices=["all", "antigravity", "claude", "cursor", "vscode"],
+        default="all",
+        help="Target IDE/agent environment to configure (default: all)",
+    )
     sub.add_parser("index", help="Build and cache the index for the project")
 
     compile_parser = sub.add_parser("compile", help="Compile surgical AST slices + neighbor skeletons for a task")
@@ -285,7 +351,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     if args.command == "init":
-        res = _run_init(Path(args.path), write_mcp=not args.no_mcp, write_rules=not args.no_rules)
+        res = _run_init(
+            Path(args.path),
+            write_mcp=not args.no_mcp,
+            write_rules=not args.no_rules,
+            ide=args.ide,
+        )
         print(json.dumps(res, indent=2))
         return 0
 

@@ -865,11 +865,17 @@ class ProjectBrain:
         target_file.write_text(full_md, encoding="utf-8")
         total_lines = len(full_md.splitlines())
         covered_files = {sr for sr, _, _ in seen_spans} | seen_globals
-        naive_bytes = sum(self._sizes.get(f, 0) for f in covered_files)
-        # Include monolith files avoided when Closed-World Exhaustive Scan runs
-        if len(tasks) <= 2 and current_lines < 520:
-            top_monoliths = sorted(self._sizes.values(), reverse=True)[:3]
-            naive_bytes += sum(top_monoliths)
+        slices_per_file: dict[str, int] = {}
+        for sr, _, _ in seen_spans:
+            slices_per_file[sr] = slices_per_file.get(sr, 0) + 1
+        # Realistic IDE read_file baseline: ~400-line window (~16KB) per file + ~4.5KB per extra slice, capped at actual file size
+        naive_bytes = 0
+        for f in covered_files:
+            fsize = self._sizes.get(f, 0)
+            n_sl = max(1, slices_per_file.get(f, 1))
+            naive_bytes += min(fsize, 14000 + 4500 * (n_sl - 1))
+        # Plus ~8KB (~2,000 tokens) for multi-file rg + closed-world verification avoided
+        naive_bytes += 8000
         est_tok = len(full_md) // 4
         naive_tok = max(est_tok, naive_bytes // 4)
         ledger_event = self._ledger.record_input_op(
@@ -877,15 +883,18 @@ class ProjectBrain:
             query=" | ".join(tasks),
             delivered_tokens=est_tok,
             naive_full_file_tokens=naive_tok,
-            files_covered=max(len(covered_files), 6),
+            files_covered=len(covered_files),
+            touched_files=covered_files,
+            file_sizes=self._sizes,
         )
-        savings_pct = round((ledger_event["input_tokens_saved"] / naive_tok) * 100, 1) if naive_tok > 0 else 0.0
+        eff_naive_tok = ledger_event["naive_input_tokens"]
+        savings_pct = round((ledger_event["input_tokens_saved"] / eff_naive_tok) * 100, 1) if eff_naive_tok > 0 else 0.0
         return {
             "dossier_path": str(target_file),
             "total_lines": total_lines,
             "total_chars": len(full_md),
             "est_tokens": est_tok,
-            "naive_full_file_tokens": naive_tok,
+            "naive_full_file_tokens": eff_naive_tok,
             "input_tokens_saved": ledger_event["input_tokens_saved"],
             "input_savings_pct": savings_pct,
             "slices_included": len(seen_slices),
@@ -954,7 +963,8 @@ class ProjectBrain:
                 fpath, s_line, e_line = range_match.group(1), int(range_match.group(2)), int(range_match.group(3))
                 rel = self._normalize_rel(fpath)
                 if rel in self._index:
-                    code = slice_lines(self.root, rel, s_line, e_line, max_lines=max_lines_per_symbol)
+                    span_len = max(max_lines_per_symbol, e_line - s_line + 1)
+                    code = slice_lines(self.root, rel, s_line, e_line, max_lines=span_len)
                     slices.append({
                         "target": t,
                         "rel_path": rel,
@@ -1053,7 +1063,20 @@ class ProjectBrain:
                         found_any = True
             if not found_any:
                 slices.append({"target": t, "error": f"Symbol or file '{t}' not found in index."})
-
+        total_slice_chars = sum(len(s.get("code") or s.get("skeleton") or "") for s in slices)
+        if total_slice_chars > 0:
+            slice_files = {s.get("rel_path") for s in slices if s.get("rel_path")}
+            deliv_tok = max(1, total_slice_chars // 4)
+            naive_slice_bytes = sum(min(self._sizes.get(f, 0), 16000) for f in slice_files)
+            self._ledger.record_input_op(
+                op="slice",
+                query=", ".join(targets)[:120],
+                delivered_tokens=deliv_tok,
+                naive_full_file_tokens=max(deliv_tok, naive_slice_bytes // 4),
+                files_covered=len(slice_files),
+                touched_files=slice_files,
+                file_sizes=self._sizes,
+            )
         return {"slices": slices, "count": len(slices)}
 
     def explore(

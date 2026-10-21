@@ -191,5 +191,16 @@ def test_cli_init_creates_gitignore_mcp_and_agent_rules(tmp_project, capsys):
     assert out["status"] == "initialized"
     assert (tmp_project / ".gitignore").exists()
     assert ".projectbrain.json" in (tmp_project / ".gitignore").read_text(encoding="utf-8")
+    # Antigravity + Claude root MCP & rules
     assert (tmp_project / ".mcp.json").exists()
+    assert (tmp_project / "AGENTS.md").exists()
     assert (tmp_project / ".agents" / "rules" / "projectbrain.md").exists()
+    assert (tmp_project / "CLAUDE.md").exists()
+    # Cursor MCP & .mdc rule
+    assert (tmp_project / ".cursor" / "mcp.json").exists()
+    assert (tmp_project / ".cursor" / "rules" / "projectbrain.mdc").exists()
+    # VS Code MCP & Copilot/Cline rules
+    vscode_mcp = json.loads((tmp_project / ".vscode" / "mcp.json").read_text(encoding="utf-8"))
+    assert "projectbrain" in vscode_mcp["servers"]
+    assert (tmp_project / ".github" / "copilot-instructions.md").exists()
+    assert (tmp_project / ".clinerules").exists()

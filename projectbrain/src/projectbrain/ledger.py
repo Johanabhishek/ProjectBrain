@@ -55,9 +55,29 @@ class SavingsLedger:
         delivered_tokens: int,
         naive_full_file_tokens: int,
         files_covered: int,
+        touched_files: list[str] | set[str] | None = None,
+        file_sizes: dict[str, int] | None = None,
     ) -> dict[str, Any]:
+        data = self._load()
+        seen_files: set[str] = set(data.get("seen_files", []))
+
+        if touched_files is not None and file_sizes is not None:
+            new_files = [f for f in touched_files if f not in seen_files]
+            repeat_files = [f for f in touched_files if f in seen_files]
+            # Normal LLM without Brain reads ~350-line window (14KB) for unseen files,
+            # and does NOT re-read files already in context (only ~3KB if scanning a new region of a >24KB monolith)
+            realistic_bytes = sum(min(file_sizes.get(f, 0), 14000) for f in new_files)
+            realistic_bytes += sum(3000 for f in repeat_files if file_sizes.get(f, 0) > 24000)
+            if op == "dossier" and new_files:
+                realistic_bytes += 6000  # rg + closed-world scan overhead for new task
+            naive_full_file_tokens = max(delivered_tokens, realistic_bytes // 4)
+            reads_avoided = len(new_files)
+            seen_files.update(touched_files)
+            data["seen_files"] = sorted(seen_files)
+        else:
+            reads_avoided = max(0, files_covered - (1 if op == "dossier" else 0))
+
         saved_input = max(0, naive_full_file_tokens - delivered_tokens)
-        reads_avoided = max(0, files_covered - (1 if op == "dossier" else 0))
         usd_saved = round((saved_input / 1_000_000.0) * EFFECTIVE_INPUT_CONTEXT_USD_PER_M, 4)
         seconds_saved = round(reads_avoided * 4.5, 1)
 
@@ -75,7 +95,6 @@ class SavingsLedger:
             "est_usd_saved": usd_saved,
             "est_seconds_saved": seconds_saved,
         }
-        data = self._load()
         data["events"].append(event)
         self._save(data)
         return event

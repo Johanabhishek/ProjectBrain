@@ -166,8 +166,23 @@ def slice_lines(
             while i < total_len and not keep[i]:
                 i += 1
             gap_lines = i - gap_start
+            landmarks: list[str] = []
+            if gap_lines >= 8:
+                for k in range(gap_start, i):
+                    st = selected[k].strip()
+                    if len(st) > 6 and (
+                        "onClick=" in st
+                        or "className=" in st
+                        or "&& (" in st
+                        or st.startswith(("/* ", "{/*", "case ", "if (", "return ("))
+                    ):
+                        snippet = re.sub(r"\s+", " ", st)[:42]
+                        landmarks.append(f"L{start_idx + k + 1}:{snippet}")
+                        if len(landmarks) >= 4:
+                            break
+            lm_suffix = f" | landmarks: {', '.join(landmarks)}" if landmarks else ""
             formatted.append(
-                f" ... | [folded {gap_lines} lines L{start_idx + gap_start + 1}-L{start_idx + i}]"
+                f" ... | [folded {gap_lines} lines L{start_idx + gap_start + 1}-L{start_idx + i}{lm_suffix}]"
             )
     return "\n".join(formatted)
 
