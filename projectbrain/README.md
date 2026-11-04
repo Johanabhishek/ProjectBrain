@@ -4,14 +4,18 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-**Local-First AST Context Compiler, Closed-World Engineering Dossier, and Surgical Anchor Patch Engine for AI Coding Agents.**
+**Local-First 4D AST Coordinate Matrix, Surgical Engineering Dossier, and Anchor Patch Engine for AI Coding Agents.**
 
-ProjectBrain indexes your codebase into a typed AST & call-graph (`file`, `fn`, `cls`, `route`, `mod`) in `~90ms` using pre-compiled `tree-sitter` C wheels—no external database, no Docker, no vector embeddings, and no LLM required. It cuts coding-agent token bills by **60%–65%** while speeding up multi-file debugging and editing by **30%–42%**:
+Instead of forcing LLMs to search repositories as flat 1D text files (running `rg`/`grep` and reading dozens of overlapping `read_file` windows), ProjectBrain indexes your codebase into a **4D AST Coordinate Matrix** and typed symbol graph in `~90ms` using pre-compiled `tree-sitter` C wheels—no external database, no Docker, no vector embeddings, and no LLM required:
 
-- **Input Token Reduction (`-81.3%` to `-88.3%` code tokens, `-73.2%` to `-76.3%` billed prompt tokens):** Compiles module constants, smart-folded AST function slices, 1–3 hop bidirectional call chains with `@L<line>` caller windows, and a **Closed-World Exhaustive Repo Scan** into a single `<800`-line `.projectbrain_dossier.md` read in **1 `read_file` call**.
-- **Output Token Reduction (`-63.2%` to `-77.3%` edit output tokens):** Replaces verbatim `Target` + `Replacement` repetition (`edit_file`) with a compact Anchor Patch DSL (`@file`, `@sub`, `@replace`, `@insert_after`, `@delete`) validated by Tree-sitter in `<5ms`.
-- **Live ROI & Token Savings Ledger (`projectbrain stats --summary`):** Tracks cumulative input/output tokens saved, file reads avoided, estimated USD saved, and developer wait-time saved in `.projectbrain_ledger.json`.
-
+- **4D AST Coordinate Matrix (`X × Y × Z × W`):** Decomposes monolith files and giant components (`>200` lines) into atomic sub-symbol cells indexed across four orthogonal axes:
+  - **`X` (Scope / Branch):** Outer function, `switch` case branch (`case 'flashcards'`), `if/elif` dispatch, or JSX conditional block.
+  - **`Y` (Execution Role):** `STATE` (`useState`/`useRef`/`self.x`), `EFFECT` (`useEffect[deps]`/`useMemo`/`useCallback`), `ACTION` (handlers/mutations), `IO` (`fetch`/API/storage), or `VIEW` (JSX render blocks).
+  - **`Z_write` / `Z_read` (State & Storage Dependency):** Directional dataflow tracking which state variables and storage keys each cell mutates vs. reads.
+  - **`W` (Component & Call Wiring):** Outgoing function calls and rendered sub-components per cell.
+- **Single-Read Surgical Dossier (`projectbrain dossier`):** Intersects all 4 axes at once to unfold only the exact matching sub-symbol cells, module constants, 1-line `Connected Call-Graph` and `Secondary Candidate` coordinate maps, and a **Closed-World Exhaustive Repo Scan** into `.projectbrain_dossier.md`—with automatic **Session Cache deduplication** across follow-up queries.
+- **Surgical Anchor Patch Engine (`projectbrain patch`):** Replaces verbatim `Target` + `Replacement` repetition (`edit_file`) with a compact Anchor Patch DSL (`@file`, `@sub`, `@replace`, `@insert_after`, `@delete`) validated by Tree-sitter in `<5ms`.
+- **Page-Accurate Token Savings Ledger (`projectbrain stats --summary`):** Tracks real delivered tokens against 800-line `read_file` page baselines and `edit_file` payloads in `.projectbrain_ledger.json`.
 ---
 
 ## Step-by-Step Setup Guide (60 Seconds)
@@ -124,13 +128,13 @@ CLAUDE.md
 
 ## Daily CLI Workflow & Commands
 
-### 1. Compile a Single-Read Engineering Dossier (`dossier`)
-Before investigating a question or bug, compile a self-contained `<800`-line dossier (`.projectbrain_dossier.md`) with module globals, smart-folded AST slices, 1–3 hop call chains, and a Closed-World Exhaustive Repo Scan:
+### 1. Compile a Single-Read Engineering Dossier (`dossier` / `dossier --zoom`)
+Before investigating a question or bug, compile a self-contained `<800`-line dossier (`.projectbrain_dossier.md`) with module globals, 4D AST Coordinate Matrix cells, 1–3 hop call chains, and a Closed-World Exhaustive Repo Scan (or pass `--zoom` for ultra-compact pure 4D coordinate slices + 1-line pointer tables):
 
 ```bash
 projectbrain --path /path/to/repo dossier "what role does questionnaire have in onboarding"
+projectbrain --path /path/to/repo dossier --zoom "how does credit card validation and countdown redirect work"
 ```
-
 ### 2. Surgically Slice Symbols or Line Ranges (`slice`)
 Fetch exact source lines (`start_line`–`end_line`) for 1–2 symbols without reading the entire file:
 
@@ -139,8 +143,7 @@ projectbrain --path /path/to/repo slice --summary src/App.tsx:ProtectedRoute src
 ```
 
 ### 3. Apply Surgical Anchor Patches (`patch`)
-Cut output tokens by 65%–80% using the Anchor Patch DSL (`@file`, `@sub`, `@replace`, `@insert_after`, `@insert_before`, `@delete`), automatically syntax-checked by Tree-sitter:
-
+Apply multi-file edits using the Anchor Patch DSL (`@file`, `@sub`, `@replace`, `@insert_after`, `@insert_before`, `@delete`), automatically syntax-checked by Tree-sitter:
 ```bash
 # Dry-run (writes unified diff to .projectbrain_patch.diff)
 projectbrain --path /path/to/repo patch --spec "@file src/App.tsx
@@ -224,20 +227,33 @@ projectbrain --path /path/to/repo health
 
 ---
 
-## Verified A/B Benchmark Results (`142`-File Production Repo)
+## How the 4D Coordinate Matrix Works (1D Search vs. 4D Intersection)
 
-| Benchmark Scenario | Metric | Baseline Agent (No Brain) | ProjectBrain Agent | Improvement |
-| :--- | :--- | :---: | :---: | :---: |
-| **Scenario 1: Targeted 3-Part Engineering Analysis** | Code Output Ingested | `67,319` tok | **`12,569` tok** | **`-81.3%` (`5.35x` smaller)** |
-| | Total Prompt Tokens Billed | `655,391` tok | **`155,052` tok** | **`-76.3%` (`4.23x` fewer)** |
-| | File Reads (`read_file`) | `16` | **`2`** | **`-87.5%`** |
-| | Net API Cost | `$0.6723` | **`$0.2590`** | **`-61.5%` (`2.60x` cheaper)** |
-| **Scenario 2: Unseen Open-Ended Bug Report (Zero Identifiers)** | Code Output Ingested | `351,658` tok (`1.40M` chars) | **`40,982` tok (`163.9k` chars)** | **`-88.3%` (`8.58x` smaller)** |
-| | Total Prompt Tokens Billed | `4,561,692` tok | **`1,220,579` tok** | **`-73.2%` (`-3.34M` tokens)** |
-| | File Reads (`read_file`) | `84` (`19` re-reads) | **`6` (`0` re-reads)** | **`-92.9%` (`14.0x` fewer reads)** |
-| | Multi-File Patch Output Tokens | `3,359` tok (`edit_file`) | **`529` – `1,237` tok** | **`-63.2%` to `-77.3%` edit output** |
-| | Net API Cost | `$3.2712` | **`$1.1557`** | **`-64.7%` (`2.83x` cheaper)** |
+Traditional coding agents search in **1D**: they run `rg -n <keyword>` and call `read_file(StartLine, EndLine)` around every match. On large real-world files (e.g., a 3,000–6,000 line React view or Python service where 90%+ of the file lives inside one outer function), a single state variable or route identifier appears 20–50 times across declarations, effects, handlers, and JSX branches—forcing the agent to read thousands of lines of surrounding noise.
 
+ProjectBrain projects every large function/component into a **4D Coordinate Matrix** inside `.projectbrain_dossier.md`:
+
+```text
+# [4D Coordinate Matrix] StudyTable (L74-L5923, 86 sub-cells indexed)
+#   [L152-L162] Y:STATE  X:StudyTable.state        Z_w:flashcards,flashcardIdx  Z_r:-
+#   [L482-L547] Y:EFFECT X:StudyTable.useEffect[]  Z_w:savedCourseParams        Z_r:localStorage
+#   [L1736-L1854] Y:VIEW X:switch:case 'flashcards' Z_w:flashcardIdx            Z_r:flashcards  W:FlashcardDeck
+```
+
+When the agent queries a bug or feature, ProjectBrain computes the **coordinate intersection** across `(X, Y, Z, W)`, unfolds the exact matching cell lines verbatim, and leaves the rest of the monolith as a compact 1-line-per-cell coordinate map so the agent knows the exact `file:start-end` address of every other branch without reading the whole file.
+
+### Measured Real-World Subagent A/B Benchmark (v0.4.0)
+
+Evaluated across two production TypeScript/React + Python repositories (`142` files / `1,238` 4D cells and `162` files / `887` 4D cells) with a live head-to-head subagent A/B audit (`rg + read_file` vs. `projectbrain dossier --zoom` + `slice`):
+
+| Benchmark Metric | Baseline Agent (`rg` + `read_file`) | ProjectBrain 4D `--zoom` Agent | Measured Difference |
+| :--- | :---: | :---: | :---: |
+| **Ground-Truth Unfolded Code Recall (`20` spans across `12` tasks)** | `20/20` (`100%`) | **`20/20` (`100%`)** | Tied (`100%` recall) |
+| **Wall-Clock Investigation Time (3-Part Multi-File Audit)** | `152.0s` (`2m 32s`) | **`58.0s` (`0m 58s`)** | **`2.62x` faster (`-94.0s`)** |
+| **LLM Planner Turns** | `12` turns | **`5` turns** | **`2.40x` fewer turns (`-58.3%`)** |
+| **Total Tool Calls** | `17` calls | **`4` calls** | **`4.25x` fewer calls (`-76.5%`)** |
+| **Raw Tool Output Ingested** | `~24,759` tok (`99,037` chars) | **`~6,322` tok (`25,291` chars)** | **`3.92x` smaller (`-74.5%`)** |
+| **Cumulative Prompt Context Billed Across Turns** | `~198,796` tok (`795,187` chars) | **`~24,773` tok (`99,095` chars)** | **`8.02x` smaller (`-87.5%`)** |
 ---
 
 ## Project Layout

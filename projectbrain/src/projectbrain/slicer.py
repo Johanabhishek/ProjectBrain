@@ -14,17 +14,23 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
+from .parsers import _PARSERS
 
 _IMPORTANT_CODE_PAT = re.compile(
     r"\b(setInterval|setTimeout|clearTimeout|clearInterval|addEventListener|fetch|Promise\.race|AbortController|AbortSignal|"
     r"catch|throw|finally|document\.cookie|localStorage|sessionStorage|"
-    r"[a-zA-Z0-9_$]+(Cooldowns|Storage|Kv|Ref\.current)\.(get|set|has|add|delete)|"
+    r"setDoc|updateDoc|getDoc|getDocs|addDoc|deleteDoc|writeBatch|runTransaction|onSnapshot|hydrate|flush|"
+    r"[a-zA-Z0-9_$]+(Cooldowns|Storage|Kv|Ref\.current|Payload|State|Data)\.(get|set|has|add|delete)|"
     r"[A-Z][A-Z0-9]*_[A-Z0-9_]+)\b"
 )
 _UPPER_CONST_PAT = re.compile(r"\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b")
 _CODE_STMT_PAT = re.compile(
     r"^\s*(const\s|let\s|var\s|if\s*\(|else\b|for\s*\(|while\s*\(|try\s*\{|catch\s*\(|return\b|await\s|throw\s|"
-    r"[a-zA-Z0-9_$.]+\.(set|get|delete|clear|test|some|race|fetch|json|addEventListener)\()"
+    r"[a-zA-Z0-9_$.]+\.[a-zA-Z0-9_$]+\s*=|"
+    r"[a-zA-Z0-9_$.]+\.(set|get|delete|clear|test|some|race|fetch|json|addEventListener|push|assign)\()"
+)
+_KV_PROP_PAT = re.compile(
+    r"^\s*['\"]?[a-zA-Z_$][a-zA-Z0-9_$]*['\"]?\s*:\s*[^/\s]"
 )
 _JSX_NOISE_PAT = re.compile(r"^\s*(</?[a-z]+[\s>]|className=|d=\"M\d|stroke=|fill=)", re.IGNORECASE)
 
@@ -95,7 +101,8 @@ def slice_lines(
         low = low_lines[i]
         sc = 0.0
         is_code_stmt = bool(_CODE_STMT_PAT.match(line))
-        is_code_like = is_code_stmt or any(ch in stripped for ch in ("=", "{", "}", ";"))
+        is_kv_prop = bool(_KV_PROP_PAT.match(line)) and not _JSX_NOISE_PAT.match(line)
+        is_code_like = is_code_stmt or is_kv_prop or any(ch in stripped for ch in ("=", "{", "}", ";", ":"))
         for t in terms:
             if t in low:
                 # Discount matches on pure English prose lines inside template strings
@@ -108,14 +115,16 @@ def slice_lines(
             sc += 3.0
         if is_code_stmt:
             sc += 1.0
-        if _JSX_NOISE_PAT.match(line) and sc <= 1.0:
+        if is_kv_prop:
+            sc += 1.5
+        if _JSX_NOISE_PAT.match(line) and sc <= 1.5:
             sc = -1.0
         line_scores[i] = sc
 
     # Smooth scores over a +/- 2 line window (weighting the center line highest so isolated statements aren't penalized by surrounding comments/blank lines)
     window_scores: list[tuple[float, int]] = []
     for i in range(head_n, total_len - tail_n):
-        if line_scores[i] > 1.0:
+        if line_scores[i] >= 1.0:
             neighbors = sum(
                 max(0.0, line_scores[j])
                 for j in range(max(0, i - 2), min(total_len, i + 3))
@@ -123,7 +132,6 @@ def slice_lines(
             )
             w_sc = line_scores[i] + 0.35 * neighbors
             window_scores.append((w_sc, i))
-
     window_scores.sort(key=lambda x: x[0], reverse=True)
     kept_count = sum(1 for k in keep if k)
 
@@ -138,13 +146,14 @@ def slice_lines(
                 if kept_count >= max_lines:
                     break
 
-    # If no focus terms matched inside the function, fall back to keeping the first (max_lines - tail_n) lines
+    # If few focus windows matched inside the function, fill remaining budget with non-noise code lines
     if kept_count < max_lines // 2:
         for i in range(min(total_len, max_lines - tail_n)):
-            if not keep[i]:
+            if kept_count >= max_lines:
+                break
+            if not keep[i] and line_scores[i] >= 0.0:
                 keep[i] = True
                 kept_count += 1
-
     # Merge small 1-3 line gaps between kept blocks
     last_kept = -1
     for i in range(total_len):
@@ -187,6 +196,35 @@ def slice_lines(
     return "\n".join(formatted)
 
 
+_EMITTED_LINE_PAT = re.compile(r"^\s*(\d+)\s*\|")
+
+
+def extract_emitted_intervals(formatted_code: str) -> list[tuple[int, int]]:
+    """Extract contiguous (start_line, end_line) intervals of actually emitted
+    (unfolded) code lines from a formatted slice string.
+    """
+    line_nums: list[int] = []
+    for raw_ln in formatted_code.splitlines():
+        m = _EMITTED_LINE_PAT.match(raw_ln)
+        if m:
+            line_nums.append(int(m.group(1)))
+    if not line_nums:
+        return []
+    line_nums.sort()
+    intervals: list[tuple[int, int]] = []
+    cur_s = line_nums[0]
+    cur_e = line_nums[0]
+    for ln in line_nums[1:]:
+        if ln <= cur_e + 1:
+            cur_e = max(cur_e, ln)
+        else:
+            intervals.append((cur_s, cur_e))
+            cur_s = ln
+            cur_e = ln
+    intervals.append((cur_s, cur_e))
+    return intervals
+
+
 def extract_file_globals_slice(
     root: Path,
     rel_path: str,
@@ -213,6 +251,9 @@ def extract_file_globals_slice(
             covered[ln] = True
     for cls in info.get("classes", []):
         s, e = cls.get("line_start", 1), cls.get("line_end", 1)
+        first_ln = lines[max(0, s - 1)].strip() if 1 <= s <= n else ""
+        if re.match(r"^(export\s+)?(interface|type)\s+\w+", first_ln):
+            continue
         for ln in range(max(1, s), min(n, e) + 1):
             covered[ln] = True
 
@@ -221,6 +262,7 @@ def extract_file_globals_slice(
     in_import = False
     in_type_block = False
     type_brace_depth = 0
+    type_block_lines = 0
     literal_item_run = 0
 
     for idx, raw in enumerate(lines):
@@ -254,18 +296,30 @@ def extract_file_globals_slice(
                 in_import = True
             continue
 
-        # Skip pure TypeScript interface / type blocks
+        # Keep TypeScript interface / type blocks compactly (up to 8 field lines + closing brace)
         if in_type_block:
             type_brace_depth += stripped.count("{") - stripped.count("}")
-            if type_brace_depth <= 0 and (stripped.endswith("}") or stripped.endswith("};") or ";" in stripped):
+            type_block_lines += 1
+            is_type_end = type_brace_depth <= 0 and (stripped.endswith("}") or stripped.endswith("};") or ";" in stripped)
+            if is_type_end:
                 in_type_block = False
+                kept_lines.append((ln, raw))
+                if len(kept_lines) >= max_lines:
+                    break
+            elif type_block_lines <= 8:
+                kept_lines.append((ln, raw))
+                if len(kept_lines) >= max_lines:
+                    break
             continue
         if re.match(r"^(export\s+)?(interface|type)\s+\w+", stripped):
             if "{" in stripped and "}" not in stripped:
                 in_type_block = True
                 type_brace_depth = stripped.count("{") - stripped.count("}")
+                type_block_lines = 0
+            kept_lines.append((ln, raw))
+            if len(kept_lines) >= max_lines:
+                break
             continue
-
         # Collapse long static string/label arrays/maps unless they are regex patterns (/.../)
         is_regex_entry = stripped.startswith("/") and ("/i" in stripped or "/g" in stripped or stripped.endswith("/,"))
         is_simple_item = (
@@ -299,19 +353,155 @@ def extract_file_globals_slice(
     return "\n".join(out)
 
 
-def build_file_skeleton(rel_path: str, info: dict, behaviors: dict[str, str] | None = None, focus_terms: list[str] | None = None) -> str:
+
+_LANDMARK_DECL_PAT = re.compile(
+    r"^\s*(?:export\s+)?(?:const|let|function|async\s+function|def|async\s+def|class)\s+([a-zA-Z0-9_$]+)"
+)
+_LANDMARK_HOOK_PAT = re.compile(r"^\s*(?:const\s+\[([^\]]+)\]\s*=\s*useState|useEffect\s*\(|useMemo\s*\(|useCallback\s*\()")
+_LANDMARK_BRANCH_PAT = re.compile(
+    r"^\s*(?:\{\s*/\*\s*(.+?)\s*\*/\s*\}|/\*\s*===\s*(.+?)\s*===|\{?\s*([a-zA-Z0-9_$.]+\s*===\s*['\"][^'\"]+['\"])|case\s+(['\"][^'\"]+['\"]|[a-zA-Z0-9_$.]+)\s*:)"
+)
+
+
+def extract_monolith_landmarks(
+    lines: list[str],
+    line_start: int = 1,
+    line_end: int | None = None,
+    max_landmarks: int = 24,
+) -> list[dict]:
+    """Scan a monolith file/function for high-signal inner landmarks (handlers, state, tabs, JSX sections)."""
+    n = len(lines)
+    s_idx = max(0, line_start - 1)
+    e_idx = min(n, line_end if line_end is not None else n)
+    raw_lms: list[dict] = []
+
+    for idx in range(s_idx, e_idx):
+        ln_num = idx + 1
+        line = lines[idx]
+        st = line.strip()
+        if not st or len(st) < 4:
+            continue
+        label = None
+        m_br = _LANDMARK_BRANCH_PAT.search(st)
+        if m_br:
+            raw_lbl = next((g for g in m_br.groups() if g), st[:36])
+            label = re.sub(r"\s+", " ", raw_lbl.strip())[:36]
+        else:
+            m_hk = _LANDMARK_HOOK_PAT.search(st)
+            if m_hk:
+                label = f"state[{m_hk.group(1)[:24]}]" if m_hk.group(1) else st.split("(", 1)[0].strip()
+            else:
+                m_dc = _LANDMARK_DECL_PAT.match(line)
+                if m_dc:
+                    indent = len(line) - len(line.lstrip())
+                    if indent <= 12:
+                        label = m_dc.group(1)
+        if label:
+            # Skip if too close (<8 lines) to previous landmark
+            if raw_lms and (ln_num - raw_lms[-1]["line_start"]) < 8:
+                continue
+            raw_lms.append({"line_start": ln_num, "label": label})
+
+    for i, lm in enumerate(raw_lms):
+        lm["line_end"] = (raw_lms[i + 1]["line_start"] - 1) if (i + 1 < len(raw_lms)) else e_idx
+
+    if len(raw_lms) <= max_landmarks:
+        return raw_lms
+    step = max(1, len(raw_lms) // max_landmarks)
+    return [raw_lms[i] for i in range(0, len(raw_lms), step)][:max_landmarks]
+
+
+def snap_to_block_boundaries(
+    lines: list[str],
+    line_start: int,
+    line_end: int,
+    max_snap: int = 8,
+) -> tuple[int, int]:
+    """Snap arbitrary line range [line_start, line_end] up/down by up to `max_snap` lines
+    so statements or block headers/footers aren't cut in half.
+    """
+    n = len(lines)
+    s = max(1, min(n, line_start))
+    e = max(s, min(n, line_end))
+
+    # Snap start upward if a comment header or declaration starts within max_snap lines above
+    for k in range(1, min(max_snap + 1, s)):
+        cand = lines[s - 1 - k].strip()
+        if not cand:
+            s = s - k + 1
+            break
+        if _LANDMARK_DECL_PAT.match(lines[s - 1 - k]) or _LANDMARK_BRANCH_PAT.search(cand):
+            s = s - k
+            break
+
+    # Snap end downward if a closing brace/tag is immediately followed by a blank line within max_snap lines
+    for k in range(1, min(max_snap + 1, n - e + 1)):
+        cand = lines[e - 1 + k].strip()
+        if not cand:
+            e = e + k - 1
+            break
+        if cand in ("}", "};", ")};", "});", "</div>", "</>") and (
+            (e - 1 + k + 1 < n and not lines[e - 1 + k + 1].strip())
+        ):
+            e = e + k
+            break
+
+    return s, e
+
+
+def format_boundary_header(
+    lines: list[str],
+    line_start: int,
+    line_end: int,
+) -> str:
+    """Return a 1-line structural navigation bar showing adjacent landmarks in monolith files."""
+    if len(lines) < 180:
+        return ""
+    lms = extract_monolith_landmarks(lines, 1, len(lines), max_landmarks=60)
+    if not lms:
+        return f"# [File Bounds: L1-L{len(lines)} | Current Slice: L{line_start}-L{line_end}]"
+
+    prev_lm = None
+    curr_lms: list[dict] = []
+    next_lm = None
+    for lm in lms:
+        if lm["line_end"] < line_start:
+            prev_lm = lm
+        elif lm["line_start"] > line_end:
+            if next_lm is None:
+                next_lm = lm
+        else:
+            curr_lms.append(lm)
+
+    parts = [f"File L1-L{len(lines)}"]
+    if prev_lm:
+        parts.append(f"Prev: L{prev_lm['line_start']}-L{prev_lm['line_end']} ({prev_lm['label']})")
+    if curr_lms:
+        c_str = ", ".join(f"L{c['line_start']}:{c['label']}" for c in curr_lms[:3])
+        parts.append(f"In-slice: {c_str}")
+    if next_lm:
+        parts.append(f"Next: L{next_lm['line_start']}-L{next_lm['line_end']} ({next_lm['label']})")
+    return "# [Boundary Map] " + " | ".join(parts)
+
+def build_file_skeleton(
+    rel_path: str,
+    info: dict,
+    behaviors: dict[str, str] | None = None,
+    focus_terms: list[str] | None = None,
+    root: Path | None = None,
+) -> str:
     """Build a compact, token-efficient structural skeleton of a file.
 
     Includes:
       - Routes (METHOD /path -> handler)
       - Classes with base classes, schema fields, and method signatures
       - Top-level function signatures with types, behavioral role, and 1-line docstrings
+      - Inner Landmark Map for monolith functions (>220 lines) so agents never peephole-crawl
       - Zero implementation bodies!
     """
     behaviors = behaviors or {}
     focus_terms = [t.lower() for t in (focus_terms or [])]
     out: list[str] = [f"# File Skeleton: {rel_path}"]
-
     routes = info.get("routes", [])
     if routes:
         route_strs = [f"{r['method']} {r['path']} -> {r.get('handler') or '?'}" for r in routes]
@@ -346,9 +536,12 @@ def build_file_skeleton(rel_path: str, info: dict, behaviors: dict[str, str] | N
             beh_tag = f" [{beh}]" if beh and beh != "unknown" else ""
             out.append(f"    {msig}: ...  # {mlines}{beh_tag}")
 
+    file_lines: list[str] | None = None
     for fn in top_fns[:25]:
         fsig = fn.get("signature") or f"def {fn['name']}()"
-        flines = f"L{fn.get('line_start', '?')}-{fn.get('line_end', '?')}"
+        l_s = fn.get("line_start", 1)
+        l_e = fn.get("line_end", l_s)
+        flines = f"L{l_s}-{l_e}"
         beh = behaviors.get(fn["name"], "")
         beh_tag = f" [{beh}]" if beh and beh != "unknown" else ""
         doc_tag = ""
@@ -356,5 +549,544 @@ def build_file_skeleton(rel_path: str, info: dict, behaviors: dict[str, str] | N
             doc_first = fn["docstring"].splitlines()[0][:80]
             doc_tag = f' — "{doc_first}"'
         out.append(f"{fsig}: ...  # {flines}{beh_tag}{doc_tag}")
+        if root is not None and isinstance(l_s, int) and isinstance(l_e, int) and (l_e - l_s) >= 220:
+            if file_lines is None:
+                try:
+                    file_lines = (root / rel_path).read_text(encoding="utf-8", errors="replace").splitlines()
+                except OSError:
+                    file_lines = []
+            if file_lines:
+                lms = extract_monolith_landmarks(file_lines, l_s, l_e, max_landmarks=16)
+                if lms:
+                    lm_str = " | ".join(f"L{lm['line_start']}-L{lm['line_end']}:{lm['label']}" for lm in lms)
+                    out.append(f"    # Inner Landmarks: {lm_str}")
 
     return "\n".join(out)
+
+
+def _find_balanced_end(lines: list[str], start_idx: int, open_ch: str = "{", close_ch: str = "}", max_scan: int = 2600) -> int:
+    n = len(lines)
+    depth = 0
+    started = False
+    limit = min(n, start_idx + max_scan)
+    for idx in range(start_idx, limit):
+        ln = lines[idx]
+        in_str: str | None = None
+        escape = False
+        for ch in ln:
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if in_str:
+                if ch == in_str:
+                    in_str = None
+                continue
+            if ch in ("'", '"', "`"):
+                in_str = ch
+                continue
+            if ch == open_ch:
+                depth += 1
+                started = True
+            elif ch == close_ch:
+                depth -= 1
+                if started and depth <= 0:
+                    return idx
+    return min(n - 1, start_idx + 45)
+
+
+def extract_4d_coordinate_matrix(
+    lines: list[str],
+    line_start: int = 1,
+    line_end: int | None = None,
+    ext: str = ".tsx",
+) -> list[dict]:
+    """Decompose a file or giant function into a 4D Coordinate Matrix of atomic sub-blocks:
+      - X_scope: structural scope / branch guard (case '...', if (...), useEffect[deps], fn:name, jsx[cond])
+      - Y_role: execution phase (STATE | EFFECT | ACTION | IO | VIEW | SCHEMA)
+      - Z_write: state variables or storage keys mutated inside the block
+      - Z_read: state variables or storage keys read inside the block
+      - W_calls: child components rendered (<Comp>) or key functions invoked
+    Uses Tree-sitter AST span & assignment extraction combined with universal hook/store/JSX patterns.
+    """
+    n = len(lines)
+    s_idx = max(0, line_start - 1)
+    e_idx = min(n, line_end if line_end is not None else n)
+
+    # Pass 0: Tree-sitter AST traversal for exact block end lines & AST assignment mutations
+    ast_span_by_start: dict[int, int] = {}
+    ast_mutations_by_line: dict[int, list[str]] = {}
+    parser = _PARSERS.get(ext.lower()) or _PARSERS.get(".tsx")
+    if parser and n > 0:
+        try:
+            src_bytes = "\n".join(lines).encode("utf-8", errors="replace")
+            tree = parser.parse(src_bytes)
+            stack = [tree.root_node]
+            _SPAN_NODE_TYPES = {
+                "function_declaration", "arrow_function", "function_definition",
+                "method_definition", "call_expression", "if_statement",
+                "switch_case", "switch_default", "jsx_expression",
+                "ternary_expression", "conditional_expression",
+            }
+            _ASSIGN_NODE_TYPES = {
+                "assignment_expression", "augmented_assignment_expression",
+                "update_expression", "assignment", "augmented_assignment",
+            }
+            while stack:
+                nd = stack.pop()
+                nd_type = nd.type
+                s_ln = nd.start_point[0] + 1
+                e_ln = nd.end_point[0] + 1
+                if nd_type in _SPAN_NODE_TYPES and e_ln > s_ln:
+                    prev_e = ast_span_by_start.get(s_ln, 0)
+                    if (e_ln - s_ln) <= 2500 and e_ln > prev_e:
+                        ast_span_by_start[s_ln] = e_ln
+                if nd_type in _ASSIGN_NODE_TYPES:
+                    lhs = nd.child_by_field_name("left") or (nd.children[0] if nd.children else None)
+                    if lhs is not None:
+                        lhs_txt = lhs.text.decode("utf-8", errors="replace").strip()
+                        m_prop = re.match(r"^(?:self|this|state|store|draft|window|globalThis)\.([a-zA-Z_]\w*)", lhs_txt)
+                        if m_prop:
+                            prop_name = m_prop.group(1)
+                            if not prop_name.startswith("_"):
+                                ast_mutations_by_line.setdefault(s_ln, []).append(prop_name)
+                if nd.children:
+                    stack.extend(nd.children)
+        except Exception:
+            pass
+
+    # Pass 1: Discover state variables & their setters across the file (useState, useRef, Zustand/Redux/Context hooks, self.*)
+    state_vars: dict[str, str] = {}
+    for ln in lines:
+        for m_st in re.finditer(r"const\s+\[\s*(\w+)\s*,\s*(\w+)\s*\]\s*=\s*useState", ln):
+            state_vars[m_st.group(1)] = m_st.group(2)
+        for m_rf in re.finditer(r"const\s+(\w+)\s*=\s*useRef\b", ln):
+            rv = m_rf.group(1)
+            state_vars[rv] = f"{rv}\\.current\\s*="
+        for m_py in re.finditer(r"\bself\.([a-zA-Z_]\w*)\s*=", ln):
+            pv = m_py.group(1)
+            if not pv.startswith("_"):
+                state_vars[pv] = f"self\\.{pv}\\s*="
+        # Zustand / Redux / Context / Custom Hook object destructuring: const { user, setUser, dispatch } = useAuthStore(...)
+        m_hk = re.search(r"const\s+\{([^}]+)\}\s*=\s*(?:use[A-Z]\w*|useStore)\s*\(", ln)
+        if m_hk:
+            for raw_tok in m_hk.group(1).split(","):
+                tok = raw_tok.split(":")[-1].split("=")[0].strip()
+                if not re.match(r"^[a-zA-Z_]\w*$", tok):
+                    continue
+                m_act = re.match(r"^(?:set|update|add|remove|delete|toggle|clear|reset|mark)([A-Z]\w*)$", tok)
+                if m_act:
+                    target_k = m_act.group(1)[0].lower() + m_act.group(1)[1:]
+                    state_vars[target_k] = tok
+                elif tok == "dispatch":
+                    state_vars["dispatch"] = "dispatch"
+                elif tok not in state_vars:
+                    state_vars[tok] = f"__readonly_{tok}__"
+        # Zustand selector: const bears = useStore((s) => s.bears)
+        m_zs = re.search(r"const\s+(\w+)\s*=\s*use\w*Store\s*\([^)]*=>\s*\w+\.(\w+)", ln)
+        if m_zs:
+            local_nm = m_zs.group(1)
+            m_act = re.match(r"^(?:set|update|add|remove|delete|toggle|clear|reset)([A-Z]\w*)$", local_nm)
+            if m_act:
+                target_k = m_act.group(1)[0].lower() + m_act.group(1)[1:]
+                state_vars[target_k] = local_nm
+            elif local_nm not in state_vars:
+                state_vars[local_nm] = f"__readonly_{local_nm}__"
+
+    raw_blocks: list[tuple[str, str, int, int]] = []
+    i = s_idx
+    while i < e_idx:
+        ln = lines[i]
+        st = ln.strip()
+        lnum = i + 1
+        if not st or st.startswith(("//", "#", "/*")):
+            i += 1
+            continue
+
+        # 1. Contiguous STATE declarations (useState / useRef)
+        if re.search(r"\buse(?:State|Ref)\s*(?:<[^>]*>)?\s*\(", st):
+            b_start = lnum
+            while i + 1 < e_idx:
+                nxt = lines[i + 1].strip()
+                if re.search(r"\buse(?:State|Ref)\b", nxt) or not nxt or nxt.startswith("//"):
+                    i += 1
+                else:
+                    break
+            raw_blocks.append(("STATE", "state_declarations", b_start, i + 1))
+            i += 1
+            continue
+
+        # 2. Reactive EFFECT / Memo / Callback blocks
+        m_eff = re.search(r"\b(useEffect|useLayoutEffect|useMemo|useCallback)\s*\(", st)
+        if m_eff:
+            kind = m_eff.group(1)
+            end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _find_balanced_end(lines, i, "(", ")", max_scan=300)
+            tail = " ".join(lines[max(i, end_i - 3) : end_i + 1])
+            m_deps = re.search(r"\[([^\]]*)\]\s*\)", tail)
+            deps = m_deps.group(1).strip() if m_deps else ""
+            role = "EFFECT" if "Effect" in kind else "ACTION"
+            raw_blocks.append((role, f"{kind}[{deps[:36]}]", lnum, end_i + 1))
+            i = end_i + 1
+            continue
+
+        # 3. Switch case dispatch branches: case "foo":
+        m_case = re.match(r"^(?:case\s+(['\"][^'\"]+['\"]|[a-zA-Z0-9_$.]+)\s*:)+", st)
+        if m_case:
+            case_labels = re.findall(r"case\s+(['\"][^'\"]+['\"]|[a-zA-Z0-9_$.]+)\s*:", st)
+            while i + 1 < e_idx and re.match(r"^case\s+(['\"][^'\"]+['\"]|[a-zA-Z0-9_$.]+)\s*:", lines[i + 1].strip()):
+                i += 1
+                case_labels.extend(re.findall(r"case\s+(['\"][^'\"]+['\"]|[a-zA-Z0-9_$.]+)\s*:", lines[i].strip()))
+            lbl_str = "|".join(c.strip("'\"") for c in case_labels[:3])
+            # Scan forward until next sibling case/default at depth <= 0 or switch closing brace
+            b_depth = 0
+            p_depth = 0
+            end_i = i
+            for k in range(i, min(e_idx, i + 2500)):
+                k_st = lines[k].strip()
+                if k > i and b_depth == 0 and p_depth == 0 and (
+                    re.match(r"^(?:case\s+|default\s*:)", k_st)
+                ):
+                    end_i = k - 1
+                    break
+                for ch in k_st:
+                    if ch == "{":
+                        b_depth += 1
+                    elif ch == "}":
+                        b_depth -= 1
+                    elif ch == "(":
+                        p_depth += 1
+                    elif ch == ")":
+                        p_depth -= 1
+                if b_depth < 0:
+                    end_i = max(i, k - 1)
+                    break
+                end_i = k
+            sample = "\n".join(lines[lnum - 1 : min(end_i + 1, lnum + 35)])
+            role = "VIEW" if ("<" in sample or "return" in sample) else "ACTION"
+            raw_blocks.append((role, f"case:{lbl_str}", lnum, end_i + 1))
+            i = max(i + 1, end_i + 1 if (end_i - i) <= 120 else i + 1)
+            continue
+
+        # 4. Named functions / arrow handlers / Python defs / TS methods (skip giant outer containers >220 lines so inner cells are indexed)
+        m_fn = re.match(
+            r"^(?:export\s+)?(?:async\s+)?(?:function|def)\s+([a-zA-Z_]\w*)|^(?:export\s+)?const\s+([a-zA-Z_]\w*)\s*=\s*(?:async\s*)?\([^)]*\)\s*(?::\s*[^=]+)?=>\s*\{|^(?:public\s+|private\s+|protected\s+)?(?:async\s+)?([a-zA-Z_]\w*)\s*\([^;]*\)\s*(?::\s*[^{]+)?\{",
+            st,
+        )
+        if m_fn:
+            fn_name = m_fn.group(1) or m_fn.group(2) or m_fn.group(3)
+            if fn_name not in ("if", "for", "while", "switch", "catch", "constructor"):
+                if "def " in st:
+                    if lnum in ast_span_by_start:
+                        end_i = ast_span_by_start[lnum] - 1
+                    else:
+                        base_ind = len(ln) - len(ln.lstrip())
+                        end_i = i
+                        for k in range(i + 1, min(e_idx, i + 800)):
+                            k_s = lines[k].strip()
+                            if not k_s or k_s.startswith("#"):
+                                continue
+                            if (len(lines[k]) - len(lines[k].lstrip())) <= base_ind:
+                                break
+                            end_i = k
+                else:
+                    end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _find_balanced_end(lines, i, "{", "}", max_scan=3000)
+                span = (end_i + 1) - lnum
+                if span <= 200:
+                    body_txt = "\n".join(lines[i : end_i + 1])
+                    if re.search(
+                        r"\b(?:fetch|axios|setItem|getItem|memoryKv|setDoc|updateDoc|execute|commit|prisma|supabase|dispatch|requests\.|httpx\.|aiohttp\.|redis\.|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b",
+                        body_txt,
+                        re.IGNORECASE,
+                    ):
+                        role = "IO"
+                    elif re.search(r"(?:</[A-Za-z]|/>)", body_txt) and "return" in body_txt:
+                        role = "VIEW"
+                    else:
+                        role = "ACTION"
+                    raw_blocks.append((role, f"fn:{fn_name}", lnum, end_i + 1))
+                    i = end_i + 1
+                    continue
+
+        # 5. Conditional dispatch branches: if (...) / elif (...)
+        m_if = re.match(r"^(?:else\s+if|elif|if)\s*\(?([^):{]{4,75})\)?\s*[{:]", st)
+        if m_if:
+            cond = m_if.group(1).strip()
+            if st.endswith("{"):
+                end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _find_balanced_end(lines, i, "{", "}", max_scan=400)
+                span = (end_i + 1) - lnum
+                if 8 <= span <= 220:
+                    sample = "\n".join(lines[i : min(end_i + 1, i + 30)])
+                    role = "VIEW" if ("<" in sample and "return" in sample) else "ACTION"
+                    raw_blocks.append((role, f"branch[{cond[:40]}]", lnum, end_i + 1))
+                    i = end_i + 1
+                    continue
+
+        # 6. JSX conditional ({cond && (...)}, ternary {cond ? (...) : (...)}) or .map() render lists
+        m_jsx = re.match(r"^\{\s*([a-zA-Z0-9_!.?\s&=|]{3,45})\s*(?:&&|\?)\s*\(", st)
+        if m_jsx:
+            cond = re.sub(r"\s+", " ", m_jsx.group(1).strip())
+            end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _find_balanced_end(lines, i, "{", "}", max_scan=350)
+            if 5 <= (end_i + 1 - lnum) <= 160:
+                raw_blocks.append(("VIEW", f"jsx[{cond[:36]}]", lnum, end_i + 1))
+                i = end_i + 1
+                continue
+
+        m_map = re.search(r"\{\s*([a-zA-Z_][\w.]*)\.map\s*\(", st)
+        if m_map:
+            arr_nm = m_map.group(1)
+            end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _find_balanced_end(lines, i, "{", "}", max_scan=220)
+            span_m = (end_i + 1) - lnum
+            if 4 <= span_m <= 180:
+                sample_m = "\n".join(lines[i : min(end_i + 1, i + 25)])
+                if re.search(r"(?:</[A-Za-z]|/>|<[A-Z])", sample_m):
+                    raw_blocks.append(("VIEW", f"jsx[{arr_nm}.map]", lnum, end_i + 1))
+                    i = end_i + 1
+                    continue
+
+        i += 1
+
+    cells: list[dict] = []
+    for role, scope, s, e in raw_blocks:
+        chunk = "\n".join(lines[s - 1 : e])
+        z_write: list[str] = []
+        z_read: list[str] = []
+        for var, setter_pat in state_vars.items():
+            if not setter_pat.startswith("__readonly_") and re.search(rf"\b{setter_pat}\b", chunk):
+                z_write.append(var)
+            elif re.search(rf"\b{var}\b", chunk):
+                z_read.append(var)
+        for ln_no in range(s, e + 1):
+            for ast_w in ast_mutations_by_line.get(ln_no, []):
+                if ast_w not in z_write:
+                    z_write.append(ast_w)
+        # ORM & Store writes (Prisma, Supabase, Zustand/Redux, SQLAlchemy/DB)
+        for m_orm in re.finditer(
+            r"\b(?:prisma\.(\w+)\.(?:create|update|upsert|delete)|supabase\.from\(\s*['\"](\w+)['\"]\s*\)\.(?:insert|update|upsert|delete)|(\w+Store)\.setState)\b",
+            chunk,
+        ):
+            orm_target = m_orm.group(1) or m_orm.group(2) or m_orm.group(3)
+            if orm_target and orm_target not in z_write:
+                z_write.append(orm_target)
+        # SQL table mutations & reads (Python / TS / Go universal SQL patterns)
+        for m_sql_w in re.finditer(
+            r"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+([a-zA-Z_][a-zA-Z0-9_]{2,})\b",
+            chunk,
+            re.IGNORECASE,
+        ):
+            tbl = m_sql_w.group(1)
+            if tbl.lower() not in ("set", "values", "where", "table") and tbl not in z_write:
+                z_write.append(tbl)
+        for m_sql_r in re.finditer(
+            r"\bSELECT\b[\s\S]{1,120}?\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]{2,})\b",
+            chunk,
+            re.IGNORECASE,
+        ):
+            tbl = m_sql_r.group(1)
+            if tbl not in z_write and tbl not in z_read:
+                z_read.append(tbl)
+        # Key-Value Storage, Dict/Session/Cache/Env State, and Event Channels (Python & JS/TS)
+        for m_kv in re.finditer(
+            r"(?:getItem|setItem|removeItem|memoryKv\.(?:get|set)|(?:state|store|session|cache|db|ledger|context|os\.environ)\.(?:get|set|put|write|update|delete)|os\.getenv)\(\s*['\"]([^'\"]{2,40})['\"]",
+            chunk,
+        ):
+            k_name = m_kv.group(1)
+            full_m = m_kv.group(0)
+            if any(w in full_m for w in (".set", "setItem", "removeItem", ".put", ".write", ".update", ".delete")):
+                if k_name not in z_write:
+                    z_write.append(k_name)
+            elif k_name not in z_read:
+                z_read.append(k_name)
+        for m_dk in re.finditer(
+            r"\b(?:state|store|session|cache|db|ledger|context|os\.environ)\[\s*['\"]([^'\"]{2,40})['\"]\s*\](\s*=[^=])?",
+            chunk,
+        ):
+            k_name = m_dk.group(1)
+            is_assign = bool(m_dk.group(2))
+            if is_assign:
+                if k_name not in z_write:
+                    z_write.append(k_name)
+            elif k_name not in z_write and k_name not in z_read:
+                z_read.append(k_name)
+        # Event Bus / PubSub / Custom Event Channels (emit/publish/dispatch vs on/subscribe/listen)
+        for m_ev_w in re.finditer(r"\b(?:emit|publish|trigger|broadcast)\(\s*['\"]([a-zA-Z0-9_.:-]{3,40})['\"]", chunk):
+            ev_key = f"evt:{m_ev_w.group(1)}"
+            if ev_key not in z_write:
+                z_write.append(ev_key)
+        for m_ev_r in re.finditer(r"\b(?:on|once|subscribe|addEventListener|listen)\(\s*['\"]([a-zA-Z0-9_.:-]{3,40})['\"]", chunk):
+            ev_key = f"evt:{m_ev_r.group(1)}"
+            if ev_key not in z_read:
+                z_read.append(ev_key)
+        # Python self.<attr> reads
+        for m_py_r in re.finditer(r"\bself\.([a-zA-Z_]\w*)\b(?!\s*\()", chunk):
+            attr = m_py_r.group(1)
+            if not attr.startswith("_") and attr not in z_write and attr not in z_read:
+                z_read.append(attr)
+
+        # Axis 5 (E_exit): Failure, Exception & Early-Return Exit Contracts (Python raise/except + JS/TS throw/catch)
+        e_exit: list[str] = []
+        for m_ex in re.finditer(r"\b(?:raise|throw\s+new|throw)\s+([A-Za-z_]\w*)", chunk):
+            exc = m_ex.group(1)
+            if exc not in ("new", "return", "from") and f"throw:{exc}" not in e_exit:
+                e_exit.append(f"throw:{exc}")
+        for m_ct in re.finditer(r"\b(?:except|catch)\s*\(?([A-Za-z_]\w*)", chunk):
+            exc = m_ct.group(1)
+            if exc not in ("as",) and f"catch:{exc}" not in e_exit:
+                e_exit.append(f"catch:{exc}")
+        if re.search(r"\bif\b[^{:\n]*[:{]?\s*\n?\s*return\b(?:\s+(?:None|False|null|false|undefined|redirect\b))?", chunk):
+            if "guard_return" not in e_exit:
+                e_exit.append("guard_return")
+
+        # Axis 6 (T_mode): Universal Temporal & Concurrency Mode (SYNC | ASYNC | REACTIVE | TIMER)
+        if role == "EFFECT" or re.search(r"\b(?:useEffect|useLayoutEffect|onSnapshot|addEventListener|subscribe|on_event)\b", chunk):
+            t_mode = "REACTIVE"
+        elif re.search(r"\b(?:setTimeout|setInterval|requestAnimationFrame|asyncio\.sleep)\b", chunk):
+            t_mode = "TIMER"
+        elif re.search(r"\b(?:async\s+def|async\s+function|async\s*\(|await\s+|Promise\.|\.then\()\b", chunk):
+            t_mode = "ASYNC"
+        else:
+            t_mode = "SYNC"
+
+        w_comps = sorted(set(re.findall(r"<([A-Z][a-zA-Z0-9_]+)", chunk)))
+        w_calls = sorted(
+            {
+                m.group(1)
+                for m in re.finditer(r"\b([a-z][a-zA-Z0-9_]{3,})\s*\(", chunk)
+                if m.group(1) not in ("if", "for", "while", "switch", "catch", "return", "function", "useEffect", "useState", "useMemo", "useCallback")
+            }
+        )
+        cells.append({
+            "X_scope": scope,
+            "Y_role": role,
+            "Z_write": z_write[:10],
+            "Z_read": z_read[:14],
+            "W_calls": (w_comps + w_calls)[:10],
+            "E_exit": e_exit[:6],
+            "T_mode": t_mode,
+            "line_start": s,
+            "line_end": e,
+            "span": e - s + 1,
+        })
+    return cells
+
+
+def query_4d_coordinate_matrix(
+    cells: list[dict],
+    focus_terms: list[str] | None = None,
+    raw_query: str = "",
+    max_table_rows: int = 22,
+) -> tuple[list[dict], str]:
+    """Intersect query terms against the Universal 6D Coordinate Matrix (X_scope, Y_role, Z_write, Z_read, W_calls, E_exit, T_mode).
+    Returns (top_matched_cells, formatted_4d_matrix_table).
+    """
+    _STOP = {
+        "the", "and", "for", "with", "from", "into", "that", "this", "where", "when", "which",
+        "what", "how", "does", "are", "was", "were", "wired", "rendered", "updated", "changes",
+        "change", "study", "table", "studytable", "file", "function", "code",
+    }
+    raw_terms = [t.lower() for t in (focus_terms or []) if len(t) >= 3 and t.lower() not in _STOP]
+    terms: list[str] = []
+    for rt in raw_terms:
+        if rt not in terms:
+            terms.append(rt)
+    q_low = raw_query.lower()
+
+    wants_view = any(w in q_low for w in ("render", "ui", "view", "jsx", "button", "modal", "header", "layout", "display", "screen"))
+    wants_effect = any(w in q_low for w in ("effect", "mount", "reset", "hydrate", "watch", "change", "init", "sync", "countdown", "timer"))
+    wants_io = any(w in q_low for w in ("save", "persist", "storage", "db", "firestore", "cloud", "fetch", "api", "kv", "pay", "submit"))
+    wants_write = any(w in q_low for w in ("set", "update", "mark", "reset", "write", "save", "mutate", "toggle", "clear", "override"))
+    wants_error = any(w in q_low for w in ("error", "throw", "raise", "fail", "exception", "guard", "abort", "reject", "catch"))
+
+    def _stem(w: str) -> str:
+        st = re.sub(r"(?:ation|ment|ing|ed|es|s)$", "", w) if len(w) >= 5 else w
+        return st if len(st) >= 3 else w
+
+    import math
+    term_idf: dict[str, float] = {}
+    n_cells = max(1, len(cells))
+    for t in terms:
+        ts = _stem(t)
+        df = 0
+        for c in cells:
+            ex_str = " ".join(c.get("E_exit", []))
+            blob = f"{c['X_scope']} {' '.join(c['Z_write'])} {' '.join(c['Z_read'])} {' '.join(c['W_calls'])} {ex_str}".lower()
+            if t in blob or (len(ts) >= 3 and ts in blob):
+                df += 1
+        term_idf[t] = 1.0 + math.log((n_cells + 1.0) / (df + 1.0))
+
+    scored: list[tuple[float, dict]] = []
+    for c in cells:
+        sc = 0.0
+        x_low = c["X_scope"].lower()
+        y_role = c["Y_role"]
+        zw_low = " ".join(c["Z_write"]).lower()
+        zr_low = " ".join(c["Z_read"]).lower()
+        w_low = " ".join(c["W_calls"]).lower()
+        ex_low = " ".join(c.get("E_exit", [])).lower()
+
+        for t in terms:
+            ts = _stem(t)
+            idf_w = term_idf.get(t, 1.0)
+            axis_hits: list[float] = []
+            if t in x_low or (len(ts) >= 3 and ts in x_low):
+                axis_hits.append(5.0)
+            if t in zw_low or (len(ts) >= 3 and ts in zw_low):
+                axis_hits.append(4.5)
+            if t in w_low or (len(ts) >= 3 and ts in w_low):
+                axis_hits.append(4.0)
+            if t in ex_low or (len(ts) >= 3 and ts in ex_low):
+                axis_hits.append(4.2)
+            if t in zr_low or (len(ts) >= 3 and ts in zr_low):
+                axis_hits.append(2.5)
+            if axis_hits:
+                sc += (max(axis_hits) + 0.35 * (len(axis_hits) - 1)) * idf_w
+
+        if sc > 0:
+            if wants_view and y_role == "VIEW":
+                sc += 2.5
+            elif not wants_view and y_role == "VIEW":
+                sc *= 0.75
+            if wants_effect and y_role == "EFFECT":
+                sc += 2.5
+            if wants_io and y_role in ("IO", "ACTION"):
+                sc += 2.5
+            if wants_write and c["Z_write"]:
+                sc += 2.0
+            if wants_error and c.get("E_exit"):
+                sc += 2.5
+            if y_role == "STATE":
+                sc *= 0.30
+            if c["span"] > 400:
+                sc *= 0.6
+        scored.append((sc, c))
+
+    scored_pos = [item for item in scored if item[0] > 0]
+    scored_pos.sort(key=lambda item: (item[0], -item[1]["span"]), reverse=True)
+    top_cells = [item[1] for item in scored_pos[:4]]
+
+    display_cells: list[dict] = list(top_cells)
+    seen_spans = {(c["line_start"], c["line_end"]) for c in display_cells}
+    step = max(1, len(cells) // max(1, max_table_rows - len(display_cells)))
+    for idx in range(0, len(cells), step):
+        cand = cells[idx]
+        key = (cand["line_start"], cand["line_end"])
+        if key not in seen_spans:
+            display_cells.append(cand)
+            seen_spans.add(key)
+            if len(display_cells) >= max_table_rows:
+                break
+    display_cells.sort(key=lambda c: c["line_start"])
+
+    table_lines = [
+        "# [4D Coordinate Matrix] Lstart-Lend | Y_Role | X_Scope | ?Z_Write -> W_Calls"
+    ]
+    for c in display_cells:
+        zw = f" ?Z:[{','.join(c['Z_write'][:3])}]" if c["Z_write"] else ""
+        wc = f" W:[{','.join(c['W_calls'][:3])}]" if c["W_calls"] else ""
+        ex = f" E:[{','.join(c.get('E_exit', [])[:2])}]" if c.get("E_exit") else ""
+        tm = f" T:{c.get('T_mode')}" if c.get("T_mode") and c.get("T_mode") != "SYNC" else ""
+        table_lines.append(
+            f"#   L{c['line_start']:4d}-L{c['line_end']:4d} | {c['Y_role']:6s} | {c['X_scope'][:34]:34s} |{zw}{wc}{ex}{tm}"
+        )
+    return top_cells, "\n".join(table_lines)

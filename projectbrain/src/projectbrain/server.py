@@ -85,25 +85,28 @@ def brain_context(
 def brain_dossier(
     tasks: list[str],
     impact_files: list[str] | None = None,
+    zoom: bool = False,
+    include_markdown: bool = True,
     repo_path: str | None = None,
 ) -> dict:
     """Compile a self-contained <800-line Engineering Dossier (.projectbrain_dossier.md) in ONE call.
 
-    Combines module globals/constants, smart-folded AST function slices, 1-3 hop bidirectional
-    call chains with @L<line> caller windows, Closed-World Exhaustive Repo Scan of discovered
-    state keys/routes, and blast radius.
+    Combines 4D AST Coordinate Matrix slices, module globals/constants, 1-3 hop bidirectional
+    call chains, and Closed-World Exhaustive Repo Scan. Pass zoom=True for pure 4D Surgical Zoom.
+    When zoom=True or include_markdown=True (default), returns the compiled markdown directly in
+    the response so no second read_file call is needed.
     """
-    res = _get_brain(repo_path).compile_dossier(tasks, impact_files=impact_files)
+    res = _get_brain(repo_path).compile_dossier(tasks, impact_files=impact_files, zoom=zoom)
+    if include_markdown or zoom:
+        return res
     return {k: v for k, v in res.items() if k != "markdown"}
-
-
 @mcp.tool()
 def brain_patch(
     spec: str,
     apply: bool = False,
     repo_path: str | None = None,
 ) -> dict:
-    """Apply or dry-run a Surgical Anchor Patch spec to cut output tokens by 75%-90%.
+    """Apply or dry-run an AST-verified Surgical Anchor Patch spec.
 
     Use this instead of repeating verbatim Target + Replacement blocks in `edit_file` or
     writing verbose before/after code blocks.
@@ -126,7 +129,7 @@ def brain_stats(
     repo_path: str | None = None,
     reset: bool = False,
 ) -> dict:
-    """Return cumulative ROI and token/dollar/time savings from `.projectbrain_ledger.json`."""
+    """Return index topology and structural/epistemic resolution telemetry from `.projectbrain_ledger.json`."""
     return _get_brain(repo_path).stats(reset=reset)
 
 

@@ -25,7 +25,17 @@ from .memory import RepoMemory
 from .parsers import parse
 from .patcher import apply_patch_spec
 from .session import SessionManager
-from .slicer import slice_lines, build_file_skeleton, extract_file_globals_slice
+from .store import SQLiteIndexStore
+from .slicer import (
+    slice_lines,
+    build_file_skeleton,
+    extract_file_globals_slice,
+    snap_to_block_boundaries,
+    format_boundary_header,
+    extract_emitted_intervals,
+    extract_4d_coordinate_matrix,
+    query_4d_coordinate_matrix,
+)
 from .versions import SCHEMA_VERSION, PARSER_VERSION, GRAPH_VERSION
 
 SKIP_DIRS = {
@@ -157,6 +167,7 @@ class ProjectBrain:
         self._token_sets: dict[str, set[str]] = {}
         self._idf: dict[str, float] = {}
         self._cache_path = self.root / ".projectbrain.json"
+        self._db_store = SQLiteIndexStore(self.root / ".projectbrain.db")
         self._graph: CodeGraph | None = None
         self._graph_path = self.root / ".projectbrain_graph.json"
         self._defn_sets: dict[str, set[str]] = {}
@@ -168,6 +179,8 @@ class ProjectBrain:
         self._skipped: dict[str, str] = {}
         self._behaviors: dict[str, dict[str, str]] = {}
         self._ast_hashes: dict[str, str] = {}
+        self._z_write_sets: dict[str, set[str]] = {}
+        self._cell_4d_tokens: dict[str, set[str]] = {}
         self._session_manager = SessionManager()
         self._memory = RepoMemory(self.root)
         self._ledger = SavingsLedger(self.root)
@@ -358,10 +371,6 @@ class ProjectBrain:
                 if any(t in imp.lower() for t in ("test", "spec", "__tests__")):
                     related_tests.add(imp)
 
-        packet_tokens = max((actual_chars_emitted + 240) // 4, 1)
-        naive_file_tokens = max(raw_files_bytes // 4, packet_tokens)
-        savings_pct = round(max(0.0, (1.0 - packet_tokens / max(naive_file_tokens, 1)) * 100), 1)
-
         out: dict = {
             "task": task,
             "intent": intent,
@@ -369,11 +378,11 @@ class ProjectBrain:
             "neighbor_skeletons": neighbor_skeletons,
             "recommended_read_order": matched_files,
             "related_tests": sorted(related_tests),
-            "token_telemetry": {
-                "packet_tokens": packet_tokens,
-                "budget_tokens": budget_tokens,
-                "naive_full_files_tokens": naive_file_tokens,
-                "tokens_saved_pct": savings_pct,
+            "resolution_telemetry": {
+                "files_resolved": len(matched_files),
+                "target_slices_count": len(target_slices),
+                "neighbor_skeletons_count": len(neighbor_skeletons),
+                "session_deduplicated_count": len(omitted_already_in_context),
             },
         }
         if memories:
@@ -385,9 +394,9 @@ class ProjectBrain:
         self._ledger.record_input_op(
             op="compile",
             query=task,
-            delivered_tokens=packet_tokens,
-            naive_full_file_tokens=naive_file_tokens,
             files_covered=len(matched_files),
+            touched_files=all_touched_paths,
+            slices_included=len(target_slices),
         )
         return out
 
@@ -396,6 +405,7 @@ class ProjectBrain:
         tasks: list[str] | str,
         impact_files: list[str] | None = None,
         out_path: str | None = None,
+        zoom: bool = False,
     ) -> dict:
         """Compile a self-contained, zero-follow-up Engineering Dossier across one
         or more tasks/questions.
@@ -444,14 +454,24 @@ class ProjectBrain:
         ]
 
         seen_spans: list[tuple[str, int, int]] = []
+        primary_files: set[str] = set()
+        emitted_by_file: dict[str, list[tuple[int, int]]] = {}
+        matched_4d_cells_count = 0
 
         # Helper to add a file's module globals once (only when max_g > 0 so expanded callees don't prematurely lock out primary globals)
         def _ensure_globals(rel_path: str, buf: list[str], max_g: int = 24) -> None:
-            if max_g <= 0 or rel_path in seen_globals or rel_path not in self._index:
+            if zoom or max_g <= 0 or rel_path in seen_globals or rel_path not in self._index:
                 return
             seen_globals.add(rel_path)
             glob_text = extract_file_globals_slice(self.root, rel_path, self._index[rel_path], max_lines=max_g)
             if glob_text:
+                g_ivs = extract_emitted_intervals(glob_text)
+                if g_ivs:
+                    g_plan = self._ledger.plan_slice_intervals(rel_path, g_ivs[0][0], g_ivs[-1][1], commit=False)
+                    if not g_plan["unseen_intervals"]:
+                        buf.append(f"### [{rel_path} :: Module Constants — [Session Cache] Already delivered in this session (0 duplicate lines)]")
+                        return
+                emitted_by_file.setdefault(rel_path, []).extend(g_ivs)
                 buf.append(f"### [{rel_path} :: Module Constants, State & Bootstrap]")
                 buf.append(glob_text)
 
@@ -490,16 +510,68 @@ class ProjectBrain:
                     slice_s = max(l_start, c_ln - 3)
                     slice_e = min(l_end, c_ln + 7)
                     effective_max_l = 12
-            code = slice_lines(self.root, rel, slice_s, slice_e, max_lines=effective_max_l, focus_terms=kw_list + ast_calls)
-            if not code:
-                return
-            buf.append(f"### [{rel} :: {nd.get('name')} (L{l_start}-L{l_end}) — {reason}]")
-            buf.append(code)
 
+            # Session Zero-Waste Guard inside dossier: skip re-emitting spans already delivered unfolded in this session
+            s_plan = self._ledger.plan_slice_intervals(rel, slice_s, slice_e, commit=False)
+            if not s_plan["unseen_intervals"]:
+                buf.append(f"### [{rel} :: {nd.get('name')} (L{l_start}-L{l_end}) — [Session Cache] Already delivered in this session (0 duplicate lines)]")
+                return
+
+            matrix_header = ""
+            cell_slices: list[str] = []
+            if (slice_e - slice_s) > 200 and not is_caller_slice:
+                pre_cells = self._index[rel].get("cells_4d")
+                if pre_cells:
+                    cells = [
+                        c for c in pre_cells
+                        if c["line_start"] >= slice_s and c["line_end"] <= slice_e
+                    ]
+                else:
+                    try:
+                        f_lines = (self.root / rel).read_text(encoding="utf-8", errors="replace").splitlines()
+                    except OSError:
+                        f_lines = []
+                    cells = extract_4d_coordinate_matrix(f_lines, slice_s, slice_e, ext=Path(rel).suffix) if f_lines else []
+                if cells:
+                    if len(cells) >= 3:
+                        top_cells, matrix_header = query_4d_coordinate_matrix(
+                            cells, focus_terms=kw_list + ast_calls, raw_query=" ".join(tasks)
+                        )
+                        for tc in top_cells[:2]:
+                            tc_s, tc_e = tc["line_start"], tc["line_end"]
+                            if any(
+                                sr == rel and ss <= tc_s and tc_e <= se and (se - ss) <= 130
+                                for sr, ss, se in seen_spans
+                            ):
+                                continue
+                            if tc["span"] <= 90:
+                                tc_code = slice_lines(self.root, rel, tc_s, tc_e, max_lines=min(55, tc["span"] + 2), focus_terms=kw_list + ast_calls)
+                                if tc_code:
+                                    nonlocal matched_4d_cells_count
+                                    matched_4d_cells_count += 1
+                                    seen_spans.append((rel, tc_s, tc_e))
+                                    emitted_by_file.setdefault(rel, []).extend(extract_emitted_intervals(tc_code))
+                                    cell_slices.append(
+                                        f"# [4D Cell Match: {tc['Y_role']} | {tc['X_scope']} (L{tc_s}-L{tc_e})]\n{tc_code}"
+                                    )
+            code = (
+                ""
+                if cell_slices
+                else slice_lines(self.root, rel, slice_s, slice_e, max_lines=effective_max_l, focus_terms=kw_list + ast_calls)
+            )
+            if not code and not cell_slices:
+                return
+            if code:
+                emitted_by_file.setdefault(rel, []).extend(extract_emitted_intervals(code))
+            buf.append(f"### [{rel} :: {nd.get('name')} (L{l_start}-L{l_end}) — {reason}]")
+            if matrix_header:
+                buf.append(matrix_header)
+            for cs in cell_slices:
+                buf.append(cs)
+            if code:
+                buf.append(code)
         for idx, task in enumerate(tasks, start=1):
-            clean_task_for_search = re.sub(
-                r"also,?\s*how many files[^?]*\?", "", task, flags=re.IGNORECASE
-            ).strip() or task
+            clean_task_for_search = task.strip()
             t_kw = _extract_keywords(clean_task_for_search)
             t_low = clean_task_for_search.lower()
             sec: list[str] = [f"## Task {idx}: {task}"]
@@ -528,24 +600,71 @@ class ProjectBrain:
                             if re.search(r"\b" + re.escape(raw_nm) + r"\b", clean_task_for_search):
                                 explicit_nodes.append(nid)
 
+            # Count explicit matches per file so secondary giant components don't hijack primary focus
+            exp_by_file: dict[str, list[str]] = {}
             for enid in explicit_nodes:
                 if self._graph and self._graph.nodes.get(enid, {}).get("type") in ("fn", "cls"):
-                    _add_node_slice(enid, "explicitly referenced in task", t_kw, sec, max_l=50, max_g=8)
-
-            # 2. Rank files for this task (skip generic file search if an explicit route already matched)
+                    erel = self._graph.nodes[enid].get("rel_path", "")
+                    if erel:
+                        exp_by_file.setdefault(erel, []).append(enid)
+            dominant_exp_file = max(exp_by_file.items(), key=lambda kv: len(kv[1]))[0] if exp_by_file else ""
+            filtered_explicit: list[str] = []
+            for enid in explicit_nodes:
+                if self._graph and self._graph.nodes.get(enid, {}).get("type") in ("fn", "cls"):
+                    e_nd = self._graph.nodes.get(enid, {})
+                    erel = e_nd.get("rel_path", "")
+                    e_span = e_nd.get("line_end", 1) - e_nd.get("line_start", 1)
+                    # If dominant file has >=2 explicit symbols, treat a >300-line component in another file as a 1-line pointer
+                    if (
+                        dominant_exp_file
+                        and len(exp_by_file.get(dominant_exp_file, [])) >= 2
+                        and erel != dominant_exp_file
+                        and e_span > 300
+                    ):
+                        sec.append(
+                            f"### [{erel} :: {e_nd.get('name')} (L{e_nd.get('line_start', 1)}-L{e_nd.get('line_end', 1)}) — referenced component (use `slice` if internals needed)]"
+                        )
+                        continue
+                    # If same file already has specific inner explicit symbols, skip redundant 1D slice on >1500-line outer wrapper
+                    if (
+                        e_span > 1500
+                        and len(exp_by_file.get(erel, [])) >= 2
+                        and any(
+                            200 < (self._graph.nodes[o].get("line_end", 1) - self._graph.nodes[o].get("line_start", 1)) < e_span
+                            for o in exp_by_file.get(erel, [])
+                            if o != enid
+                        )
+                    ):
+                        primary_files.add(erel)
+                        continue
+                    if erel:
+                        primary_files.add(erel)
+                    filtered_explicit.append(enid)
+                    _add_node_slice(enid, "explicitly referenced in task", t_kw, sec, max_l=75 if e_span <= 180 else 55, max_g=8)
+            if filtered_explicit:
+                explicit_nodes = filtered_explicit
             had_initial_explicit = bool(explicit_nodes)
             step2_ranked_files: set[str] = set()
             same_file_callers_to_add: list[tuple[str, str, list[str]]] = []
+            top3_query_files: set[str] = set()
             if not has_explicit_route:
-                ranked = self.query(clean_task_for_search, top_n=1)
+                ranked_all = self.query(clean_task_for_search, top_n=3)
+                top3_query_files = {r["rel_path"] for r in ranked_all}
+                ranked = ranked_all[: (1 if had_initial_explicit else 2)]
+                top1_file_score = ranked[0]["score"] if ranked else 1.0
                 for file_rank, r in enumerate(ranked):
+                    if file_rank > 0 and r["score"] < top1_file_score * 0.72:
+                        continue
                     rp = r["rel_path"]
                     step2_ranked_files.add(rp)
+                    primary_files.add(rp)
+                    if len(filtered_explicit) >= 2 and rp in exp_by_file:
+                        continue
                     info = self._index.get(rp, {})
                     behaviors = self._behaviors.get(rp, {})
                     scored: list[tuple[float, str, dict]] = []
                     for fn in info.get("functions", []):
-                        sc = self._score_symbol_for_query(fn, t_kw, behaviors, info.get("routes", []))
+                        sc = self._score_symbol_for_query(fn, t_kw, behaviors, info.get("routes", []), info.get("cells_4d", []))
                         if sc > 0:
                             scored.append((sc, "fn", fn))
                     for cls in info.get("classes", []):
@@ -553,13 +672,26 @@ class ProjectBrain:
                         if sc > 0:
                             scored.append((sc, "cls", cls))
                     scored.sort(key=lambda x: x[0], reverse=True)
-                    top_k = 6 if had_initial_explicit else 4
-                    for rank_idx, (sc, kind, sym) in enumerate(scored[:top_k]):
+                    # Deduplicate nested functions so inner helpers don't consume top_k slots of the same outer function
+                    dedup_scored: list[tuple[float, str, dict]] = []
+                    for item in scored:
+                        s_fn = item[2]
+                        s_st, s_en = s_fn.get("line_start", 1), s_fn.get("line_end", 1)
+                        if any(
+                            o_fn.get("line_start", 1) <= s_st and s_en <= o_fn.get("line_end", 1) and (o_fn.get("line_end", 1) - o_fn.get("line_start", 1)) <= 180
+                            or (s_st <= o_fn.get("line_start", 1) and o_fn.get("line_end", 1) <= s_en and (s_en - s_st) <= 180)
+                            for _, _, o_fn in dedup_scored
+                        ):
+                            continue
+                        dedup_scored.append(item)
+                    top_k = 1 if (had_initial_explicit or file_rank > 0) else 2
+                    for rank_idx, (sc, kind, sym) in enumerate(dedup_scored[:top_k]):
                         nid = fn_id(rp, sym["name"], sym.get("parent_class")) if kind == "fn" else cls_id(rp, sym["name"])
-                        _add_node_slice(nid, f"top match in {rp}", t_kw, sec, max_l=58 if rank_idx < 3 else 34, max_g=33)
-                        if not had_initial_explicit and nid not in explicit_nodes and len(explicit_nodes) < 3:
+                        sym_span = sym.get("line_end", 1) - sym.get("line_start", 1)
+                        rank_max_l = (75 if sym_span <= 180 else 55) if rank_idx == 0 else 42
+                        _add_node_slice(nid, f"top match in {rp}", t_kw, sec, max_l=rank_max_l, max_g=16 if file_rank == 0 else 8)
+                        if not had_initial_explicit and nid not in explicit_nodes and len(explicit_nodes) < 4:
                             explicit_nodes.append(nid)
-                        elif had_initial_explicit and self._graph:
                             added_for_sym = 0
                             for ei_c in self._graph._radj.get(nid, []):
                                 ec = self._graph.edges[ei_c]
@@ -575,7 +707,7 @@ class ProjectBrain:
 
             # 3. Expand bidirectional call chains (BFS hop order + cross-file priority)
             wants_auth = any(w in t_kw for w in ("auth", "header", "headers", "token"))
-            wants_load = any(w in t_kw for w in ("load", "restore", "resume"))
+            wants_load = any(w.startswith(("load", "restore", "resume", "fetch", "cache")) for w in t_kw)
             if self._graph and explicit_nodes:
                 chain_lines: list[str] = []
                 expanded_nodes: list[tuple[str, str, list[str], int, int]] = []
@@ -598,15 +730,24 @@ class ProjectBrain:
                         dst1 = e1["dst"]
                         dst1_nd = self._graph.nodes.get(dst1, {})
                         dst1_rel = dst1_nd.get("rel_path", "")
+                        if (seed_e - seed_s) > 200:
+                            c_line = e1.get("line", 0)
+                            dst1_low = (dst1_nd.get("name") or "").lower()
+                            in_matched_cell = any(
+                                sr == seed_rel and (se - ss) <= 130 and ss <= c_line <= se
+                                for sr, ss, se in seen_spans
+                            )
+                            kw_hit = any(w in dst1_low for w in t_kw if len(w) >= 4)
+                            if not in_matched_cell and not kw_hit:
+                                continue
                         dst1_s = dst1_nd.get("line_start", 0)
                         dst1_e = dst1_nd.get("line_end", 0)
                         if dst1_rel == seed_rel and seed_s <= dst1_s and dst1_e <= seed_e:
                             continue
                         chain_lines.append(f"- `{seed_id}` -[{e1['type']} (L{e1.get('line', '?')})]-> `{dst1}`")
                         dst1_name = (dst1_nd.get("name") or "").lower()
-                        if dst1_rel == seed_rel and seed_rel in step2_ranked_files:
-                            continue
                         if not wants_auth and ("header" in dst1_name or "token" in dst1_name):
+                            continue
                             continue
                         h1_max_l = 10 if (dst1_name.startswith("load") and not wants_load) else 42
                         hop1_list.append((dst1, f"called by {seed_id.split(':')[-1]}", t_kw + [dst1_name], h1_max_l, 0))
@@ -668,6 +809,15 @@ class ProjectBrain:
                             continue
                         caller_files_seen.add(caller_rel)
                         bwd_expanded.append((caller_id, f"calls {seed_id.split(':')[-1]} @L{e_in.get('line', 0)}", [seed_id.split(":")[-1].lower()], 18, 0))
+                        if any(w[:4] in caller_name.lower() for w in t_kw if len(w) >= 4):
+                            for ei_b2 in self._graph._radj.get(caller_id, []):
+                                eb2 = self._graph.edges[ei_b2]
+                                if eb2["type"] == "calls" and eb2.get("confidence") in ("exact", "import_resolved"):
+                                    c2_id = eb2["src"]
+                                    c2_nd = self._graph.nodes.get(c2_id, {})
+                                    c2_span = c2_nd.get("line_end", 1) - c2_nd.get("line_start", 1)
+                                    if c2_span <= 120:
+                                        bwd_expanded.append((c2_id, f"calls {caller_name} @L{eb2.get('line', 0)}", [caller_name.lower()], 16, 0))
                         for dep_rel in self._import_targets.get(caller_rel, []):
                             dep_tokens = {tok.rstrip("s") for tok in _tokenize_symbol(Path(dep_rel).stem) if len(tok) >= 4}
                             norm_seed = {tok.rstrip("s") for tok in seed_tokens}
@@ -699,18 +849,76 @@ class ProjectBrain:
                                         inid = fn_id(imp_rel, ifn["name"], ifn.get("parent_class"))
                                         bwd_expanded.append((inid, f"invokes {seed_sym} in {imp_rel}", [seed_sym], 12, 0))
 
-                    expanded_nodes.extend(fwd_expanded[:6])
-                    expanded_nodes.extend(bwd_expanded[:3])
+                    expanded_nodes.extend(fwd_expanded[:8])
+                    expanded_nodes.extend(bwd_expanded[:8])
 
                 for sc_id, sc_reason, sc_kw in same_file_callers_to_add[:3]:
                     expanded_nodes.append((sc_id, sc_reason, sc_kw, 20, 0))
 
-                if chain_lines:
-                    sec.append("### Verified Call & Flow Graph Edges")
-                    sec.extend(list(dict.fromkeys(chain_lines))[:12])
+                # Append Transitive Interprocedural Effects & State-Channel Flow Edges for seed symbols
+                for seed_id in explicit_nodes[:4]:
+                    s_nd = self._graph.nodes.get(seed_id, {})
+                    t_zw = s_nd.get("transitive_z_write", [])
+                    t_eff = s_nd.get("transitive_effects", [])
+                    t_ex = s_nd.get("transitive_exits", [])
+                    prov = s_nd.get("effect_provenance", {})
+                    if t_zw or t_ex or "IO" in t_eff:
+                        parts_eff = []
+                        if t_zw:
+                            parts_eff.append(f"?Z_transitive:[{', '.join(t_zw[:4])}]")
+                        if t_eff:
+                            parts_eff.append(f"Effects:[{', '.join(t_eff)}]")
+                        if t_ex:
+                            parts_eff.append(f"Exits:[{', '.join(t_ex[:3])}]")
+                        sample_via = next(iter(prov.values()), "")
+                        via_sfx = f" ({sample_via})" if sample_via else ""
+                        chain_lines.append(f"- `{seed_id}` -[interprocedural_bubble]-> {' | '.join(parts_eff)}{via_sfx}")
+                    for ei_sf in self._graph._adj.get(seed_id, []):
+                        esf = self._graph.edges[ei_sf]
+                        if esf["type"] == "state_flow":
+                            chain_lines.append(f"- `{seed_id}` -[state_flow: {esf.get('reason', '')}]-> `{esf['dst']}`")
+                    for ei_sfr in self._graph._radj.get(seed_id, []):
+                        esfr = self._graph.edges[ei_sfr]
+                        if esfr["type"] == "state_flow":
+                            chain_lines.append(f"- `{esfr['src']}` -[state_flow: {esfr.get('reason', '')}]-> `{seed_id}`")
 
+                if chain_lines and not zoom and matched_4d_cells_count == 0:
+                    sec.append("### Static AST Call, State-Channel & Interprocedural Flow Edges")
+                    sec.extend(list(dict.fromkeys(chain_lines))[:12])
+                emitted_hops = 99 if (zoom and had_initial_explicit) else 0
+                max_hops_allowed = (2 if not had_initial_explicit else 1) if (zoom or matched_4d_cells_count > 0 or len(filtered_explicit) >= 2) else 2
+                def _hop_priority(item: tuple[str, str, list[str], int, int]) -> tuple[int, int, int, int]:
+                    nd_obj = self._graph.nodes.get(item[0], {}) if self._graph else {}
+                    nd_nm = (nd_obj.get("name") or "").lower()
+                    nd_rel = nd_obj.get("rel_path", "")
+                    nd_span = nd_obj.get("line_end", 1) - nd_obj.get("line_start", 1)
+                    is_1hop = 1 if not item[1].startswith(("2-hop", "3-hop")) else 0
+                    in_top_files = 1 if (nd_rel in top3_query_files and "analytics" not in nd_rel.lower()) else 0
+                    kw_hits = sum(1 for w in t_kw if len(w) >= 4 and (w in nd_nm or w[:4] in nd_nm))
+                    top_kw = 1 if (kw_hits > 0 and in_top_files) else 0
+                    substantive = 1 if nd_span >= 6 else 0
+                    return (-top_kw, -kw_hits, -in_top_files, -is_1hop, -substantive)
+                expanded_nodes.sort(key=_hop_priority)
+                hop_pointers: list[str] = []
                 for enid, ereason, ekw, emax_l, emax_g in expanded_nodes:
-                    _add_node_slice(enid, ereason, ekw, sec, max_l=emax_l, max_g=emax_g)
+                    if not self._graph or enid not in self._graph.nodes or enid in seen_slices:
+                        continue
+                    end_node = self._graph.nodes[enid]
+                    enm = (end_node.get("name") or "").lower()
+                    erel = end_node.get("rel_path", "")
+                    espan = end_node.get("line_end", 1) - end_node.get("line_start", 1)
+                    sec_lines_now = sum(len(x.splitlines()) for x in sec)
+                    kw_direct = any(w in enm or w[:4] in enm for w in t_kw if len(w) >= 4)
+                    if emitted_hops < max_hops_allowed and (sec_lines_now < 120 or (kw_direct and sec_lines_now < 200)) and espan <= 110:
+                        _add_node_slice(enid, ereason, ekw, sec, max_l=min(emax_l, 26), max_g=0)
+                        emitted_hops += 1
+                    else:
+                        ptr = f"- `{erel} :: {end_node.get('name')}` (L{end_node.get('line_start', 1)}-L{end_node.get('line_end', 1)}) ? {ereason}"
+                        if ptr not in hop_pointers:
+                            hop_pointers.append(ptr)
+                if hop_pointers:
+                    sec.append("### Connected Call-Graph Coordinate Map (1-hop/2-hop neighbors)")
+                    sec.extend(hop_pointers[:6])
 
             md_sections.extend(sec)
 
@@ -738,39 +946,56 @@ class ProjectBrain:
         # 5. Multi-File Symptom & Cross-File State-Key Expansion (when Pass 1 uses < 520 lines, e.g. open-ended bug hunts)
         current_md = "\n".join(md_sections)
         current_lines = len(current_md.splitlines())
-        if current_lines < 520:
+        if current_lines < 520 and not zoom:
             symptom_sec: list[str] = []
-
             # 5a. Extract state keys (getItem/setItem) and route paths (<Navigate to="...") from Pass 1 slices
+            _GENERIC_SCAN_WORDS = {
+                "how", "what", "where", "when", "why", "who", "does", "is", "are", "the", "and", "for", "with",
+                "from", "into", "state", "session", "usersession", "user", "app", "data", "database", "db",
+                "save", "saved", "saving", "track", "tracked", "tracking", "store", "stored", "file", "files",
+                "function", "code", "flow", "work", "works", "handled", "manage", "managed", "context", "sync",
+                "completed", "counts", "open", "id",
+            }
             all_t_kw = {w for t in tasks for w in _extract_keywords(t)}
+            specific_t_kw = {w for w in all_t_kw if w not in _GENERIC_SCAN_WORDS and len(w) >= 3}
+            all_tasks_low = " ".join(tasks).lower()
             state_keys: list[str] = []
-            for m_key in re.finditer(r"(?:getItem|setItem|removeItem)\(\s*['\"]([^'\"]{6,45})['\"]\s*\)", current_md):
+            for m_key in re.finditer(r"(?:getItem|setItem|removeItem)\(\s*['\"]([^'\"]{6,45})['\"]", current_md):
                 k_val = m_key.group(1)
-                if k_val not in ("username", "app_authenticated") and k_val not in state_keys:
+                if k_val in state_keys:
+                    continue
+                k_low = k_val.lower()
+                k_toks = {tok for tok in re.split(r"[_\-./]+", k_low) if len(tok) >= 3 and tok not in _GENERIC_SCAN_WORDS}
+                # Only include a state key if explicitly mentioned in tasks or matching a specific domain keyword
+                if k_low in all_tasks_low or (specific_t_kw and (k_toks & specific_t_kw)):
                     state_keys.append(k_val)
             for m_nav in re.finditer(r"Navigate\s+to=['\"](/[^'\"]{2,30})['\"]", current_md):
                 n_val = m_nav.group(1)
-                if n_val not in state_keys:
+                n_low = n_val.lower()
+                n_toks = {tok for tok in re.split(r"[_\-./]+", n_low) if len(tok) >= 3 and tok not in _GENERIC_SCAN_WORDS}
+                if n_val not in state_keys and (n_low in all_tasks_low or (specific_t_kw and (n_toks & specific_t_kw))):
                     state_keys.append(n_val)
             state_keys.sort(
-                key=lambda x: (any(w in x.lower() for w in all_t_kw), "_" in x, len(x)),
+                key=lambda x: (x.lower() in all_tasks_low, any(w in x.lower() for w in specific_t_kw), "_" in x, len(x)),
                 reverse=True,
             )
 
-            # 5b. Exhaustively scan all indexed files for discovered state_keys/routes (Closed-World Guarantee)
-            if state_keys:
-                target_keys = state_keys[:3]
-                xref_lines: list[str] = [
-                    "## Closed-World Exhaustive Repo Scan (100% File Coverage)",
-                    f"> **EXHAUSTIVE GUARANTEE:** Scanned all `{len(self._index)}` repository files. Every occurrence of "
-                    + ", ".join(f"`{k}`" for k in target_keys)
-                    + " across the entire codebase is shown below. Do NOT read other files to search for additional occurrences.",
-                ]
+            # 5b. Scan all indexed files for discovered query-relevant state_keys/routes
+            wants_cross_scan = (
+                matched_4d_cells_count == 0
+                or any(
+                    w in all_tasks_low
+                    for w in ("storage", "localstorage", "persist", "cloud", "kv", "route", "redirect", "navigate", "onboarding", "across", "sync")
+                )
+            )
+            if state_keys and wants_cross_scan:
+                target_keys = state_keys[:2]
+                xref_body: list[str] = []
                 xref_line_count = 2
+                test_hit_files: list[str] = []
+                omitted_prod_hits: list[str] = []
                 for sk in target_keys:
                     for rp in sorted(self._index.keys()):
-                        if current_lines + xref_line_count > 520:
-                            break
                         fpath = self.root / rp
                         if not fpath.exists():
                             continue
@@ -780,45 +1005,69 @@ class ProjectBrain:
                             continue
                         if sk not in raw_txt:
                             continue
+                        rp_low = rp.lower()
+                        if any(t_marker in rp_low for t_marker in ("test", "spec", "__tests__", "eval/")):
+                            if rp not in test_hit_files:
+                                test_hit_files.append(rp)
+                            continue
                         flines = raw_txt.splitlines()
                         hit_lines = [ln_no for ln_no, l_txt in enumerate(flines, start=1) if sk in l_txt]
-                        for h_ln in hit_lines[:4]:
-                            if current_lines + xref_line_count > 520:
-                                break
+                        for h_idx, h_ln in enumerate(hit_lines):
                             if any(sr == rp and ss <= h_ln <= se and (se - ss) <= 60 for sr, ss, se in seen_spans):
+                                continue
+                            if h_idx >= 3 or xref_line_count >= 64 or current_lines + xref_line_count > 520:
+                                omitted_prod_hits.append(f"{rp}:L{h_ln}")
                                 continue
                             w_s = max(1, h_ln - 3)
                             w_e = min(len(flines), h_ln + 7)
                             seen_spans.append((rp, w_s, w_e))
                             win_code = slice_lines(self.root, rp, w_s, w_e, max_lines=12)
                             if win_code:
-                                xref_lines.append(f"### [{rp} (L{w_s}-L{w_e}) — references `{sk}` @L{h_ln}]")
-                                xref_lines.append(win_code)
+                                emitted_by_file.setdefault(rp, []).extend(extract_emitted_intervals(win_code))
+                                xref_body.append(f"### [{rp} (L{w_s}-L{w_e}) — references `{sk}` @L{h_ln}]")
+                                xref_body.append(win_code)
                                 xref_line_count += 1 + len(win_code.splitlines())
-                if len(xref_lines) > 2:
-                    symptom_sec.extend(xref_lines)
+                if xref_body or omitted_prod_hits:
+                    if not omitted_prod_hits:
+                        xref_header = [
+                            "## Closed-World Exhaustive Repo Scan (100% File Coverage)",
+                            f"> **EXHAUSTIVE GUARANTEE:** Scanned all `{len(self._index)}` repository files. Every production occurrence of "
+                            + ", ".join(f"`{k}`" for k in target_keys)
+                            + " across the codebase is shown below. Do NOT read other files to search for additional occurrences.",
+                        ]
+                    else:
+                        xref_header = [
+                            "## Cross-File Repo Scan (Truncated to Fit Dossier Budget)",
+                            f"> **PARTIAL SCAN NOTE:** Scanned all `{len(self._index)}` repository files for "
+                            + ", ".join(f"`{k}`" for k in target_keys)
+                            + f". Showing top slices below; {len(omitted_prod_hits)} additional production occurrence(s) omitted: "
+                            + ", ".join(f"`{h}`" for h in omitted_prod_hits[:12]),
+                        ]
+                    symptom_sec.extend(xref_header)
+                    symptom_sec.extend(xref_body)
+                    if test_hit_files:
+                        symptom_sec.append(
+                            f"- **Also referenced in {len(test_hit_files)} test file(s):** "
+                            + ", ".join(f"`{tf}`" for tf in test_hit_files[:10])
+                        )
 
-            # 5c. Expand secondary candidate files (ranks #2-#7) for each symptom task, filtering out pure UI icon/spinner helpers
-            xref_covered_files = {sr for sr, _, _ in seen_spans if "Profile.tsx" in sr}
+            # 5c. Compact Secondary Candidate Map (replaces 745-line code padding with 1-line coordinate pointers)
+            map_pointer_lines: list[str] = []
             for idx, task in enumerate(tasks, start=1):
-                clean_t = re.sub(r"also,?\s*how many files[^?]*\?", "", task, flags=re.IGNORECASE).strip() or task
-                t_kw = [w for w in _extract_keywords(clean_t) if w not in ("modal", "open", "opens", "sometimes")]
+                clean_t = task.strip()
+                t_kw = _extract_keywords(clean_t)
                 if not t_kw:
-                    t_kw = _extract_keywords(clean_t)
-                more_ranked = self.query(" ".join(t_kw), top_n=7)
+                    continue
+                more_ranked = self.query(" ".join(t_kw), top_n=5)
+                top1_score = more_ranked[0]["score"] if more_ranked else 1.0
                 for r in more_ranked:
-                    if current_lines + sum(len(x.splitlines()) for x in symptom_sec) > 745:
-                        break
                     rp = r["rel_path"]
-                    if rp in xref_covered_files or "courseNavigation" in rp:
+                    if rp in step2_ranked_files:
                         continue
                     info = self._index.get(rp, {})
                     behaviors = self._behaviors.get(rp, {})
                     scored: list[tuple[float, str, dict]] = []
                     for fn in info.get("functions", []):
-                        fn_nm = (fn.get("name") or "").lower()
-                        if any(skip_w in fn_nm for skip_w in ("loadingwaitscreen", "icon", "spinner", "quickcheck", "waveform", "mindmap", "buildoverlay", "rendermaincontent")):
-                            continue
                         sc = self._score_symbol_for_query(fn, t_kw, behaviors, info.get("routes", []))
                         if sc > 0:
                             scored.append((sc, "fn", fn))
@@ -827,35 +1076,36 @@ class ProjectBrain:
                         if sc > 0:
                             scored.append((sc, "cls", cls))
                     scored.sort(key=lambda x: x[0], reverse=True)
-                    for rank_idx, (sc, kind, sym) in enumerate(scored[:2]):
-                        if current_lines + sum(len(x.splitlines()) for x in symptom_sec) > 745:
-                            break
+                    if not scored:
+                        continue
+                    # Only emit a code slice if Pass 1 had no explicit/4D matches and was very small (< 90 lines)
+                    if (
+                        not had_initial_explicit
+                        and matched_4d_cells_count == 0
+                        and current_lines + sum(len(x.splitlines()) for x in symptom_sec) < 90
+                        and r["score"] >= top1_score * 0.55
+                    ):
+                        sc, kind, sym = scored[0]
                         nid = fn_id(rp, sym["name"], sym.get("parent_class")) if kind == "fn" else cls_id(rp, sym["name"])
-                        _add_node_slice(nid, f"secondary symptom match in {rp} (Task {idx})", t_kw, symptom_sec, max_l=26, max_g=8)
-                        # Also include direct same-file data/auth/session/fetch callee if present (e.g., resolveAssetUrl -> getRegistryChapterData)
-                        if kind == "fn" and self._graph:
-                            for ei_s in self._graph._adj.get(nid, []):
-                                es = self._graph.edges[ei_s]
-                                if es["type"] == "calls" and es.get("confidence") in ("exact", "import_resolved"):
-                                    dst_s = es["dst"]
-                                    dst_nd = self._graph.nodes.get(dst_s, {})
-                                    dst_nm = (dst_nd.get("name") or "").lower()
-                                    if (
-                                        dst_nd.get("rel_path") == rp
-                                        and any(k in dst_nm for k in ("data", "auth", "session", "fetch", "error", "tenant", "token"))
-                                        and current_lines + sum(len(x.splitlines()) for x in symptom_sec) <= 745
-                                    ):
-                                        _add_node_slice(dst_s, f"called by {sym['name']} in {rp}", t_kw, symptom_sec, max_l=26, max_g=0)
-
+                        _add_node_slice(nid, f"secondary match in {rp} (Task {idx})", t_kw, symptom_sec, max_l=24, max_g=6)
+                        ptrs = [
+                            f"`{s['name']}` (L{s.get('line_start', 1)}-L{s.get('line_end', 1)})"
+                            for _, _, s in scored[:4]
+                        ]
+                        line_ptr = f"- `{rp}` :: " + ", ".join(ptrs)
+                        if line_ptr not in map_pointer_lines:
+                            map_pointer_lines.append(line_ptr)
+            if map_pointer_lines:
+                symptom_sec.append("### Secondary Candidate Coordinate Map (Use `projectbrain slice <file>:<symbol>` if needed)")
+                symptom_sec.extend(map_pointer_lines[:6])
             if symptom_sec:
                 md_sections.extend(symptom_sec)
-
             # 5d. Append compact output-token saving instructions for `projectbrain patch`
             current_lines_after = len("\n".join(md_sections).splitlines())
             if current_lines_after < 775:
                 md_sections.extend([
                     "",
-                    "## Output-Token Saving Patch Tool (`projectbrain patch`)",
+                    "## Surgical Anchor Patch Tool (`projectbrain patch`)",
                     "> Use `projectbrain --path \"<repo>\" patch --spec \"...\"` (or `--apply`) to generate verified unified diffs (`<repo>/.projectbrain_patch.diff`) without repeating full before/after code blocks:",
                     "> `@file <rel_path>` | `@sub L<line> \\`<old>\\` -> \\`<new>\\`` | `@replace L<s-e> ... @end` | `@insert_after L<line> ... @end` | `@delete L<s-e>`",
                 ])
@@ -864,41 +1114,29 @@ class ProjectBrain:
         target_file = Path(out_path) if out_path else (self.root / ".projectbrain_dossier.md")
         target_file.write_text(full_md, encoding="utf-8")
         total_lines = len(full_md.splitlines())
+        for f_rel, ivs in emitted_by_file.items():
+            self._ledger.commit_slice_intervals(f_rel, ivs)
         covered_files = {sr for sr, _, _ in seen_spans} | seen_globals
-        slices_per_file: dict[str, int] = {}
-        for sr, _, _ in seen_spans:
-            slices_per_file[sr] = slices_per_file.get(sr, 0) + 1
-        # Realistic IDE read_file baseline: ~400-line window (~16KB) per file + ~4.5KB per extra slice, capped at actual file size
-        naive_bytes = 0
-        for f in covered_files:
-            fsize = self._sizes.get(f, 0)
-            n_sl = max(1, slices_per_file.get(f, 1))
-            naive_bytes += min(fsize, 14000 + 4500 * (n_sl - 1))
-        # Plus ~8KB (~2,000 tokens) for multi-file rg + closed-world verification avoided
-        naive_bytes += 8000
-        est_tok = len(full_md) // 4
-        naive_tok = max(est_tok, naive_bytes // 4)
-        ledger_event = self._ledger.record_input_op(
+        credited_files = primary_files if primary_files else covered_files
+        closed_world_verified = "EXHAUSTIVE GUARANTEE" in full_md
+        self._ledger.record_input_op(
             op="dossier",
             query=" | ".join(tasks),
-            delivered_tokens=est_tok,
-            naive_full_file_tokens=naive_tok,
-            files_covered=len(covered_files),
-            touched_files=covered_files,
-            file_sizes=self._sizes,
+            files_covered=len(credited_files),
+            touched_files=credited_files,
+            slices_included=len(seen_slices),
+            cells_4d_resolved=matched_4d_cells_count,
+            closed_world_verified=closed_world_verified,
         )
-        eff_naive_tok = ledger_event["naive_input_tokens"]
-        savings_pct = round((ledger_event["input_tokens_saved"] / eff_naive_tok) * 100, 1) if eff_naive_tok > 0 else 0.0
         return {
             "dossier_path": str(target_file),
             "total_lines": total_lines,
             "total_chars": len(full_md),
-            "est_tokens": est_tok,
-            "naive_full_file_tokens": eff_naive_tok,
-            "input_tokens_saved": ledger_event["input_tokens_saved"],
-            "input_savings_pct": savings_pct,
             "slices_included": len(seen_slices),
             "files_globals_included": len(seen_globals),
+            "cells_4d_resolved": matched_4d_cells_count,
+            "files_resolved": len(credited_files),
+            "closed_world_verified": closed_world_verified,
             "markdown": full_md,
         }
 
@@ -909,7 +1147,7 @@ class ProjectBrain:
         diff_out: str | None = None,
         fuzzy_window: int = 8,
     ) -> dict:
-        """Apply or dry-run a Surgical Anchor Patch spec and return unified diff + output token savings."""
+        """Apply or dry-run a Surgical Anchor Patch spec and return unified diff + syntax verification."""
         diff_path = Path(diff_out) if diff_out else (self.root / ".projectbrain_patch.diff")
         res = apply_patch_spec(
             self.root,
@@ -918,14 +1156,12 @@ class ProjectBrain:
             diff_out_path=diff_path,
             fuzzy_window=fuzzy_window,
         )
-        telem = res.get("output_token_telemetry", {})
         if res.get("total_ops_applied", 0) > 0:
             self._ledger.record_patch_op(
                 files_patched=res.get("files_patched", 0),
                 ops_applied=res.get("total_ops_applied", 0),
-                spec_tokens=telem.get("patch_spec_tokens", 0),
-                equiv_edit_tokens=telem.get("standard_edit_file_tokens", 0),
                 mode="applied" if apply else "dry_run",
+                all_syntax_valid=bool(res.get("all_syntax_valid", False)),
             )
         if apply and res.get("all_syntax_valid"):
             self.index()
@@ -937,7 +1173,12 @@ class ProjectBrain:
             return self._ledger.reset()
         return self._ledger.get_stats()
 
-    def slice_symbols(self, targets: list[str] | str, max_lines_per_symbol: int = 120) -> dict:
+    def slice_symbols(
+        self,
+        targets: list[str] | str,
+        max_lines_per_symbol: int = 120,
+        summary_mode: bool = False,
+    ) -> dict:
         """Surgically slice specific symbols or files without reading full files.
 
         Each target in `targets` can be:
@@ -963,8 +1204,55 @@ class ProjectBrain:
                 fpath, s_line, e_line = range_match.group(1), int(range_match.group(2)), int(range_match.group(3))
                 rel = self._normalize_rel(fpath)
                 if rel in self._index:
-                    span_len = max(max_lines_per_symbol, e_line - s_line + 1)
-                    code = slice_lines(self.root, rel, s_line, e_line, max_lines=span_len)
+                    try:
+                        f_lines = (self.root / rel).read_text(encoding="utf-8", errors="replace").splitlines()
+                    except OSError:
+                        f_lines = []
+                    if f_lines:
+                        s_line, e_line = snap_to_block_boundaries(f_lines, s_line, e_line)
+                        plan = self._ledger.plan_slice_intervals(rel, s_line, e_line, len(f_lines), commit=False)
+                        unseen = plan["unseen_intervals"]
+                        skipped = plan["skipped_intervals"]
+                        b_hdr = format_boundary_header(f_lines, s_line, e_line)
+                        if not unseen:
+                            code = (
+                                f"{b_hdr}\n" if b_hdr else ""
+                            ) + f"# [Zero-Waste Guard] L{s_line}-L{e_line} of {rel} was already delivered in this session (file unchanged — 0 duplicate lines emitted)."
+                        else:
+                            parts_out: list[str] = []
+                            if b_hdr:
+                                parts_out.append(b_hdr)
+                            if skipped and not plan["auto_completed_file"]:
+                                sk_str = ", ".join(f"L{ks}-L{ke}" for ks, ke in skipped)
+                                un_str = ", ".join(f"L{us}-L{ue}" for us, ue in unseen)
+                                parts_out.append(
+                                    f"# [Zero-Waste Guard] Trimmed already-read ({sk_str}); emitting only unseen ({un_str}):"
+                                )
+                            elif plan["auto_completed_file"] and not summary_mode:
+                                un_str = ", ".join(f"L{us}-L{ue}" for us, ue in unseen)
+                                parts_out.append(
+                                    f"# [Small-File Remainder Guard] Emitting all remaining unread lines ({un_str}) of {rel} ({len(f_lines)} lines total) in one pass:"
+                                )
+                            if summary_mode:
+                                target_cap = max(55, min(max_lines_per_symbol, 220 // max(1, len(targets))))
+                            else:
+                                # Explicit non-summary line-range request: unfold up to 400 lines per target
+                                target_cap = max(max_lines_per_symbol, 400)
+                            emitted_ivs: list[tuple[int, int]] = []
+                            for u_s, u_e in unseen:
+                                u_len = (
+                                    min(400, u_e - u_s + 1)
+                                    if not summary_mode
+                                    else min(target_cap, max(45, target_cap // max(1, len(unseen))))
+                                )
+                                chunk_code = slice_lines(self.root, rel, u_s, u_e, max_lines=u_len)
+                                parts_out.append(chunk_code)
+                                emitted_ivs.extend(extract_emitted_intervals(chunk_code))
+                            self._ledger.commit_slice_intervals(rel, emitted_ivs)
+                            code = "\n".join(parts_out)
+                    else:
+                        span_len = max_lines_per_symbol if summary_mode else max(max_lines_per_symbol, min(400, e_line - s_line + 1))
+                        code = slice_lines(self.root, rel, s_line, e_line, max_lines=span_len)
                     slices.append({
                         "target": t,
                         "rel_path": rel,
@@ -976,7 +1264,6 @@ class ProjectBrain:
                         "code": code,
                     })
                     continue
-
             # 2. Exact node_id in graph
             if self._graph and t in self._graph.nodes:
                 nd = self._graph.nodes[t]
@@ -985,6 +1272,7 @@ class ProjectBrain:
                     l_start = nd.get("line_start", 1)
                     l_end = nd.get("line_end", l_start)
                     code = slice_lines(self.root, rel, l_start, l_end, max_lines=max_lines_per_symbol)
+                    self._ledger.commit_slice_intervals(rel, extract_emitted_intervals(code))
                     self._served_slices.add(t)
                     slices.append({
                         "node_id": t,
@@ -999,14 +1287,14 @@ class ProjectBrain:
                     })
                     continue
                 elif nd.get("type") == "file" and rel in self._index:
-                    skel = build_file_skeleton(rel, self._index[rel], behaviors=self._behaviors.get(rel, {}))
+                    skel = build_file_skeleton(rel, self._index[rel], behaviors=self._behaviors.get(rel, {}), root=self.root)
                     slices.append({"node_id": t, "rel_path": rel, "symbol": rel, "name": rel, "skeleton": skel, "code": skel})
                     continue
 
             # 3. Direct file path -> return file skeleton
             rel_try = self._normalize_rel(t)
             if rel_try in self._index:
-                skel = build_file_skeleton(rel_try, self._index[rel_try], behaviors=self._behaviors.get(rel_try, {}))
+                skel = build_file_skeleton(rel_try, self._index[rel_try], behaviors=self._behaviors.get(rel_try, {}), root=self.root)
                 self._served_skeletons.add(rel_try)
                 slices.append({"target": t, "rel_path": rel_try, "symbol": rel_try, "name": rel_try, "skeleton": skel, "code": skel})
                 continue
@@ -1030,6 +1318,7 @@ class ProjectBrain:
                         nid = fn_id(rel, fn["name"], fn.get("parent_class"))
                         l_start, l_end = fn.get("line_start", 1), fn.get("line_end", 1)
                         code = slice_lines(self.root, rel, l_start, l_end, max_lines=max_lines_per_symbol)
+                        self._ledger.commit_slice_intervals(rel, extract_emitted_intervals(code))
                         self._served_slices.add(nid)
                         slices.append({
                             "node_id": nid,
@@ -1048,6 +1337,7 @@ class ProjectBrain:
                         nid = cls_id(rel, cls["name"])
                         l_start, l_end = cls.get("line_start", 1), cls.get("line_end", 1)
                         code = slice_lines(self.root, rel, l_start, l_end, max_lines=max_lines_per_symbol)
+                        self._ledger.commit_slice_intervals(rel, extract_emitted_intervals(code))
                         self._served_slices.add(nid)
                         slices.append({
                             "node_id": nid,
@@ -1066,16 +1356,12 @@ class ProjectBrain:
         total_slice_chars = sum(len(s.get("code") or s.get("skeleton") or "") for s in slices)
         if total_slice_chars > 0:
             slice_files = {s.get("rel_path") for s in slices if s.get("rel_path")}
-            deliv_tok = max(1, total_slice_chars // 4)
-            naive_slice_bytes = sum(min(self._sizes.get(f, 0), 16000) for f in slice_files)
             self._ledger.record_input_op(
                 op="slice",
                 query=", ".join(targets)[:120],
-                delivered_tokens=deliv_tok,
-                naive_full_file_tokens=max(deliv_tok, naive_slice_bytes // 4),
                 files_covered=len(slice_files),
                 touched_files=slice_files,
-                file_sizes=self._sizes,
+                slices_included=len(slices),
             )
         return {"slices": slices, "count": len(slices)}
 
@@ -1188,28 +1474,48 @@ class ProjectBrain:
             return file_path.replace("\\", "/").lstrip("./")
 
     def _score_symbol_for_query(
-        self, fn: dict, keywords: list[str], behaviors: dict[str, str], routes: list[dict],
+        self,
+        fn: dict,
+        keywords: list[str],
+        behaviors: dict[str, str],
+        routes: list[dict],
+        cells_4d: list[dict] | None = None,
     ) -> float:
         name_lower = fn.get("name", "").lower()
         name_tokens = set(_tokenize_symbol(fn.get("name", ""))) | {name_lower}
         doc_lower = (fn.get("docstring") or "").lower()
         calls_lower = {c.lower() for c in fn.get("calls", [])}
         body_tokens = set(fn.get("body_tokens", []))
+        fn_s = fn.get("line_start", 1)
+        fn_e = fn.get("line_end", fn_s)
         score = 0.0
         for kw in keywords:
             idf = self._idf.get(kw, 1.0)
+            kw_stem = re.sub(r"(?:ed|ing|es|s)$", "", kw) if len(kw) >= 5 else kw
+            if len(kw_stem) < 3:
+                kw_stem = kw
             if kw == name_lower:
                 score += 4.0 * idf
-            elif kw in name_tokens or kw in name_lower:
+            elif kw in name_tokens or kw in name_lower or (len(kw_stem) >= 4 and kw_stem in name_lower):
                 score += 2.5 * idf
-            elif kw in doc_lower:
+            elif kw in doc_lower or (len(kw_stem) >= 4 and kw_stem in doc_lower):
                 score += 1.0 * idf
-            elif kw in calls_lower:
+            elif any(kw in c or (len(kw_stem) >= 4 and kw_stem in c) for c in calls_lower):
                 score += 0.8 * idf
-            elif kw in body_tokens:
+            elif kw in body_tokens or any(len(kw_stem) >= 4 and kw_stem in bt for bt in body_tokens):
                 score += 0.6 * idf
-
-        # Boost route handlers if route matches
+        if score == 0.0 and (fn_e - fn_s) > 120 and cells_4d:
+            inner_cells = [
+                c for c in cells_4d
+                if fn_s <= c.get("line_start", 0) and c.get("line_end", 0) <= fn_e
+            ]
+            cell_blob = " ".join(
+                f"{c.get('X_scope', '')} {' '.join(c.get('Z_write', []))}"
+                for c in inner_cells
+            ).lower()
+            for kw in keywords:
+                if kw in cell_blob:
+                    score += 0.7 * self._idf.get(kw, 1.0)
         for r in routes:
             if r.get("handler") == fn.get("name"):
                 for kw in keywords:
@@ -1475,49 +1781,69 @@ class ProjectBrain:
             st = path.stat()
             info = parse(source, ext)
             info.setdefault("routes", []).extend(frameworks.infer_file_based_routes(rel, info))
+            info["cells_4d"] = extract_4d_coordinate_matrix(source.splitlines(), ext=ext)
             info["mtime"] = st.st_mtime
             self._index[rel] = info
             self._sizes[rel] = st.st_size
 
-        cache_obj = {
-            "schema_version": SCHEMA_VERSION,
-            "parser_version": PARSER_VERSION,
-            "graph_version": GRAPH_VERSION,
-            "root": str(self.root),
-            "skipped": self._skipped,
-            "files": {
-                rel: {
-                    "mtime": info.get("mtime"),
-                    "size": self._sizes.get(rel),
-                    "hash": None,
-                    "info": {k: v for k, v in info.items() if k != "mtime"},
-                }
-                for rel, info in self._index.items()
-            },
-        }
-        self._cache_path.write_text(json.dumps(cache_obj, indent=2), encoding="utf-8")
         self._build_blobs()
         self._graph = CodeGraph.build(
             self._index,
             import_targets=self._import_targets,
             symbol_imports=self._symbol_imports,
         )
-        self._graph_path.write_text(self._graph.to_json(), encoding="utf-8")
+        self._sync_interprocedural_effects()
+        self._db_store.write_full(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "parser_version": PARSER_VERSION,
+                "graph_version": GRAPH_VERSION,
+                "root": str(self.root),
+            },
+            self._index,
+            self._sizes,
+            self._skipped,
+            graph_json=self._graph.to_json(),
+        )
+        for legacy in (self._cache_path, self._graph_path):
+            if legacy.exists():
+                legacy.unlink(missing_ok=True)
         return self.stats()
 
     def load(self) -> bool:
-        """Load a previously saved index from disk."""
-        if not self._cache_path.exists():
+        """Load a previously saved index from disk (SQLite .projectbrain.db primary)."""
+        data = None
+        db_exists = self._db_store.db_path.exists()
+        json_exists = self._cache_path.exists()
+        if not db_exists and not json_exists:
             return False
 
-        try:
-            data = json.loads(self._cache_path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            return False
+        # Prefer SQLite .projectbrain.db unless a legacy/tampered .projectbrain.json is present
+        json_header_ok = True
+        if json_exists:
+            try:
+                with self._cache_path.open("r", encoding="utf-8") as fh:
+                    head = fh.read(200)
+                json_header_ok = (
+                    f'"schema_version": {SCHEMA_VERSION}' in head
+                    and f'"parser_version": "{PARSER_VERSION}"' in head
+                )
+            except OSError:
+                json_header_ok = False
+        use_sqlite = db_exists and (not json_exists or json_header_ok)
+        if use_sqlite:
+            data = self._db_store.load_all()
+
+        if data is None:
+            if not json_exists:
+                return False
+            try:
+                data = json.loads(self._cache_path.read_text(encoding="utf-8"))
+            except json.JSONDecodeError:
+                return False
 
         if not self._is_compatible_cache(data):
             return False
-
         self._index = {
             rel: {**entry.get("info", {}), "mtime": entry.get("mtime")}
             for rel, entry in data.get("files", {}).items()
@@ -1527,7 +1853,9 @@ class ProjectBrain:
         }
         self._skipped = data.get("skipped", {})
         self._build_blobs()
-        if self._graph_path.exists():
+        if data.get("graph_json"):
+            self._graph = CodeGraph.from_json(data["graph_json"])
+        elif self._graph_path.exists():
             self._graph = CodeGraph.from_json(self._graph_path.read_text(encoding="utf-8"))
         else:
             self._graph = CodeGraph.build(
@@ -1535,7 +1863,53 @@ class ProjectBrain:
                 import_targets=self._import_targets,
                 symbol_imports=self._symbol_imports,
             )
+        self._sync_interprocedural_effects()
         return True
+
+    def _sync_interprocedural_effects(self) -> None:
+        """Fold transitive_z_write and exit_contracts from CodeGraph fn nodes back into file search sets."""
+        if not self._graph:
+            return
+        new_toks_by_file: dict[str, set[str]] = {}
+        for nid, nd in self._graph.nodes.items():
+            if nd.get("type") != "fn":
+                continue
+            rel = nd.get("rel_path", "")
+            if not rel or rel not in self._index:
+                continue
+            zw_set = self._z_write_sets.setdefault(rel, set())
+            tok_set = self._token_sets.setdefault(rel, set())
+            added = new_toks_by_file.setdefault(rel, set())
+            for zw in nd.get("transitive_z_write", []):
+                zw_l = zw.lower()
+                if zw_l not in tok_set:
+                    added.add(zw_l)
+                zw_set.add(zw_l)
+                tok_set.add(zw_l)
+                for sub_t in _tokenize_symbol(zw):
+                    if len(sub_t) >= 3:
+                        if sub_t not in tok_set:
+                            added.add(sub_t)
+                        zw_set.add(sub_t)
+                        tok_set.add(sub_t)
+            for ex in nd.get("exit_contracts", []) + nd.get("transitive_exits", []):
+                ex_clean = ex.split(":", 1)[-1].lower()
+                if len(ex_clean) >= 3:
+                    if ex_clean not in tok_set:
+                        added.add(ex_clean)
+                    tok_set.add(ex_clean)
+                    for sub_t in _tokenize_symbol(ex.split(":", 1)[-1]):
+                        if len(sub_t) >= 3:
+                            if sub_t not in tok_set:
+                                added.add(sub_t)
+                            tok_set.add(sub_t)
+        n_files = max(len(self._index), 1)
+        for rel, toks in new_toks_by_file.items():
+            if toks:
+                self._blobs[rel] = self._blobs.get(rel, "") + " " + " ".join(sorted(toks))
+                for t in toks:
+                    if t not in self._idf:
+                        self._idf[t] = math.log((n_files + 1) / 2.0) + 1.0
 
     @staticmethod
     def _is_compatible_cache(data) -> bool:
@@ -1553,6 +1927,8 @@ class ProjectBrain:
         self._token_sets = {}
         self._defn_sets = {}
         self._ast_hashes = {}
+        self._z_write_sets = {}
+        self._cell_4d_tokens = {}
         doc_freq: dict[str, int] = {}
 
         for rel_path, info in self._index.items():
@@ -1564,6 +1940,33 @@ class ProjectBrain:
             tokenized = []
             for name in symbol_names:
                 tokenized.extend(_tokenize_symbol(name))
+
+            z_write_toks: set[str] = set()
+            cell_4d_toks: set[str] = set()
+            for cell in info.get("cells_4d", []):
+                for zw in cell.get("Z_write", []):
+                    zw_l = zw.lower()
+                    z_write_toks.add(zw_l)
+                    cell_4d_toks.add(zw_l)
+                    for sub_t in _tokenize_symbol(zw):
+                        if len(sub_t) >= 4:
+                            cell_4d_toks.add(sub_t)
+                for zr in cell.get("Z_read", []):
+                    zr_l = zr.lower()
+                    cell_4d_toks.add(zr_l)
+                    for sub_t in _tokenize_symbol(zr):
+                        if len(sub_t) >= 4:
+                            cell_4d_toks.add(sub_t)
+                x_sc = cell.get("X_scope", "")
+                if x_sc.startswith(("useEffect", "useLayoutEffect", "useMemo", "useCallback", "case:")):
+                    for x_id in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", x_sc):
+                        if x_id not in ("useEffect", "useLayoutEffect", "useMemo", "useCallback", "case"):
+                            cell_4d_toks.add(x_id.lower())
+                            for sub_t in _tokenize_symbol(x_id):
+                                if len(sub_t) >= 4:
+                                    cell_4d_toks.add(sub_t)
+            self._z_write_sets[rel_path] = z_write_toks
+            self._cell_4d_tokens[rel_path] = cell_4d_toks
 
             for f in info.get("functions", []):
                 nid = fn_id(rel_path, f["name"], f.get("parent_class"))
@@ -1582,13 +1985,14 @@ class ProjectBrain:
                 *info.get("imports", []),
                 *info.get("exports", []),
                 *tokenized,
+                *sorted(cell_4d_toks),
                 *[f["docstring"] for f in info.get("functions", []) if f.get("docstring")],
                 *[c["docstring"] for c in info.get("classes", []) if c.get("docstring")],
             ]
             blob_str = " ".join(parts).lower()
             self._blobs[rel_path] = blob_str
 
-            file_tokens = set(re.findall(r"[a-z0-9_]+", blob_str)) | set(tokenized)
+            file_tokens = set(re.findall(r"[a-z0-9_]+", blob_str)) | set(tokenized) | cell_4d_toks
             for p_seg in re.split(r"[/._\-]", rel_path.lower()):
                 if p_seg:
                     file_tokens.add(p_seg)
@@ -1731,6 +2135,7 @@ class ProjectBrain:
             st = path.stat()
             info = parse(source, ext)
             info.setdefault("routes", []).extend(frameworks.infer_file_based_routes(rel, info))
+            info["cells_4d"] = extract_4d_coordinate_matrix(source.splitlines(), ext=ext)
             info["mtime"] = st.st_mtime
             self._index[rel] = info
             self._sizes[rel] = st.st_size
@@ -1743,25 +2148,23 @@ class ProjectBrain:
             import_targets=self._import_targets,
             symbol_imports=self._symbol_imports,
         )
-
-        cache_obj = {
-            "schema_version": SCHEMA_VERSION,
-            "parser_version": PARSER_VERSION,
-            "graph_version": GRAPH_VERSION,
-            "root": str(self.root),
-            "skipped": self._skipped,
-            "files": {
-                rel: {
-                    "mtime": info.get("mtime"),
-                    "size": self._sizes.get(rel),
-                    "hash": None,
-                    "info": {k: v for k, v in info.items() if k != "mtime"},
-                }
-                for rel, info in self._index.items()
+        self._sync_interprocedural_effects()
+        self._db_store.apply_incremental(
+            {
+                "schema_version": SCHEMA_VERSION,
+                "parser_version": PARSER_VERSION,
+                "graph_version": GRAPH_VERSION,
+                "root": str(self.root),
             },
-        }
-        self._cache_path.write_text(json.dumps(cache_obj, indent=2), encoding="utf-8")
-        self._graph_path.write_text(self._graph.to_json(), encoding="utf-8")
+            {r: self._index[r] for r in (added | modified) if r in self._index},
+            self._sizes,
+            deleted,
+            self._skipped,
+            graph_json=self._graph.to_json(),
+        )
+        for legacy in (self._cache_path, self._graph_path):
+            if legacy.exists():
+                legacy.unlink(missing_ok=True)
 
         return {
             "status": "incremental_update",
@@ -1793,6 +2196,8 @@ class ProjectBrain:
         for rel_path, blob in self._blobs.items():
             path_lower = rel_path.lower()
             defns = self._defn_sets.get(rel_path, set())
+            z_writes = self._z_write_sets.get(rel_path, set())
+            c4d_toks = self._cell_4d_tokens.get(rel_path, set())
             tokens = self._token_sets.get(rel_path, set())
             score = 0.0
             for kw in keywords:
@@ -1804,7 +2209,14 @@ class ProjectBrain:
                     # Use gentle IDF scaling when multiple keywords exist so rare terms
                     # win ties without breaking single-keyword exact score ratios
                     idf_weight = 1.0 if len(keywords) == 1 else (0.7 + 0.3 * self._idf.get(kw, 1.0))
-                    base_hit = 2.0 if kw in defns else (1.0 if matched_token else 0.6)
+                    if kw in defns:
+                        base_hit = 2.0
+                    elif kw in z_writes:
+                        base_hit = 1.5
+                    elif matched_token:
+                        base_hit = 1.0
+                    else:
+                        base_hit = 0.6
                     score += base_hit * idf_weight
                     if kw in path_lower:
                         score += 0.5 * idf_weight
@@ -1896,6 +2308,10 @@ class ProjectBrain:
             for exp in info.get("exports", []):
                 if kw in exp.lower():
                     reasons.append(f"exports '{exp}'")
+            for cell in info.get("cells_4d", []):
+                if kw in (cell.get("X_scope") or "").lower() or any(kw == zw.lower() for zw in cell.get("Z_write", [])):
+                    reasons.append(f"4D cell {cell.get('Y_role')} {cell.get('X_scope')} (L{cell.get('line_start')}-L{cell.get('line_end')})")
+                    break
 
         seen: set[str] = set()
         deduped = []
@@ -2765,7 +3181,9 @@ class ProjectBrain:
             "functions": sum(len(v.get("functions", [])) for v in self._index.values()),
             "classes": sum(len(v.get("classes", [])) for v in self._index.values()),
             "routes": sum(len(v.get("routes", [])) for v in self._index.values()),
+            "cells_4d": sum(len(v.get("cells_4d", [])) for v in self._index.values()),
             "memories": len(self._memory._notes),
+            "storage_backend": "sqlite" if self._db_store.db_path.exists() else "json",
             "schema_version": SCHEMA_VERSION,
             "parser_version": PARSER_VERSION,
             "graph_version": GRAPH_VERSION,
@@ -2812,9 +3230,24 @@ class ProjectBrain:
         }
 
     def _walk(self):
+        # Detect if this workspace has sibling application projects (e.g. package.json in a child dir)
+        # so nested copies of projectbrain itself (e.g. brian/projectbrain) are skipped.
+        has_app_project = (self.root / "package.json").exists() or any(
+            (child / "package.json").exists()
+            for child in self.root.iterdir()
+            if child.is_dir() and child.name not in SKIP_DIRS
+        )
         for dirpath, dirs, files in os.walk(self.root, topdown=True):
-            dirs[:] = sorted(d for d in dirs if d not in SKIP_DIRS)
             dp = Path(dirpath)
+            filtered_dirs = []
+            for d in dirs:
+                if d in SKIP_DIRS:
+                    continue
+                cand = dp / d
+                if has_app_project and (cand / "src" / "projectbrain" / "brain.py").exists():
+                    continue
+                filtered_dirs.append(d)
+            dirs[:] = sorted(filtered_dirs)
             for fname in sorted(files):
                 if fname in SKIP_FILES:
                     continue
@@ -2824,7 +3257,6 @@ class ProjectBrain:
                 if ext not in PARSED_EXTS:
                     continue
                 yield dp / fname
-
 
 def _is_minified(source: str) -> bool:
     lines = source.splitlines()

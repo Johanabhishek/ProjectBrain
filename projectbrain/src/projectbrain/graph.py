@@ -319,8 +319,156 @@ class CodeGraph:
                             )
 
         g._build_index()
+        g._propagate_interprocedural_effects(index)
         return g
 
+    def _propagate_interprocedural_effects(self, index: dict) -> None:
+        """Pass A: Bind Universal 6D IR to fn nodes & bubble effects/?Z 1-3 hops up the call graph.
+        Pass B: Wire cross-function `state_flow` edges (?Z_write -> Z_read) across shared state/event channels.
+        """
+        _GENERIC_STATE_KEYS = {
+            "data", "res", "result", "item", "items", "val", "value", "err", "error",
+            "req", "resp", "args", "kwargs", "options", "config", "params", "state",
+            "props", "dispatch", "user", "id", "key", "obj", "row", "rows",
+        }
+        # 1. Bind file 6D cells onto enclosing function nodes
+        for rel_path, info in index.items():
+            cells = info.get("cells_4d", [])
+            if not cells:
+                continue
+            for fn in info.get("functions", []):
+                nid = fn_id(rel_path, fn["name"], fn.get("parent_class"))
+                nd = self.nodes.get(nid)
+                if not nd:
+                    continue
+                f_s = fn.get("line_start", 1)
+                f_e = fn.get("line_end", f_s)
+                fn_cells = [
+                    c for c in cells
+                    if c.get("line_start", 0) >= f_s and c.get("line_end", 0) <= f_e
+                ]
+                if not fn_cells:
+                    continue
+                local_zw: list[str] = []
+                local_zr: list[str] = []
+                local_exits: list[str] = []
+                local_roles: set[str] = set()
+                t_modes: set[str] = set()
+                for c in fn_cells:
+                    local_roles.add(c.get("Y_role", "ACTION"))
+                    t_modes.add(c.get("T_mode", "SYNC"))
+                    for zw in c.get("Z_write", []):
+                        if zw not in local_zw:
+                            local_zw.append(zw)
+                    for zr in c.get("Z_read", []):
+                        if zr not in local_zr and zr not in local_zw:
+                            local_zr.append(zr)
+                    for ex in c.get("E_exit", []):
+                        if ex not in local_exits:
+                            local_exits.append(ex)
+                local_eff = [r for r in ("IO", "EFFECT", "VIEW") if r in local_roles]
+                if local_zw and "MUTATE" not in local_eff:
+                    local_eff.append("MUTATE")
+                t_mode = next((m for m in ("REACTIVE", "TIMER", "ASYNC") if m in t_modes), "SYNC")
+                if local_zw:
+                    nd["local_z_write"] = local_zw
+                if local_zr:
+                    nd["local_z_read"] = local_zr
+                if local_exits:
+                    nd["exit_contracts"] = local_exits
+                if local_eff:
+                    nd["local_effects"] = local_eff
+                if t_mode != "SYNC":
+                    nd["temporal_mode"] = t_mode
+
+        # 2. Pass A: Bottom-Up 3-Hop Interprocedural Effect & ?Z Bubbling along `calls` edges
+        for nid, nd in self.nodes.items():
+            if nd.get("type") != "fn":
+                continue
+            own_zw = set(nd.get("local_z_write", []))
+            own_exits = set(nd.get("exit_contracts", []))
+            trans_zw: list[str] = []
+            trans_eff: list[str] = []
+            trans_exits: list[str] = []
+            provenance: dict[str, str] = {}
+
+            q: deque[tuple[str, int, list[str]]] = deque([(nid, 0, [])])
+            visited_callees: set[str] = {nid}
+            while q:
+                curr_id, hop, chain = q.popleft()
+                if hop >= 3:
+                    continue
+                for ei in self._adj.get(curr_id, []):
+                    e = self.edges[ei]
+                    if e["type"] != "calls" or e.get("confidence") not in ("exact", "import_resolved"):
+                        continue
+                    callee_id = e["dst"]
+                    if callee_id in visited_callees:
+                        continue
+                    visited_callees.add(callee_id)
+                    callee_nd = self.nodes.get(callee_id, {})
+                    callee_name = callee_nd.get("name") or callee_id.split(":")[-1]
+                    nxt_chain = chain + [callee_name]
+                    nxt_hop = hop + 1
+                    via_label = f"via {' -> '.join(nxt_chain)} ({nxt_hop} hop{'s' if nxt_hop > 1 else ''})"
+
+                    for zw in callee_nd.get("local_z_write", []):
+                        if zw not in own_zw and zw not in trans_zw:
+                            trans_zw.append(zw)
+                            provenance[f"?Z:{zw}"] = via_label
+                    for eff in callee_nd.get("local_effects", []):
+                        if eff not in trans_eff:
+                            trans_eff.append(eff)
+                            provenance.setdefault(f"effect:{eff}", via_label)
+                    for ex in callee_nd.get("exit_contracts", []):
+                        if ex.startswith("throw:") and ex not in own_exits and ex not in trans_exits:
+                            trans_exits.append(ex)
+                            provenance[ex] = via_label
+
+                    q.append((callee_id, nxt_hop, nxt_chain))
+
+            if trans_zw:
+                nd["transitive_z_write"] = trans_zw[:12]
+            if trans_eff:
+                nd["transitive_effects"] = trans_eff
+            if trans_exits:
+                nd["transitive_exits"] = trans_exits[:8]
+            if provenance:
+                nd["effect_provenance"] = provenance
+
+        # 3. Pass B: Cross-Function / Cross-File State-Channel Edges (`state_flow`: ?Z_write -> Z_read)
+        writers_by_key: dict[str, list[str]] = {}
+        readers_by_key: dict[str, list[str]] = {}
+        for nid, nd in self.nodes.items():
+            if nd.get("type") != "fn":
+                continue
+            for zw in nd.get("local_z_write", []):
+                if len(zw) >= 3 and zw.lower() not in _GENERIC_STATE_KEYS:
+                    writers_by_key.setdefault(zw, []).append(nid)
+            for zr in nd.get("local_z_read", []):
+                if len(zr) >= 3 and zr.lower() not in _GENERIC_STATE_KEYS:
+                    readers_by_key.setdefault(zr, []).append(nid)
+
+        added_state_edges = 0
+        seen_state_pairs: set[tuple[str, str, str]] = set()
+        for k, writers in writers_by_key.items():
+            readers = readers_by_key.get(k, [])
+            if not readers or len(writers) > 8 or len(readers) > 12:
+                continue
+            for w_id in writers:
+                for r_id in readers:
+                    if w_id != r_id and (w_id, r_id, k) not in seen_state_pairs:
+                        seen_state_pairs.add((w_id, r_id, k))
+                        self._add_edge(
+                            w_id,
+                            r_id,
+                            "state_flow",
+                            "exact",
+                            f"shared state channel '{k}' (?Z_write -> Z_read)",
+                        )
+                        added_state_edges += 1
+        if added_state_edges > 0:
+            self._build_index()
     # ── traversal ────────────────────────────────────────────────────────────
 
     def neighbors(

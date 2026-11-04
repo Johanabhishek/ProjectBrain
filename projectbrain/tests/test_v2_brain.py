@@ -124,7 +124,7 @@ def test_compile_context_slices_code_and_auto_deduplicates_session(tmp_project):
     packet1 = brain.compile_context("add discount code to checkout", budget_tokens=2000)
     assert packet1["target_slices"], "Expected surgical target code slices"
     assert packet1["neighbor_skeletons"], "Expected signature-only neighbor skeletons"
-    assert "token_telemetry" in packet1
+    assert "resolution_telemetry" in packet1
 
     # Verify actual code with line numbers is in target_slices
     first_slice = packet1["target_slices"][0]

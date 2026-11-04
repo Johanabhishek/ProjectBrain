@@ -12,9 +12,10 @@ def test_index_writes_cache_and_returns_stats(tmp_project):
 
     assert stats["files"] == 8
     assert stats["routes"] == 1
-    assert (tmp_project / ".projectbrain.json").exists()
-    assert (tmp_project / ".projectbrain_graph.json").exists()
-
+    assert stats["storage_backend"] == "sqlite"
+    assert (tmp_project / ".projectbrain.db").exists()
+    assert not (tmp_project / ".projectbrain.json").exists()
+    assert not (tmp_project / ".projectbrain_graph.json").exists()
 
 def test_query_defines_outranks_mentions(tmp_project):
     """The +2.0 (defines) vs +1.0 (mentions) branch in query()."""
@@ -90,12 +91,14 @@ def test_index_writes_versioned_cache_envelope(tmp_project):
     brain = ProjectBrain(str(tmp_project))
     brain.index()
 
-    data = json.loads((tmp_project / ".projectbrain.json").read_text(encoding="utf-8"))
+    data = brain._db_store.load_all()
+    assert data is not None
 
     assert data["schema_version"] == SCHEMA_VERSION
     assert data["parser_version"] == PARSER_VERSION
     assert data["graph_version"] == GRAPH_VERSION
     assert data["root"] == str(tmp_project)
+    assert "graph_json" in data
     assert "notes.py" in data["files"]
     assert data["files"]["notes.py"]["info"]["functions"][0]["name"] == "print_notes"
     assert "mtime" not in data["files"]["notes.py"]["info"]
@@ -113,23 +116,25 @@ def test_load_rejects_old_flat_cache_and_forces_reindex(tmp_project):
     # _ensure_fresh treats a failed load like "no cache" and reindexes from scratch
     results = brain.query("discount")
     assert results
-
-    data = json.loads((tmp_project / ".projectbrain.json").read_text(encoding="utf-8"))
-    assert data["schema_version"] == SCHEMA_VERSION
+    assert (tmp_project / ".projectbrain.db").exists()
+    assert not (tmp_project / ".projectbrain.json").exists()
 
 
 def test_load_rejects_version_mismatch_even_if_schema_matches(tmp_project):
+    import sqlite3
+
     brain = ProjectBrain(str(tmp_project))
     brain.index()
 
-    cache_path = tmp_project / ".projectbrain.json"
-    data = json.loads(cache_path.read_text(encoding="utf-8"))
-    data["parser_version"] = "stale-version"
-    cache_path.write_text(json.dumps(data), encoding="utf-8")
+    with sqlite3.connect(str(tmp_project / ".projectbrain.db")) as conn:
+        conn.execute(
+            "UPDATE meta SET value = ? WHERE key = 'parser_version'",
+            (json.dumps("stale-version"),),
+        )
+        conn.commit()
 
     fresh = ProjectBrain(str(tmp_project))
     assert fresh.load() is False
-
 
 def test_load_rejects_corrupt_json(tmp_project):
     (tmp_project / ".projectbrain.json").write_text("not valid json{", encoding="utf-8")

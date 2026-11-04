@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "projectbrain-mcp"
-version = "0.2.3"
-description = "Surgical AST Context Compiler, Closed-World Dossier & Anchor Patch Engine for AI Coding Agents (-75% to -88% tokens)"
+version = "0.6.0"
+description = "Universal 6D Behavioral IR, Interprocedural Effect Bubbling, State-Channel Graph, Closed-World Dossier & Surgical Anchor Patch Engine for AI Coding Agents"
 readme = "README.md"
 license = { text = "MIT" }
 requires-python = ">=3.9"

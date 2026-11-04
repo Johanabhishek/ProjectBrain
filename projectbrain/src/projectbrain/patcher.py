@@ -99,14 +99,8 @@ def parse_patch_spec(spec_text: str) -> dict[str, list[PatchOp]]:
         return _parse_json_patch_spec(stripped)
 
     # Support single-line CLI invocation in Windows cmd.exe where \n is passed literally
-    spec_text = re.sub(
-        r"\\n(?=\s*@(?:file|sub|replace|insert_after|insert_before|delete|end)\b)",
-        "\n",
-        spec_text,
-    )
     if "\n" not in spec_text and "\\n" in spec_text:
         spec_text = spec_text.replace("\\n", "\n")
-
     ops_by_file: dict[str, list[PatchOp]] = {}
     current_file: str | None = None
     lines = spec_text.splitlines()
@@ -313,10 +307,9 @@ def apply_patch_spec(
             idx_s = max(0, min(n_lines, op.line_start - 1))
             idx_e = max(idx_s, min(n_lines, op.line_end))
 
-            ctx_s = max(0, idx_s - 3)
-            ctx_e = min(n_lines, idx_e + 3)
+            ctx_s = max(0, idx_s - 2)
+            ctx_e = min(n_lines, idx_e + 2)
             target_block = "\n".join(orig_lines[ctx_s:ctx_e])
-
             if op.kind == "sub":
                 if op.anchor_mode == "all":
                     matched_lines: list[int] = []
@@ -324,13 +317,15 @@ def apply_patch_spec(
                         if op.old_expr in work_lines[k]:
                             work_lines[k] = work_lines[k].replace(op.old_expr, op.new_expr)
                             matched_lines.append(k + 1)
-                            c_s = max(0, k - 3)
-                            c_e = min(len(orig_lines), k + 4)
-                            t_b = "\n".join(orig_lines[c_s:c_e])
-                            r_b = t_b.replace(op.old_expr, op.new_expr)
-                            total_edit_file_equiv_chars += len(t_b) + len(r_b) + len(rel_path) + 120
                     if not matched_lines:
                         raise ValueError(f"{rel_path}: @sub ALL target {op.old_expr!r} not found in file")
+                    # Standard edit_file replaces all occurrences of a unique target in 1 call
+                    first_k = matched_lines[0] - 1
+                    c_s = max(0, first_k - 2)
+                    c_e = min(len(orig_lines), first_k + 3)
+                    t_b = "\n".join(orig_lines[c_s:c_e])
+                    r_b = t_b.replace(op.old_expr, op.new_expr)
+                    total_edit_file_equiv_chars += len(t_b) + len(r_b) + len(rel_path) + 80
                     applied_details.append(
                         {"op": "sub_all", "lines": matched_lines, "spec_chars": op.raw_spec_chars}
                     )
@@ -486,28 +481,18 @@ def apply_patch_spec(
     if combined_diff:
         out_diff_file.write_text(combined_diff + "\n", encoding="utf-8")
 
-    spec_tokens = max(1, total_spec_chars // 4)
-    equiv_edit_tokens = max(1, total_edit_file_equiv_chars // 4)
-    full_diff_tokens = max(1, len(combined_diff) // 4)
-    equiv_markdown_patch_tokens = int(equiv_edit_tokens * 1.35)
-    saved_vs_edit = max(0, equiv_edit_tokens - spec_tokens)
-    saved_pct_vs_edit = round((saved_vs_edit / equiv_edit_tokens) * 100, 1) if equiv_edit_tokens > 0 else 0.0
-
+    total_diff_lines = sum(f.get("diff_lines", 0) for f in file_results)
+    syntax_verified_files = sum(1 for f in file_results if f.get("syntax", {}).get("valid"))
     return {
         "mode": "applied" if apply else "dry_run",
         "files_patched": len(file_results),
         "total_ops_applied": total_ops_applied,
         "all_syntax_valid": all(f.get("syntax", {}).get("valid", False) for f in file_results),
         "diff_path": str(out_diff_file) if combined_diff else None,
-        "output_token_telemetry": {
-            "patch_spec_chars": total_spec_chars,
-            "patch_spec_tokens": spec_tokens,
-            "standard_edit_file_chars": total_edit_file_equiv_chars,
-            "standard_edit_file_tokens": equiv_edit_tokens,
-            "expanded_unified_diff_tokens": full_diff_tokens,
-            "markdown_before_after_est_tokens": equiv_markdown_patch_tokens,
-            "output_tokens_saved_vs_edit_file": saved_vs_edit,
-            "output_savings_pct_vs_edit_file": saved_pct_vs_edit,
+        "mutation_telemetry": {
+            "spec_chars": total_spec_chars,
+            "diff_lines": total_diff_lines,
+            "syntax_verified_files": syntax_verified_files,
         },
         "files": file_results,
         "unified_diff": combined_diff,

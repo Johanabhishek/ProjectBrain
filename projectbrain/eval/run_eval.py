@@ -353,24 +353,30 @@ def score_self_dogfood_tasks() -> list[dict]:
         sliced_symbols = {s["symbol"].split(".")[-1] for s in packet.get("target_slices", [])}
         expected = set(t["expected_symbols"])
         symbol_recall = len(expected & sliced_symbols) / len(expected) if expected else 1.0
-        telem = packet["token_telemetry"]
+        packet_chars = sum(len(s.get("code", "")) for s in packet.get("target_slices", [])) + sum(
+            len(sk.get("skeleton", "")) for sk in packet.get("neighbor_skeletons", [])
+        )
+        packet_tokens = max((packet_chars + 240) // 4, 1)
+        matched_files = packet.get("recommended_read_order", [])
+        naive_file_tokens = sum(brain._sizes.get(rp, 0) for rp in matched_files) // 4
+        savings_pct = round(((naive_file_tokens - packet_tokens) / max(naive_file_tokens, 1)) * 100, 1) if naive_file_tokens > 0 else 0.0
         grep_sim = _simulate_disciplined_grep_window_agent(brain, t["prompt"], expected)
         gw_tokens = grep_sim["grep_window_tokens"]
-        saved_vs_gw = round((1.0 - telem["packet_tokens"] / max(gw_tokens, 1)) * 100, 1)
+        saved_vs_gw = round((1.0 - packet_tokens / max(gw_tokens, 1)) * 100, 1)
 
         results.append({
             "id": t["id"],
             "prompt": t["prompt"],
             "symbol_recall": symbol_recall,
             "sliced_symbols": sorted(sliced_symbols),
-            "packet_tokens": telem["packet_tokens"],
+            "packet_tokens": packet_tokens,
             "grep_window_tokens": gw_tokens,
             "grep_window_recall": grep_sim["grep_window_recall"],
             "tokens_saved_vs_grep_window_pct": saved_vs_gw,
-            "naive_full_files_tokens": telem["naive_full_files_tokens"],
+            "naive_full_files_tokens": naive_file_tokens,
             "total_repo_tokens": total_repo_tokens,
-            "tokens_saved_vs_matched_files_pct": telem["tokens_saved_pct"],
-            "tokens_saved_vs_repo_pct": round((1.0 - telem["packet_tokens"] / max(total_repo_tokens, 1)) * 100, 1),
+            "tokens_saved_vs_matched_files_pct": savings_pct,
+            "tokens_saved_vs_repo_pct": round((1.0 - packet_tokens / max(total_repo_tokens, 1)) * 100, 1),
             "compile_time_ms": round(elapsed_ms, 2),
         })
     return results
@@ -419,10 +425,13 @@ def score_adversarial_dogfood_tasks() -> list[dict]:
         sliced_symbols = {s["symbol"].split(".")[-1] for s in packet.get("target_slices", [])}
         expected = set(t["expected_symbols"])
         symbol_recall = len(expected & sliced_symbols) / len(expected) if expected else 1.0
-        telem = packet["token_telemetry"]
+        packet_chars = sum(len(s.get("code", "")) for s in packet.get("target_slices", [])) + sum(
+            len(sk.get("skeleton", "")) for sk in packet.get("neighbor_skeletons", [])
+        )
+        packet_tokens = max((packet_chars + 240) // 4, 1)
         grep_sim = _simulate_disciplined_grep_window_agent(brain, t["prompt"], expected)
         gw_tokens = grep_sim["grep_window_tokens"]
-        saved_vs_gw = round((1.0 - telem["packet_tokens"] / max(gw_tokens, 1)) * 100, 1)
+        saved_vs_gw = round((1.0 - packet_tokens / max(gw_tokens, 1)) * 100, 1)
 
         results.append({
             "id": t["id"],
@@ -430,7 +439,7 @@ def score_adversarial_dogfood_tasks() -> list[dict]:
             "expected_symbols": sorted(expected),
             "sliced_symbols": sorted(sliced_symbols),
             "symbol_recall": symbol_recall,
-            "packet_tokens": telem["packet_tokens"],
+            "packet_tokens": packet_tokens,
             "grep_window_tokens": gw_tokens,
             "grep_window_recall": grep_sim["grep_window_recall"],
             "tokens_saved_vs_grep_window_pct": saved_vs_gw,

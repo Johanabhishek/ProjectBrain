@@ -75,12 +75,12 @@ def _print_context_summary(ctx: dict) -> None:
 
 
 def _print_compiled_summary(packet: dict) -> None:
-    telem = packet.get("token_telemetry", {})
+    telem = packet.get("resolution_telemetry", {})
     print(f"Task: {packet.get('task')}  [intent: {packet.get('intent', {}).get('intent')}]")
     print(
-        f"Token Telemetry: {telem.get('packet_tokens')} tokens "
-        f"(vs {telem.get('naive_full_files_tokens')} full-file tokens -> "
-        f"{telem.get('tokens_saved_pct')}% saved)\n"
+        f"Resolution: {telem.get('target_slices_count', 0)} AST slices, "
+        f"{telem.get('neighbor_skeletons_count', 0)} neighbor skeletons across "
+        f"{telem.get('files_resolved', 0)} files\n"
     )
     if packet.get("memories"):
         print("=== Active Repo Memories ===")
@@ -106,22 +106,19 @@ def _print_compiled_summary(packet: dict) -> None:
 
 
 def _print_stats_summary(st: dict) -> None:
-    inp = st.get("input_tokens", {})
-    out = st.get("output_tokens", {})
+    res = st.get("resolution", {})
     print("===============================================================")
-    print("  ProjectBrain Token Reduction Ledger")
+    print("  ProjectBrain Structural & Epistemic Telemetry")
     print("===============================================================")
-    print(f"  Repository         : {st.get('repo')}")
-    print(f"  Total Operations   : {st.get('total_operations', 0)}")
-    print(
-        f"  Input Tokens Saved : {inp.get('saved', 0):,} tok "
-        f"({inp.get('delivered', 0):,} delivered vs {inp.get('naive_baseline', 0):,} baseline -> -{inp.get('savings_pct', 0)}%)"
-    )
-    print(
-        f"  Output Tokens Saved: {out.get('saved', 0):,} tok "
-        f"({out.get('delivered', 0):,} spec vs {out.get('naive_baseline', 0):,} edit_file -> -{out.get('savings_pct', 0)}%)"
-    )
-    print(f"  Tool Calls Avoided : {st.get('tool_calls_avoided', 0):,} file reads / multi-turn edits")
+    print(f"  Repository                : {st.get('repo', st.get('root'))}")
+    print(f"  Indexed Files / Symbols   : {st.get('files', 0)} files, {st.get('functions', 0)} functions, {st.get('classes', 0)} classes")
+    print(f"  4D Coordinate Cells       : {st.get('cells_4d', 0)} cells")
+    print(f"  Total Session Operations  : {st.get('total_operations', 0)}")
+    print(f"  AST Slices Compiled       : {res.get('ast_slices_compiled', 0)}")
+    print(f"  4D Cells Resolved         : {res.get('cells_4d_resolved', 0)}")
+    print(f"  Closed-World Proofs       : {res.get('closed_world_verifications', 0)}")
+    print(f"  Anchor Patch Ops Applied  : {res.get('patch_ops_applied', 0)}")
+    print(f"  Files in Working Memory   : {res.get('files_in_working_memory', 0)}")
     print("===============================================================")
 
 
@@ -178,6 +175,9 @@ def _run_init(
     ignore_entries = [
         ".projectbrain.json",
         ".projectbrain_graph.json",
+        ".projectbrain.db",
+        ".projectbrain.db-wal",
+        ".projectbrain.db-shm",
         ".projectbrain_dossier.md",
         ".projectbrain_patch.diff",
         ".projectbrain_ledger.json",
@@ -293,7 +293,9 @@ def main(argv: list[str] | None = None) -> int:
     dossier_parser.add_argument("tasks", nargs="+", help="One or more task descriptions or engineering questions")
     dossier_parser.add_argument("--impact", nargs="*", default=None, help="Optional file paths for blast-radius analysis")
     dossier_parser.add_argument("--out", default=None, help="Output markdown path (default: <root>/.projectbrain_dossier.md)")
-
+    dossier_parser.add_argument("--zoom", action="store_true", help="Pure 4D Surgical Zoom mode (omits globals, neighbor bodies, and repo-wide scans)")
+    dossier_parser.add_argument("--stdout", action="store_true", help="Print compiled markdown directly to stdout in one call")
+    dossier_parser.add_argument("--summary", action="store_true", help="Print compiled markdown directly to stdout in one call")
     patch_parser = sub.add_parser(
         "patch",
         help="Apply or dry-run a Surgical Anchor Patch spec to cut output tokens (75-90 percent reduction)",
@@ -344,9 +346,9 @@ def main(argv: list[str] | None = None) -> int:
 
     sub.add_parser("health", help="Report index coverage and blind spots")
 
-    stats_parser = sub.add_parser("stats", help="Display cumulative ROI, tokens saved, dollars saved, and time saved")
-    stats_parser.add_argument("--summary", action="store_true", help="Print human-readable ROI dashboard")
-    stats_parser.add_argument("--reset", action="store_true", help="Reset the savings ledger")
+    stats_parser = sub.add_parser("stats", help="Display index topology and structural resolution telemetry")
+    stats_parser.add_argument("--summary", action="store_true", help="Print human-readable structural telemetry dashboard")
+    stats_parser.add_argument("--reset", action="store_true", help="Reset session working memory and resolution ledger")
 
     args = parser.parse_args(argv)
 
@@ -375,8 +377,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "dossier":
-        res = brain.compile_dossier(args.tasks, impact_files=args.impact, out_path=args.out)
-        summary = {k: v for k, v in res.items() if k != "markdown"}
+        res = brain.compile_dossier(args.tasks, impact_files=args.impact, out_path=args.out, zoom=bool(args.zoom))
+        if args.stdout or args.summary:
+            print(res.get("markdown", ""))
+            return 0
+        summary = dict(res) if args.zoom else {k: v for k, v in res.items() if k != "markdown"}
         print(json.dumps(summary, indent=2))
         return 0
 
@@ -395,7 +400,7 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "slice":
-        res = brain.slice_symbols(args.targets, max_lines_per_symbol=args.max_lines)
+        res = brain.slice_symbols(args.targets, max_lines_per_symbol=args.max_lines, summary_mode=bool(args.summary))
         if args.summary:
             for s in res.get("slices", []):
                 if s.get("error"):
