@@ -493,6 +493,11 @@ def _parse_python(root) -> dict:
         functions.append(entry)
 
     imports, import_bindings = _py_extract_imports_and_bindings(root)
+    m_pref = re.search(
+        r"\b(?:APIRouter|Blueprint)\s*\([^)]*?\b(?:url_)?prefix\s*=\s*['\"]([^'\"]+)['\"]",
+        _text(root),
+    )
+    router_prefix = m_pref.group(1).rstrip("/") if m_pref else ""
 
     for _, mc in _matches(_PY, _PY_ROUTE, root):
         m_nodes = mc.get("method", [])
@@ -505,19 +510,19 @@ def _parse_python(root) -> dict:
         path = _text(p_nodes[0])
         handler = _text(h_nodes[0])
         line = _line(h_nodes[0])
+        full_path = (f"{router_prefix}/{path.lstrip('/')}".rstrip("/") or "/") if router_prefix else path
 
         if method in _HTTP:
             routes.append({
-                "method": method.upper(), "path": path, "handler": handler,
-                "line": line, "framework": "fastapi",
+                "method": method.upper(), "path": path, "full_path": full_path,
+                "handler": handler, "line": line, "framework": "fastapi",
             })
         elif method == "route" and a_nodes:
             for verb in _flask_methods(a_nodes[0]):
                 routes.append({
-                    "method": verb, "path": path, "handler": handler,
-                    "line": line, "framework": "flask",
+                    "method": verb, "path": path, "full_path": full_path,
+                    "handler": handler, "line": line, "framework": "flask",
                 })
-
     for _, mc in _matches(_PY, _PY_DJANGO_ROUTE, root):
         f_nodes = mc.get("func", [])
         p_nodes = mc.get("path", [])
@@ -968,10 +973,181 @@ def _parse_js(root, lang: Language) -> dict:
     }
 
 
-# ── Public entry point ──────────────────────────────────────────────────────
+# ?? SQL schema & function parser ????????????????????????????????????????????
+
+def extract_sql_table_schemas(source: str) -> dict[str, dict]:
+    """Extract CREATE TABLE definitions (columns, NOT NULL without DEFAULT) from SQL or inline strings."""
+    schemas: dict[str, dict] = {}
+    if "CREATE" not in source.upper():
+        return schemas
+    for m in re.finditer(
+        r"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:[a-zA-Z_]\w*\.)?[\"`]?([a-zA-Z_][a-zA-Z0-9_]*)[\"`]?\s*\(",
+        source,
+        re.IGNORECASE,
+    ):
+        tbl_name = m.group(1)
+        l_start = source.count("\n", 0, m.start()) + 1
+        open_pos = m.end() - 1
+        depth = 0
+        close_pos = len(source)
+        in_str: str | None = None
+        for idx in range(open_pos, min(len(source), open_pos + 15000)):
+            ch = source[idx]
+            if in_str:
+                if ch == in_str:
+                    in_str = None
+                continue
+            if ch in ("'", '"'):
+                in_str = ch
+            elif ch == "(":
+                depth += 1
+            elif ch == ")":
+                depth -= 1
+                if depth == 0:
+                    close_pos = idx
+                    break
+        l_end = source.count("\n", 0, close_pos) + 1
+        body = source[open_pos + 1 : close_pos]
+        clean_lines = [re.sub(r"--.*$", "", ln) for ln in body.splitlines()]
+        clean_body = "\n".join(clean_lines)
+        clauses: list[str] = []
+        cur: list[str] = []
+        p_depth = 0
+        q_char: str | None = None
+        for ch in clean_body:
+            if q_char:
+                cur.append(ch)
+                if ch == q_char:
+                    q_char = None
+                continue
+            if ch in ("'", '"'):
+                q_char = ch
+                cur.append(ch)
+            elif ch == "(":
+                p_depth += 1
+                cur.append(ch)
+            elif ch == ")":
+                p_depth = max(0, p_depth - 1)
+                cur.append(ch)
+            elif ch == "," and p_depth == 0:
+                clauses.append("".join(cur).strip())
+                cur = []
+            else:
+                cur.append(ch)
+        if cur:
+            clauses.append("".join(cur).strip())
+
+        all_cols: list[str] = []
+        required_cols: list[str] = []
+        defaulted_cols: list[str] = []
+        fields: list[str] = []
+        for cl in clauses:
+            if not cl or re.match(
+                r"^(?:PRIMARY\s+KEY|FOREIGN\s+KEY|UNIQUE\b|CONSTRAINT\b|CHECK\b|INDEX\b|KEY\b)",
+                cl,
+                re.IGNORECASE,
+            ):
+                continue
+            m_col = re.match(r"^[\"`]?([a-zA-Z_][a-zA-Z0-9_]*)[\"`]?\s+([A-Za-z][A-Za-z0-9_()]*)", cl)
+            if not m_col:
+                continue
+            c_name = m_col.group(1)
+            c_type = m_col.group(2)
+            if c_name.upper() in ("PRIMARY", "FOREIGN", "UNIQUE", "CONSTRAINT", "CHECK"):
+                continue
+            is_not_null = bool(re.search(r"\bNOT\s+NULL\b", cl, re.IGNORECASE))
+            has_default = bool(
+                re.search(
+                    r"\b(?:DEFAULT\b|SERIAL\b|BIGSERIAL\b|SMALLSERIAL\b|AUTOINCREMENT\b|AUTO_INCREMENT\b|GENERATED\b)",
+                    cl,
+                    re.IGNORECASE,
+                )
+            )
+            is_int_pk = bool(re.search(r"\bINTEGER\s+PRIMARY\s+KEY\b", cl, re.IGNORECASE))
+            all_cols.append(c_name)
+            suffix = (" NOT NULL" if is_not_null else "") + (" DEFAULT" if has_default else "")
+            fields.append(f"{c_name}: {c_type}{suffix}")
+            if is_not_null and not has_default and not is_int_pk:
+                required_cols.append(c_name)
+            elif is_not_null and has_default:
+                defaulted_cols.append(c_name)
+
+        if all_cols:
+            schemas[tbl_name] = {
+                "name": tbl_name,
+                "line_start": l_start,
+                "line_end": l_end,
+                "all_cols": all_cols,
+                "required_cols": required_cols,
+                "defaulted_cols": defaulted_cols,
+                "fields": fields[:25],
+            }
+    return schemas
+
+
+def _parse_sql(source: str) -> dict:
+    schemas = extract_sql_table_schemas(source)
+    classes: list[dict] = []
+    functions: list[dict] = []
+    for tbl_name, sc in schemas.items():
+        classes.append({
+            "name": tbl_name,
+            "line_start": sc["line_start"],
+            "line_end": sc["line_end"],
+            "signature": f"CREATE TABLE {tbl_name} ({', '.join(sc['all_cols'][:8])})",
+            "bases": [],
+            "methods": [],
+            "fields": sc["fields"],
+            "required_cols": sc["required_cols"],
+            "defaulted_cols": sc["defaulted_cols"],
+            "is_sql_table": True,
+            "ast_hash": _ast_hash(",".join(sc["fields"])),
+        })
+    for m_fn in re.finditer(
+        r"\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(?:[a-zA-Z_]\w*\.)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]*)\)",
+        source,
+        re.IGNORECASE,
+    ):
+        fn_nm = m_fn.group(1)
+        params = _collapse_ws(m_fn.group(2))
+        l_start = source.count("\n", 0, m_fn.start()) + 1
+        end_m = re.search(r"\$\$\s*;|END\s*;", source[m_fn.end() :], re.IGNORECASE)
+        end_pos = (m_fn.end() + end_m.end()) if end_m else min(len(source), m_fn.end() + 1500)
+        l_end = source.count("\n", 0, end_pos) + 1
+        body_slice = source[m_fn.start() : end_pos]
+        ref_tables = [t for t in schemas if re.search(rf"\b{re.escape(t)}\b", body_slice, re.IGNORECASE)]
+        functions.append({
+            "name": fn_nm,
+            "line_start": l_start,
+            "line_end": l_end,
+            "signature": f"CREATE FUNCTION {fn_nm}({params})",
+            "params": f"({params})",
+            "return_type": "",
+            "docstring": "SQL stored function",
+            "body_tokens": [w.lower() for w in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{2,}", body_slice)][:60],
+            "calls": ref_tables,
+            "call_sites": {},
+            "qualified_calls": {},
+            "ast_hash": _ast_hash(body_slice),
+        })
+    return {
+        "functions": functions,
+        "classes": classes,
+        "imports": [],
+        "import_bindings": {},
+        "exports": list(schemas.keys()),
+        "routes": [],
+        "sql_schemas": schemas,
+        "parse_status": "ok",
+    }
+
+
+# ?? Public entry point ??????????????????????????????????????????????????????
 
 def parse(source: str, ext: str) -> dict:
     """Parse source by file extension. Returns functions/classes/imports/routes/exports."""
+    if ext == ".sql":
+        return _parse_sql(source)
     lang = _LANG_MAP.get(ext)
     if lang is None:
         return {
@@ -983,9 +1159,12 @@ def parse(source: str, ext: str) -> dict:
     root = tree.root_node
 
     result = _parse_python(root) if ext == ".py" else _parse_js(root, lang)
+    if "CREATE TABLE" in source.upper():
+        sql_sc = extract_sql_table_schemas(source)
+        if sql_sc:
+            result["sql_schemas"] = sql_sc
     result["parse_status"] = "partial" if root.has_error else "ok"
     return result
-
 
 # ── Legacy shims (brain.py calls these directly) ────────────────────────────
 

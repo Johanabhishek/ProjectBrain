@@ -473,6 +473,7 @@ def apply_patch_spec(
                 "syntax": syntax_res,
                 "diff_lines": len(diff_lines),
                 "operations": list(reversed(applied_details)),
+                "_patched_text": new_text,
             }
         )
 

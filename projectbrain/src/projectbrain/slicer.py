@@ -626,9 +626,11 @@ def extract_4d_coordinate_matrix(
             stack = [tree.root_node]
             _SPAN_NODE_TYPES = {
                 "function_declaration", "arrow_function", "function_definition",
-                "method_definition", "call_expression", "if_statement",
-                "switch_case", "switch_default", "jsx_expression",
-                "ternary_expression", "conditional_expression",
+                "method_definition", "call_expression", "if_statement", "elif_clause",
+                "else_clause", "try_statement", "except_clause", "catch_clause",
+                "with_statement", "for_statement", "for_in_statement", "while_statement",
+                "match_statement", "case_clause", "switch_case", "switch_default",
+                "jsx_expression", "ternary_expression", "conditional_expression",
             }
             _ASSIGN_NODE_TYPES = {
                 "assignment_expression", "augmented_assignment_expression",
@@ -695,16 +697,40 @@ def extract_4d_coordinate_matrix(
             elif local_nm not in state_vars:
                 state_vars[local_nm] = f"__readonly_{local_nm}__"
 
+    def _py_block_end(start_i: int, max_scan: int = 400) -> int:
+        base_ind = len(lines[start_i]) - len(lines[start_i].lstrip())
+        end_k = start_i
+        for k in range(start_i + 1, min(e_idx, start_i + max_scan)):
+            k_s = lines[k].strip()
+            if not k_s or k_s.startswith("#"):
+                continue
+            if (len(lines[k]) - len(lines[k].lstrip())) <= base_ind:
+                break
+            end_k = k
+        return end_k
+
     raw_blocks: list[tuple[str, str, int, int]] = []
     i = s_idx
     while i < e_idx:
         ln = lines[i]
         st = ln.strip()
         lnum = i + 1
-        if not st or st.startswith(("//", "#", "/*")):
+        if not st or st.startswith(("//", "#", "/*", "--")):
             i += 1
             continue
 
+        # 0. SQL CREATE TABLE blocks (in .sql files or inline schema strings)
+        m_ct = re.search(
+            r"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:[a-zA-Z_]\w*\.)?[\"`]?([a-zA-Z_][a-zA-Z0-9_]*)[\"`]?\s*\(",
+            st,
+            re.IGNORECASE,
+        )
+        if m_ct:
+            tbl_nm = m_ct.group(1)
+            end_i = _find_balanced_end(lines, i, "(", ")", max_scan=120)
+            raw_blocks.append(("SCHEMA", f"table:{tbl_nm}", lnum, end_i + 1))
+            i = end_i + 1
+            continue
         # 1. Contiguous STATE declarations (useState / useRef)
         if re.search(r"\buse(?:State|Ref)\s*(?:<[^>]*>)?\s*\(", st):
             b_start = lnum
@@ -778,25 +804,14 @@ def extract_4d_coordinate_matrix(
             fn_name = m_fn.group(1) or m_fn.group(2) or m_fn.group(3)
             if fn_name not in ("if", "for", "while", "switch", "catch", "constructor"):
                 if "def " in st:
-                    if lnum in ast_span_by_start:
-                        end_i = ast_span_by_start[lnum] - 1
-                    else:
-                        base_ind = len(ln) - len(ln.lstrip())
-                        end_i = i
-                        for k in range(i + 1, min(e_idx, i + 800)):
-                            k_s = lines[k].strip()
-                            if not k_s or k_s.startswith("#"):
-                                continue
-                            if (len(lines[k]) - len(lines[k].lstrip())) <= base_ind:
-                                break
-                            end_i = k
+                    end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _py_block_end(i, max_scan=800)
                 else:
                     end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _find_balanced_end(lines, i, "{", "}", max_scan=3000)
                 span = (end_i + 1) - lnum
                 if span <= 200:
                     body_txt = "\n".join(lines[i : end_i + 1])
                     if re.search(
-                        r"\b(?:fetch|axios|setItem|getItem|memoryKv|setDoc|updateDoc|execute|commit|prisma|supabase|dispatch|requests\.|httpx\.|aiohttp\.|redis\.|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM)\b",
+                        r"\b(?:fetch|axios|setItem|getItem|memoryKv|setDoc|updateDoc|execute|commit|prisma|supabase|dispatch|requests\.|httpx\.|aiohttp\.|redis\.|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|SELECT\s+)\b",
                         body_txt,
                         re.IGNORECASE,
                     ):
@@ -806,23 +821,79 @@ def extract_4d_coordinate_matrix(
                     else:
                         role = "ACTION"
                     raw_blocks.append((role, f"fn:{fn_name}", lnum, end_i + 1))
-                    i = end_i + 1
+                    # For functions >= 16 lines, step inside so inner branches, try/except, with, and SQL blocks are also extracted
+                    i = (end_i + 1) if span < 8 else (i + 1)
                     continue
 
-        # 5. Conditional dispatch branches: if (...) / elif (...)
-        m_if = re.match(r"^(?:else\s+if|elif|if)\s*\(?([^):{]{4,75})\)?\s*[{:]", st)
+        # 5. Conditional dispatch branches: if (...) / elif (...) in JS/TS ({) and Python (:)
+        m_if = re.match(r"^(?:else\s+if|elif|if)\s*\(?([^):{]{3,75})\)?\s*[{:]\s*(?:#.*)?$", st)
         if m_if:
             cond = m_if.group(1).strip()
             if st.endswith("{"):
                 end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _find_balanced_end(lines, i, "{", "}", max_scan=400)
-                span = (end_i + 1) - lnum
-                if 8 <= span <= 220:
-                    sample = "\n".join(lines[i : min(end_i + 1, i + 30)])
-                    role = "VIEW" if ("<" in sample and "return" in sample) else "ACTION"
-                    raw_blocks.append((role, f"branch[{cond[:40]}]", lnum, end_i + 1))
+            else:
+                end_i = _py_block_end(i, max_scan=250)
+            span = (end_i + 1) - lnum
+            if 4 <= span <= 220:
+                sample = "\n".join(lines[i : min(end_i + 1, i + 30)])
+                if re.search(
+                    r"\b(?:fetch|axios|setItem|getItem|execute|commit|prisma|supabase|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|SELECT\s+)\b",
+                    sample,
+                    re.IGNORECASE,
+                ):
+                    role = "IO"
+                elif "<" in sample and "return" in sample:
+                    role = "VIEW"
+                else:
+                    role = "ACTION"
+                raw_blocks.append((role, f"branch[{cond[:40]}]", lnum, end_i + 1))
+                i = (end_i + 1) if span <= 5 else (i + 1)
+                continue
+
+        # 5b. Context managers / transactions (`with ...:`) and exception handlers (`try` / `except` / `catch`)
+        m_with = re.match(r"^(?:async\s+)?with\s+([^:]{3,65}):\s*(?:#.*)?$", st)
+        if m_with:
+            ctx_expr = m_with.group(1).strip()
+            end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _py_block_end(i, max_scan=250)
+            span = (end_i + 1) - lnum
+            if 3 <= span <= 220:
+                sample = "\n".join(lines[i : min(end_i + 1, i + 30)])
+                role = "IO" if re.search(r"\b(?:tx|db|conn|cursor|open|lock|session|execute|INSERT\s+INTO|UPDATE\s+|SELECT\s+)\b", sample, re.IGNORECASE) else "ACTION"
+                raw_blocks.append((role, f"with[{ctx_expr[:36]}]", lnum, end_i + 1))
+                i = i + 1
+                continue
+
+        m_try = re.match(r"^(?:try\s*[:{]|(?:except|catch)\s*\(?([^):{]{0,50})\)?\s*[:{])\s*(?:#.*)?$", st)
+        if m_try:
+            is_catch = st.startswith(("except", "catch"))
+            end_i = _find_balanced_end(lines, i, "{", "}", max_scan=200) if st.endswith("{") else _py_block_end(i, max_scan=200)
+            span = (end_i + 1) - lnum
+            if 3 <= span <= 180:
+                sample = "\n".join(lines[i : min(end_i + 1, i + 25)])
+                role = "IO" if re.search(r"\b(?:execute|commit|INSERT\s+INTO|UPDATE\s+|DELETE\s+FROM|SELECT\s+|fetch|axios)\b", sample, re.IGNORECASE) else "ACTION"
+                lbl = f"catch[{(m_try.group(1) or 'all').strip()[:32]}]" if is_catch else "try_block"
+                raw_blocks.append((role, lbl, lnum, end_i + 1))
+                i = (end_i + 1) if (is_catch and span <= 6) else (i + 1)
+                continue
+
+        # 5c. Multi-line SQL execution statements (`conn.execute(...)`, `db.execute(...)`, `pool.query(...)`)
+        if re.search(r"\b(?:conn|cur|cursor|db|session|pool|client|tx)\.(?:execute|executemany|query)\s*\(", st):
+            end_i = _find_balanced_end(lines, i, "(", ")", max_scan=80)
+            span = (end_i + 1) - lnum
+            if 2 <= span <= 80:
+                sql_sample = "\n".join(lines[i : end_i + 1])
+                m_op = re.search(
+                    r"\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM|SELECT\b[\s\S]{1,100}?\bFROM|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?)\s+([a-zA-Z_][a-zA-Z0-9_]{2,})",
+                    sql_sample,
+                    re.IGNORECASE,
+                )
+                if m_op:
+                    raw_verb = m_op.group(1).strip().upper()
+                    verb = "SELECT" if raw_verb.startswith("SELECT") else raw_verb.split()[0]
+                    tbl_nm = m_op.group(2)
+                    raw_blocks.append(("IO", f"sql[{verb} {tbl_nm}]", lnum, end_i + 1))
                     i = end_i + 1
                     continue
-
         # 6. JSX conditional ({cond && (...)}, ternary {cond ? (...) : (...)}) or .map() render lists
         m_jsx = re.match(r"^\{\s*([a-zA-Z0-9_!.?\s&=|]{3,45})\s*(?:&&|\?)\s*\(", st)
         if m_jsx:
@@ -934,6 +1005,18 @@ def extract_4d_coordinate_matrix(
             exc = m_ct.group(1)
             if exc not in ("as",) and f"catch:{exc}" not in e_exit:
                 e_exit.append(f"catch:{exc}")
+        for m_st in re.finditer(
+            r"\b(?:ApiError|HTTPException|status|status_code)\s*[\(=]\s*(?:status_code\s*=\s*)?(4\d\d|5\d\d)\b"
+            r"(?:\s*,\s*['\"]([a-zA-Z0-9_\-]+)['\"])?",
+            chunk,
+        ):
+            st_code = f"status:{m_st.group(1)}"
+            if st_code not in e_exit:
+                e_exit.append(st_code)
+            if m_st.group(2):
+                err_tag = f"err:{m_st.group(2).lower()}"
+                if err_tag not in e_exit:
+                    e_exit.append(err_tag)
         if re.search(r"\bif\b[^{:\n]*[:{]?\s*\n?\s*return\b(?:\s+(?:None|False|null|false|undefined|redirect\b))?", chunk):
             if "guard_return" not in e_exit:
                 e_exit.append("guard_return")
@@ -956,20 +1039,176 @@ def extract_4d_coordinate_matrix(
                 if m.group(1) not in ("if", "for", "while", "switch", "catch", "return", "function", "useEffect", "useState", "useMemo", "useCallback")
             }
         )
-        cells.append({
+        sql_inserts: list[dict] = []
+        for m_ins in re.finditer(
+            r"\bINSERT\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]{2,})\s*\(([^)]+)\)\s*(?:VALUES|SELECT)\b",
+            chunk,
+            re.IGNORECASE,
+        ):
+            ins_tbl = m_ins.group(1)
+            ins_cols = [
+                c.strip().strip('"`')
+                for c in m_ins.group(2).split(",")
+                if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", c.strip().strip('"`'))
+            ]
+            if ins_cols:
+                ins_line = s + chunk.count("\n", 0, m_ins.start())
+                sql_inserts.append({"table": ins_tbl, "cols": ins_cols, "line": ins_line})
+
+        sql_dialects: list[str] = []
+        if re.search(r"\binterval\s+'[^']+'", chunk, re.IGNORECASE):
+            sql_dialects.append("interval_literal")
+        if re.search(r"\bmake_interval\s*\(", chunk, re.IGNORECASE):
+            sql_dialects.append("make_interval")
+        if re.search(r"=\s*ANY\s*\(\s*(?:%s|\$|\?)", chunk, re.IGNORECASE):
+            sql_dialects.append("any_array")
+
+        # Cross-stack HTTP client calls (fetch / axios / client.<verb>)
+        # Cross-stack HTTP client calls (fetch / axios / client.<verb>) + expected response shape
+        _JS_RES_BUILTINS = {
+            "ok", "status", "statusText", "headers", "json", "text", "blob", "clone",
+            "then", "catch", "finally", "length", "map", "filter", "forEach", "slice",
+            "toString", "valueOf", "error", "errors", "detail", "message", "data",
+        }
+        expected_res_keys: list[str] = []
+        for m_jvar in re.finditer(r"\b(?:const|let|var)\s+([a-zA-Z_]\w*)\s*=\s*await\s+\w+\.json\(\)", chunk):
+            jvar = m_jvar.group(1)
+            for m_prop in re.finditer(rf"\b{re.escape(jvar)}\.([a-zA-Z_]\w*)\b", chunk[m_jvar.end() :]):
+                pk = m_prop.group(1)
+                line_end_pos = chunk.find("\n", m_jvar.end() + m_prop.start())
+                line_start_pos = chunk.rfind("\n", 0, m_jvar.end() + m_prop.start()) + 1
+                prop_line_txt = chunk[line_start_pos : (line_end_pos if line_end_pos != -1 else len(chunk))]
+                if "||" in prop_line_txt or "??" in prop_line_txt:
+                    continue
+                if pk not in _JS_RES_BUILTINS and pk not in expected_res_keys:
+                    expected_res_keys.append(pk)
+
+        http_calls: list[dict] = []
+        for m_fe in re.finditer(
+            r"\bfetch\s*\(\s*[`'\"](\/[a-zA-Z0-9_/\-${}:.]+)[`'\"](?:\s*,\s*\{([\s\S]{0,260}?)\})?",
+            chunk,
+        ):
+            raw_u = m_fe.group(1).split("?")[0]
+            opts_u = m_fe.group(2) or ""
+            m_verb = re.search(r"\bmethod\s*:\s*['\"]([A-Za-z]+)['\"]", opts_u)
+            verb_u = m_verb.group(1).upper() if m_verb else "GET"
+            norm_u = re.sub(r"\$\{[^}]+\}|:[a-zA-Z_]\w*", "{*}", raw_u).rstrip("/") or "/"
+            fe_line = s + chunk.count("\n", 0, m_fe.start())
+            hc_entry: dict = {"method": verb_u, "url": raw_u, "norm_url": norm_u, "line": fe_line}
+            if expected_res_keys:
+                hc_entry["expected_keys"] = expected_res_keys[:8]
+            http_calls.append(hc_entry)
+        for m_ax in re.finditer(
+            r"\b(?:axios|api|client|http)\.(get|post|put|delete|patch)\s*\(\s*[`'\"](\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]",
+            chunk,
+            re.IGNORECASE,
+        ):
+            verb_u = m_ax.group(1).upper()
+            raw_u = m_ax.group(2).split("?")[0]
+            norm_u = re.sub(r"\$\{[^}]+\}|:[a-zA-Z_]\w*", "{*}", raw_u).rstrip("/") or "/"
+            ax_line = s + chunk.count("\n", 0, m_ax.start())
+            http_calls.append({"method": verb_u, "url": raw_u, "norm_url": norm_u, "line": ax_line})
+        # Disjoint runtime type comparisons (e.g. Python UUID parameter compared directly to SQLite TEXT row["col"])
+        type_comparisons: list[dict] = []
+        if scope.startswith("fn:"):
+            sig_head = "\n".join(lines[s - 1 : min(e, s + 8)])
+            uuid_params = set(re.findall(r"\b([a-zA-Z_]\w*)\s*:\s*(?:uuid\.)?UUID\b", sig_head))
+            if uuid_params:
+                for off_idx, raw_ln in enumerate(lines[s - 1 : e]):
+                    if "str(" in raw_ln or "UUID(" in raw_ln:
+                        continue
+                    for up in uuid_params:
+                        m_cmp = re.search(
+                            rf"\b\w+\[\s*['\"]([a-zA-Z_]\w*)['\"]\s*\]\s*(?:==|!=)\s*{re.escape(up)}\b"
+                            rf"|\b{re.escape(up)}\s*(?:==|!=)\s*\w+\[\s*['\"]([a-zA-Z_]\w*)['\"]\s*\]",
+                            raw_ln,
+                        )
+                        if m_cmp:
+                            col_k = m_cmp.group(1) or m_cmp.group(2)
+                            type_comparisons.append({
+                                "param": up,
+                                "param_type": "UUID",
+                                "row_key": col_k,
+                                "line": s + off_idx,
+                            })
+        # Producer-Consumer SQL SELECT projection vs row["key"] read algebra
+        sql_select_violations: list[dict] = []
+        return_dict_keys: list[str] = []
+        if scope.startswith("fn:"):
+            for m_sel in re.finditer(
+                r"\b([a-zA-Z_]\w*)\s*=\s*[\w.]+\.execute\(\s*(?:f?['\"]{1,3})\s*SELECT\s+([\s\S]+?)\s+FROM\s+([a-zA-Z_]\w*)\b[\s\S]*?\)\.fetchone\(\)",
+                chunk,
+                re.IGNORECASE,
+            ):
+                r_var = m_sel.group(1)
+                raw_c_str = m_sel.group(2)
+                sel_tbl = m_sel.group(3)
+                if "*" in raw_c_str or "(" in raw_c_str:
+                    continue
+                proj_cols: list[str] = []
+                for c_part in raw_c_str.split(","):
+                    cp = c_part.strip()
+                    m_as = re.search(r"\bAS\s+([a-zA-Z_]\w*)\s*$", cp, re.IGNORECASE)
+                    if m_as:
+                        proj_cols.append(m_as.group(1))
+                    else:
+                        base_c = cp.split("::")[0].strip().split(".")[-1].strip().strip('"`')
+                        if re.match(r"^[a-zA-Z_]\w*$", base_c):
+                            proj_cols.append(base_c)
+                if not proj_cols:
+                    continue
+                proj_low = {c.lower() for c in proj_cols}
+                tail_chunk = chunk[m_sel.end() :]
+                m_reassign = re.search(rf"\b{re.escape(r_var)}\s*=\s*", tail_chunk)
+                if m_reassign:
+                    tail_chunk = tail_chunk[: m_reassign.start()]
+                for m_rk in re.finditer(rf"\b{re.escape(r_var)}\[\s*['\"]([a-zA-Z_]\w*)['\"]\s*\]", tail_chunk):
+                    rk = m_rk.group(1)
+                    if rk.lower() not in proj_low:
+                        rk_line = s + chunk.count("\n", 0, m_sel.end() + m_rk.start())
+                        sql_select_violations.append({
+                            "var": r_var,
+                            "read_key": rk,
+                            "projected_cols": proj_cols,
+                            "table": sel_tbl,
+                            "line": rk_line,
+                        })
+
+            if ext == ".py":
+                ret_blocks = re.findall(r"\breturn\s*\{([^{};]+)\}", chunk)
+                if ret_blocks and not any("**" in rb for rb in ret_blocks):
+                    for rb in ret_blocks:
+                        for mk in re.finditer(r"['\"]([a-zA-Z_]\w*)['\"]\s*:", rb):
+                            k_str = mk.group(1)
+                            if k_str not in return_dict_keys:
+                                return_dict_keys.append(k_str)
+
+        cell_dict: dict = {
             "X_scope": scope,
             "Y_role": role,
             "Z_write": z_write[:10],
             "Z_read": z_read[:14],
             "W_calls": (w_comps + w_calls)[:10],
-            "E_exit": e_exit[:6],
+            "E_exit": e_exit[:10],
             "T_mode": t_mode,
             "line_start": s,
             "line_end": e,
             "span": e - s + 1,
-        })
+        }
+        if sql_inserts:
+            cell_dict["sql_inserts"] = sql_inserts
+        if sql_dialects:
+            cell_dict["sql_dialects"] = sql_dialects
+        if http_calls:
+            cell_dict["http_calls"] = http_calls
+        if type_comparisons:
+            cell_dict["type_comparisons"] = type_comparisons
+        if sql_select_violations:
+            cell_dict["sql_select_violations"] = sql_select_violations
+        if return_dict_keys:
+            cell_dict["return_dict_keys"] = return_dict_keys[:16]
+        cells.append(cell_dict)
     return cells
-
 
 def query_4d_coordinate_matrix(
     cells: list[dict],
@@ -994,9 +1233,29 @@ def query_4d_coordinate_matrix(
 
     wants_view = any(w in q_low for w in ("render", "ui", "view", "jsx", "button", "modal", "header", "layout", "display", "screen"))
     wants_effect = any(w in q_low for w in ("effect", "mount", "reset", "hydrate", "watch", "change", "init", "sync", "countdown", "timer"))
-    wants_io = any(w in q_low for w in ("save", "persist", "storage", "db", "firestore", "cloud", "fetch", "api", "kv", "pay", "submit"))
-    wants_write = any(w in q_low for w in ("set", "update", "mark", "reset", "write", "save", "mutate", "toggle", "clear", "override"))
-    wants_error = any(w in q_low for w in ("error", "throw", "raise", "fail", "exception", "guard", "abort", "reject", "catch"))
+    wants_io = any(
+        w in q_low
+        for w in (
+            "save", "persist", "storage", "db", "database", "sql", "sqlite", "postgres",
+            "firestore", "cloud", "fetch", "api", "kv", "pay", "submit", "connect",
+            "connection", "query", "insert", "table", "upload", "worker", "backend",
+        )
+    )
+    wants_write = any(
+        w in q_low
+        for w in (
+            "set", "update", "mark", "reset", "write", "save", "mutate", "toggle",
+            "clear", "override", "insert", "create", "delete", "upload", "persist",
+        )
+    )
+    wants_error = any(
+        w in q_low
+        for w in (
+            "error", "throw", "raise", "fail", "exception", "guard", "abort", "reject",
+            "catch", "bug", "bugs", "cant", "cannot", "broken", "crash", "500", "409",
+            "400", "constraint",
+        )
+    )
 
     def _stem(w: str) -> str:
         st = re.sub(r"(?:ation|ment|ing|ed|es|s)$", "", w) if len(w) >= 5 else w
@@ -1059,8 +1318,28 @@ def query_4d_coordinate_matrix(
                 sc *= 0.30
             if c["span"] > 400:
                 sc *= 0.6
+        else:
+            # Behavioral 6D axis fallback when query uses symptom/intent terms rather than exact identifier names
+            beh_sc = 0.0
+            if wants_io and y_role in ("IO", "SCHEMA"):
+                beh_sc += 2.0
+            if (wants_write or wants_io) and c["Z_write"]:
+                beh_sc += 1.8
+            if wants_error and c.get("E_exit"):
+                beh_sc += 2.0
+            if wants_view and y_role == "VIEW":
+                beh_sc += 1.5
+            if wants_effect and y_role == "EFFECT":
+                beh_sc += 1.5
+            if c.get("sql_inserts") or c.get("sql_dialects"):
+                beh_sc += 1.5
+            if beh_sc > 0:
+                if c["span"] <= 90 and not x_low.startswith("fn:"):
+                    beh_sc *= 1.15
+                elif c["span"] > 400:
+                    beh_sc *= 0.5
+                sc = beh_sc
         scored.append((sc, c))
-
     scored_pos = [item for item in scored if item[0] > 0]
     scored_pos.sort(key=lambda item: (item[0], -item[1]["span"]), reverse=True)
     top_cells = [item[1] for item in scored_pos[:4]]

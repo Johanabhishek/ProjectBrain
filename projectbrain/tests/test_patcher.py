@@ -501,3 +501,266 @@ def test_interprocedural_effect_bubbling_and_state_channels(tmp_path: Path):
     assert "interprocedural_bubble" in md
     assert "invoices_ledger" in md
     assert "state_flow" in md
+
+
+def test_6d_subblocks_sql_schema_and_contract_diagnostics(tmp_path: Path, monkeypatch, capsys):
+    """Verify 6D sub-block extraction inside <200-line functions, .sql indexing, and Pass C 6D Contract Diagnostics."""
+    import io
+    from projectbrain import cli
+
+    src = tmp_path / "backend"
+    src.mkdir()
+
+    # 1. SQL migration file (.sql)
+    (src / "001_init.sql").write_text(
+        "CREATE TABLE audit_logs (\n"
+        "  id TEXT PRIMARY KEY,\n"
+        "  action TEXT NOT NULL\n"
+        ");\n\n"
+        "CREATE OR REPLACE FUNCTION record_audit(p_id TEXT) RETURNS VOID AS $$\n"
+        "BEGIN\n"
+        "  INSERT INTO audit_logs (id, action) VALUES (p_id, 'init');\n"
+        "END;\n"
+        "$$ LANGUAGE plpgsql;\n",
+        encoding="utf-8",
+    )
+
+    # 2. Local SQLite adapter with inline CREATE TABLE (where `created_at` is NOT NULL without DEFAULT)
+    #    and an incomplete SQL translator that does NOT handle `interval '...'` or `ANY(%s)`.
+    (src / "local_db.py").write_text(
+        "import sqlite3\n\n"
+        "def init_schema(conn):\n"
+        "    conn.executescript('''\n"
+        "    CREATE TABLE IF NOT EXISTS source_files (\n"
+        "        id TEXT PRIMARY KEY,\n"
+        "        batch_id TEXT NOT NULL,\n"
+        "        created_at TEXT NOT NULL\n"
+        "    );\n"
+        "    ''')\n\n"
+        "class SqliteAdapter:\n"
+        "    def _translate_sql(self, sql: str) -> str:\n"
+        "        return sql.replace('%s', '?')\n"
+        "    def execute(self, sql: str, params=()):\n"
+        "        conn = sqlite3.connect(':memory:')\n"
+        "        return conn.execute(self._translate_sql(sql), params)\n",
+        encoding="utf-8",
+    )
+
+    # 3. Modular (<60-line) router function with:
+    #    - `with db.tx() as conn:` sub-block
+    #    - `try / except UniqueViolation:` sub-block
+    #    - `INSERT INTO source_files (id, batch_id)` omitting required `created_at`
+    #    - Postgres `interval '5 minutes'` dialect mismatch
+    (src / "uploads.py").write_text(
+        "class UniqueViolation(Exception):\n"
+        "    pass\n\n"
+        "async def upload_file_handler(db, file_id: str, batch_id: str):\n"
+        "    if not file_id:\n"
+        "        return None\n"
+        "    try:\n"
+        "        with db.tx() as conn:\n"
+        "            conn.execute(\n"
+        "                '''INSERT INTO source_files (id, batch_id)\n"
+        "                   VALUES (%s, %s)''',\n"
+        "                (file_id, batch_id),\n"
+        "            )\n"
+        "            conn.execute(\n"
+        "                '''SELECT id FROM source_files\n"
+        "                   WHERE created_at > now() + interval '5 minutes' '''\n"
+        "            )\n"
+        "    except UniqueViolation:\n"
+        "        raise RuntimeError('duplicate upload')\n"
+        "    return {'id': file_id}\n",
+        encoding="utf-8",
+    )
+
+    brain = ProjectBrain(str(tmp_path))
+    st = brain.index()
+    assert "backend/001_init.sql" in brain._index
+    assert any(c["name"] == "audit_logs" for c in brain._index["backend/001_init.sql"]["classes"])
+    assert any(f["name"] == "record_audit" for f in brain._index["backend/001_init.sql"]["functions"])
+
+    # Verify sub-blocks inside the 22-line `upload_file_handler` were extracted into 6D cells
+    up_cells = brain._index["backend/uploads.py"]["cells_4d"]
+    up_scopes = [c["X_scope"] for c in up_cells]
+    assert "fn:upload_file_handler" in up_scopes
+    assert any(s.startswith("with[") for s in up_scopes)
+    assert any(s.startswith("sql[INSERT source_files]") for s in up_scopes)
+
+    # Verify dossier on open-ended DB bug prompt surfaces 6D Coordinate Matrix + all 3 Contract Warnings
+    d_res = brain.compile_dossier(["there are some backend bugs . cant connect to db"])
+    md = d_res["markdown"]
+    assert "[4D Coordinate Matrix]" in md
+    assert "Static 6D Contract, Schema & Dialect Diagnostics" in md
+    assert "[6D Schema Contract Violation]" in md
+    assert "created_at" in md
+    assert "[6D SQL Dialect Mismatch]" in md
+    assert "interval_literal" in md
+    assert "[6D Exception Contract Mismatch]" in md
+    assert "UniqueViolation" in md
+    assert brain.stats()["resolution"]["cells_4d_resolved"] >= 1
+
+    # Verify CLI `patch --spec -` reads from stdin
+    patch_dsl = "@file backend/uploads.py\n@sub L19 `'duplicate upload'` -> `'conflict 409'`\n"
+    monkeypatch.setattr("sys.stdin", io.StringIO(patch_dsl))
+    capsys.readouterr()
+    rc = cli.main(["--path", str(tmp_path), "patch", "--spec", "-", "--apply"])
+    assert rc == 0
+    assert "conflict 409" in (src / "uploads.py").read_text(encoding="utf-8")
+
+
+def test_multiplex_ppr_submodular_and_type_route_algebra(tmp_path):
+    """Verify Multiplex PageRank across HTTP->Backend->SQL->Worker, Submodular selection, and Type/Method Algebra."""
+    (tmp_path / "schema.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS background_jobs (\n"
+        "    id TEXT PRIMARY KEY,\n"
+        "    status TEXT NOT NULL\n"
+        ");\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "frontend_api.ts").write_text(
+        "export async function uploadBatchFile(batchId: string, file: File) {\n"
+        "    const form = new FormData();\n"
+        "    form.append('file', file);\n"
+        "    const res = await fetch(`/api/v1/batches/${batchId}/files`, { method: 'POST', body: form });\n"
+        "    const bad = await fetch(`/api/v1/batches/${batchId}/files`, { method: 'DELETE' });\n"
+        "    if (!res.ok) {\n"
+        "        throw new Error('Upload failed');\n"
+        "    }\n"
+        "    return res.json();\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "routes.py").write_text(
+        "import sqlite3\n"
+        "from uuid import UUID\n"
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter(prefix='/api/v1/batches')\n\n"
+        "@router.post('/{batch_id}/files')\n"
+        "def upload_file_endpoint(batch_id: str, user_id: UUID):\n"
+        "    conn = sqlite3.connect(':memory:')\n"
+        "    row = {'uploaded_by': 'some-text-uuid'}\n"
+        "    if row['uploaded_by'] != user_id:\n"
+        "        raise PermissionError('Forbidden')\n"
+        "    with conn:\n"
+        "        conn.execute(\"INSERT INTO background_jobs (id, status) VALUES ('1', 'queued')\")\n"
+        "    return {'ok': True}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "worker.py").write_text(
+        "import sqlite3\n\n"
+        "def process_next_job():\n"
+        "    conn = sqlite3.connect(':memory:')\n"
+        "    with conn:\n"
+        "        rows = conn.execute(\"SELECT id, status FROM background_jobs WHERE status = 'queued'\").fetchall()\n"
+        "        for r in rows:\n"
+        "            print(r)\n"
+        "    return len(rows)\n",
+        encoding="utf-8",
+    )
+
+    from projectbrain.brain import ProjectBrain
+
+    brain = ProjectBrain(root=str(tmp_path))
+    brain.index()
+
+    # 1. Verify cross-stack http_flow edge was built from frontend_api.ts -> routes.py
+    http_edges = [e for e in brain._graph.edges if e["type"] == "http_flow"]
+    assert len(http_edges) >= 1, f"Expected http_flow bridge edge, got: {brain._graph.edges}"
+    assert any("uploadBatchFile" in e["src"] and "upload_file_endpoint" in e["dst"] for e in http_edges)
+
+    # 2. Verify Multiplex PageRank diffuses from frontend uploadBatchFile -> routes -> worker
+    ppr_results = brain._graph.multiplex_ppr(["frontend_api.ts::uploadBatchFile"])
+    ppr_ids = [nid for nid, _, _ in ppr_results]
+    assert any("upload_file_endpoint" in k for k in ppr_ids), f"Backend route missing from PPR: {ppr_results}"
+    assert any("process_next_job" in k for k in ppr_ids), f"Worker missing from 2-hop Multiplex PPR: {ppr_results}"
+
+    # 3. Verify Pass C catches both Type Disjointness (UUID vs str row) and HTTP Route Method Mismatch (DELETE vs POST)
+    res = brain.compile_dossier(["uploadBatchFile fails with Forbidden or method error"])
+    dossier = res["markdown"]
+    assert "[6D Type Disjointness Violation]" in dossier
+    assert "user_id" in dossier and "uploaded_by" in dossier
+    assert "[6D HTTP Route Method Mismatch]" in dossier
+    assert "DELETE" in dossier
+
+
+def test_causal_symptom_chop_shape_algebra_and_predisk_patch_contracts(tmp_path):
+    """Verify Causal Symptom Chop (403 -> nested callback -> load_batch), Producer-Consumer SQL/HTTP Shape Algebra, and Pre-Disk Patch Verification."""
+    (tmp_path / "schema.sql").write_text(
+        "CREATE TABLE IF NOT EXISTS background_jobs (\n"
+        "    id TEXT PRIMARY KEY,\n"
+        "    status TEXT NOT NULL\n"
+        ");\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "deps.py").write_text(
+        "from uuid import UUID\n\n"
+        "class ApiError(Exception):\n"
+        "    pass\n\n"
+        "def load_batch(conn, batch_id: UUID, user: UUID):\n"
+        "    b = conn.execute(\"SELECT id, created_by FROM ingestion_batches WHERE id = %s\", (batch_id,)).fetchone()\n"
+        "    if not b:\n"
+        "        raise ApiError(404, 'batch_not_found', 'Batch not found')\n"
+        "    if str(b['created_by']) != str(user):\n"
+        "        raise ApiError(403, 'forbidden', 'Only the batch creator can do this')\n"
+        "    bad_val = b['unselected_column']\n"
+        "    return b\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "routes.py").write_text(
+        "import sqlite3\n"
+        "from uuid import UUID\n"
+        "from fastapi import APIRouter\n"
+        "from deps import load_batch\n\n"
+        "router = APIRouter(prefix='/api/v1/batches')\n\n"
+        "@router.post('/{batch_id}/files')\n"
+        "def upload_file_endpoint(batch_id: UUID, user_id: UUID):\n"
+        "    conn = sqlite3.connect(':memory:')\n"
+        "    def on_file_headers():\n"
+        "        return load_batch(conn, batch_id, user_id)\n"
+        "    on_file_headers()\n"
+        "    with conn:\n"
+        "        conn.execute(\"INSERT INTO background_jobs (id, status) VALUES ('1', 'queued')\")\n"
+        "    return {'ok': True, 'file_id': '123'}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "frontend_api.ts").write_text(
+        "export async function uploadBatchFile(batchId: string, file: File) {\n"
+        "    const res = await fetch(`/api/v1/batches/${batchId}/files`, { method: 'POST' });\n"
+        "    const data = await res.json();\n"
+        "    return data.non_existent_prop;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    from projectbrain.brain import ProjectBrain
+
+    brain = ProjectBrain(root=str(tmp_path))
+    brain.index()
+
+    # 1. Verify Causal Symptom Chop finds 4-hop cross-stack path from uploadBatchFile -> upload_file_endpoint -> on_file_headers -> load_batch (status:403)
+    chops = brain._graph.causal_symptom_chop(["frontend_api.ts::uploadBatchFile"], "uploadBatchFile fails with 403")
+    assert len(chops) >= 1, f"Expected causal symptom chop hit, got: {chops}"
+    origin_nid, sym_str, path_list = chops[0]
+    assert "load_batch" in origin_nid
+    assert "status:403" in sym_str
+
+    # 2. Verify Dossier surfaces Causal Symptom Chop, SQL SELECT Projection Shape Violation, and Cross-Stack HTTP Shape Violation
+    res = brain.compile_dossier(["uploadBatchFile fails with 403 database error"])
+    md = res["markdown"]
+    assert "[Causal Symptom Chop]" in md
+    assert "load_batch" in md
+    assert "[6D Producer-Consumer SQL Shape Violation]" in md
+    assert "unselected_column" in md
+    assert "[6D Cross-Stack HTTP Shape Violation]" in md
+    assert "non_existent_prop" in md
+
+    # 3. Verify Pre-Disk Differential 6D Contract Verification in `brain.patch(..., apply=False)`
+    bad_patch_spec = (
+        "@file routes.py\n"
+        "@sub L15 `INSERT INTO background_jobs (id, status) VALUES ('1', 'queued')` -> `INSERT INTO background_jobs (id) VALUES ('1')`\n"
+    )
+    patch_res = brain.patch(bad_patch_spec, apply=False)
+    assert patch_res["all_syntax_valid"] is True
+    assert patch_res["all_contracts_valid"] is False
+    assert any("[6D Schema Contract Violation]" in d and "status" in d for d in patch_res["contract_diagnostics"])

@@ -1,16 +1,21 @@
+import functools
 import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).parent.parent / "eval"))
 
-from run_eval import run  # noqa: E402
+from run_eval import run as _raw_run  # noqa: E402
+
+
+@functools.lru_cache(maxsize=1)
+def run():
+    return _raw_run()
 
 
 def test_file_retrieval_recall_regression_floor():
     data = run()
     fr = data["file_retrieval"]
     assert fr
-
     avg_recall = sum(r["recall"] for r in fr) / len(fr)
     assert avg_recall >= 0.7, f"file-retrieval recall regressed: {avg_recall:.0%}"
 

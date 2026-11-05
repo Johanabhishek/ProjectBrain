@@ -6,6 +6,7 @@ Edges: defines, imports, calls, inherits, handles, has_method, exports
 from __future__ import annotations
 
 import json
+import re
 from collections import deque
 
 
@@ -119,10 +120,10 @@ class CodeGraph:
                     "rel_path": rel_path,
                     "method": r["method"],
                     "path": r["path"],
+                    "full_path": r.get("full_path") or r["path"],
                     "handler": r.get("handler"),
                     "line": r.get("line"),
                 }
-
             for imp in info.get("imports", []):
                 nid = mod_id(imp)
                 if nid not in g.nodes:
@@ -253,6 +254,19 @@ class CodeGraph:
                             )
                         added_call_dsts.add(cand)
 
+                # 3. Connect lexically nested helper/callback functions (e.g., on_file_headers inside upload_file)
+                fn_s = fn.get("line_start", 0)
+                fn_e = fn.get("line_end", 0)
+                if 0 < (fn_e - fn_s) <= 300:
+                    for inner_fn in info.get("functions", []):
+                        in_s = inner_fn.get("line_start", 0)
+                        in_e = inner_fn.get("line_end", 0)
+                        if fn_s < in_s and in_e <= fn_e:
+                            in_nid = fn_id(rel_path, inner_fn["name"], inner_fn.get("parent_class"))
+                            if in_nid != nid and in_nid in g.nodes and in_nid not in added_call_dsts:
+                                g._add_edge(nid, in_nid, "calls", "exact", "nested helper/callback in function", line=in_s)
+                                added_call_dsts.add(in_nid)
+
             for c in info.get("classes", []):
                 cid = cls_id(rel_path, c["name"])
                 g._add_edge(fid, cid, "defines", "exact", "direct definition in file")
@@ -352,6 +366,8 @@ class CodeGraph:
                 local_zw: list[str] = []
                 local_zr: list[str] = []
                 local_exits: list[str] = []
+                local_http: list[dict] = []
+                local_ret_keys: list[str] = []
                 local_roles: set[str] = set()
                 t_modes: set[str] = set()
                 for c in fn_cells:
@@ -366,6 +382,13 @@ class CodeGraph:
                     for ex in c.get("E_exit", []):
                         if ex not in local_exits:
                             local_exits.append(ex)
+                    for hc in c.get("http_calls", []):
+                        if hc not in local_http:
+                            local_http.append(hc)
+                    if c.get("X_scope", "").startswith("fn:"):
+                        for rk in c.get("return_dict_keys", []):
+                            if rk not in local_ret_keys:
+                                local_ret_keys.append(rk)
                 local_eff = [r for r in ("IO", "EFFECT", "VIEW") if r in local_roles]
                 if local_zw and "MUTATE" not in local_eff:
                     local_eff.append("MUTATE")
@@ -376,11 +399,14 @@ class CodeGraph:
                     nd["local_z_read"] = local_zr
                 if local_exits:
                     nd["exit_contracts"] = local_exits
+                if local_http:
+                    nd["http_calls"] = local_http[:8]
+                if local_ret_keys:
+                    nd["return_dict_keys"] = local_ret_keys[:16]
                 if local_eff:
                     nd["local_effects"] = local_eff
                 if t_mode != "SYNC":
                     nd["temporal_mode"] = t_mode
-
         # 2. Pass A: Bottom-Up 3-Hop Interprocedural Effect & ?Z Bubbling along `calls` edges
         for nid, nd in self.nodes.items():
             if nd.get("type") != "fn":
@@ -421,7 +447,7 @@ class CodeGraph:
                             trans_eff.append(eff)
                             provenance.setdefault(f"effect:{eff}", via_label)
                     for ex in callee_nd.get("exit_contracts", []):
-                        if ex.startswith("throw:") and ex not in own_exits and ex not in trans_exits:
+                        if ex.startswith(("throw:", "status:", "err:")) and ex not in own_exits and ex not in trans_exits:
                             trans_exits.append(ex)
                             provenance[ex] = via_label
 
@@ -432,7 +458,7 @@ class CodeGraph:
             if trans_eff:
                 nd["transitive_effects"] = trans_eff
             if trans_exits:
-                nd["transitive_exits"] = trans_exits[:8]
+                nd["transitive_exits"] = trans_exits[:12]
             if provenance:
                 nd["effect_provenance"] = provenance
 
@@ -449,11 +475,11 @@ class CodeGraph:
                 if len(zr) >= 3 and zr.lower() not in _GENERIC_STATE_KEYS:
                     readers_by_key.setdefault(zr, []).append(nid)
 
-        added_state_edges = 0
+        added_multiplex_edges = 0
         seen_state_pairs: set[tuple[str, str, str]] = set()
         for k, writers in writers_by_key.items():
             readers = readers_by_key.get(k, [])
-            if not readers or len(writers) > 8 or len(readers) > 12:
+            if not readers or len(writers) > 18 or len(readers) > 25:
                 continue
             for w_id in writers:
                 for r_id in readers:
@@ -466,9 +492,198 @@ class CodeGraph:
                             "exact",
                             f"shared state channel '{k}' (?Z_write -> Z_read)",
                         )
-                        added_state_edges += 1
-        if added_state_edges > 0:
+                        added_multiplex_edges += 1
+
+        # 4. Pass B2: Cross-Stack HTTP Bridge Edges (`http_flow`: Frontend fetch/axios -> Backend route handler)
+        route_handlers: list[tuple[str, str, str, str]] = []
+        for rnid, rnd in self.nodes.items():
+            if rnd.get("type") != "route":
+                continue
+            rmeth = (rnd.get("method") or "GET").upper()
+            rfull = rnd.get("full_path") or rnd.get("path") or ""
+            rnorm = re.sub(r"\{[^}]+\}|:[a-zA-Z_]\w*", "{*}", rfull).rstrip("/") or "/"
+            rshort = re.sub(r"\{[^}]+\}|:[a-zA-Z_]\w*", "{*}", rnd.get("path") or "").rstrip("/") or "/"
+            for ei in self._adj.get(rnid, []):
+                e_h = self.edges[ei]
+                if e_h["type"] == "handles":
+                    route_handlers.append((rmeth, rnorm, rshort, e_h["dst"]))
+
+        if route_handlers:
+            seen_http_pairs: set[tuple[str, str, str]] = set()
+            for fnid, fnd in self.nodes.items():
+                if fnd.get("type") != "fn":
+                    continue
+                for hc in fnd.get("http_calls", []):
+                    hm = hc["method"]
+                    hu = hc["norm_url"]
+                    for rmeth, rnorm, rshort, h_dst in route_handlers:
+                        if rmeth not in ("ANY", "ALL", hm):
+                            continue
+                        matched_route = (hu == rnorm) or (
+                            len(rshort) > 4 and rshort.count("/") >= 2 and hu.endswith(rshort)
+                        )
+                        if matched_route and fnid != h_dst and (fnid, h_dst, hu) not in seen_http_pairs:
+                            seen_http_pairs.add((fnid, h_dst, hu))
+                            self._add_edge(
+                                fnid,
+                                h_dst,
+                                "http_flow",
+                                "exact",
+                                f"HTTP {hm} {hc['url']} -> {h_dst.split(':')[-1]}",
+                                line=hc.get("line"),
+                            )
+                            added_multiplex_edges += 1
+
+        if added_multiplex_edges > 0:
             self._build_index()
+
+    def multiplex_ppr(
+        self,
+        seed_weights: dict[str, float] | list[str] | set[str] | tuple[str, ...],
+        alpha: float = 0.30,
+        iterations: int = 12,
+        top_k: int = 12,
+    ) -> list[tuple[str, float, str]]:
+        """Multiplex Personalized PageRank (Random Walk with Restart) across the 4-layer graph:
+          ?^(t+1) = (1 - ?) * P^T * ?^(t) + ? * v_0
+        Diffuses probability mass simultaneously over AST call edges, HTTP frontend->backend bridges,
+        and shared SQL/state-channel edges to locate cross-stack fault bottlenecks.
+        """
+        if not isinstance(seed_weights, dict):
+            raw_seeds = {str(k): 1.0 for k in seed_weights}
+        else:
+            raw_seeds = {str(k): float(v) for k, v in seed_weights.items() if v > 0}
+        valid_seeds: dict[str, float] = {}
+        for k, v in raw_seeds.items():
+            if k in self.nodes:
+                valid_seeds[k] = v
+            else:
+                norm_k = k.replace("::", ":")
+                if f"fn:{norm_k}" in self.nodes:
+                    valid_seeds[f"fn:{norm_k}"] = v
+                else:
+                    for nid in self.nodes:
+                        if nid.endswith(f":{norm_k}") or nid.endswith(f":{k.split(':')[-1]}"):
+                            valid_seeds[nid] = v
+                            break
+        if not valid_seeds:
+            return []
+        total_s = sum(valid_seeds.values())
+        v0 = {k: v / total_s for k, v in valid_seeds.items()}
+        pi = dict(v0)
+
+        _FWD_W = {"http_flow": 1.40, "state_flow": 1.20, "handles": 1.10, "calls": 1.00}
+        _BWD_W = {"http_flow": 0.85, "state_flow": 0.80, "handles": 0.70, "calls": 0.65}
+        best_prov: dict[str, tuple[float, str]] = {}
+
+        for _ in range(iterations):
+            nxt_pi: dict[str, float] = {k: alpha * val for k, val in v0.items()}
+            for u, p_u in pi.items():
+                if p_u < 1e-5:
+                    continue
+                transitions: list[tuple[str, float, str]] = []
+                for ei in self._adj.get(u, []):
+                    e = self.edges[ei]
+                    et = e["type"]
+                    if et in _FWD_W and e.get("confidence") in ("exact", "import_resolved"):
+                        w = _FWD_W[et]
+                        u_nm = self.nodes.get(u, {}).get("name") or u.split(":")[-1]
+                        rsn = e.get("reason") or f"{et} from {u_nm}"
+                        transitions.append((e["dst"], w, f"PPR [{et}] via {u_nm}: {rsn}"))
+                for ei in self._radj.get(u, []):
+                    e = self.edges[ei]
+                    et = e["type"]
+                    if et in _BWD_W and e.get("confidence") in ("exact", "import_resolved"):
+                        w = _BWD_W[et]
+                        u_nm = self.nodes.get(u, {}).get("name") or u.split(":")[-1]
+                        transitions.append((e["src"], w, f"PPR [inverse_{et}] -> {u_nm}"))
+                if not transitions:
+                    for k, val in v0.items():
+                        nxt_pi[k] = nxt_pi.get(k, 0.0) + (1.0 - alpha) * p_u * val
+                    continue
+                w_sum = sum(t[1] for t in transitions)
+                for dst, w, prov_str in transitions:
+                    contrib = (1.0 - alpha) * p_u * (w / w_sum)
+                    nxt_pi[dst] = nxt_pi.get(dst, 0.0) + contrib
+                    prev_best = best_prov.get(dst, (0.0, ""))[0]
+                    if dst not in valid_seeds and contrib > prev_best:
+                        best_prov[dst] = (contrib, prov_str)
+            pi = nxt_pi
+
+        ranked_out: list[tuple[str, float, str]] = []
+        for nid, prob in pi.items():
+            if nid in valid_seeds:
+                continue
+            nd = self.nodes.get(nid, {})
+            if nd.get("type") not in ("fn", "cls"):
+                continue
+            prov_reason = best_prov.get(nid, (0.0, "multiplex diffusion"))[1]
+            ranked_out.append((nid, prob, prov_reason))
+        ranked_out.sort(key=lambda x: x[1], reverse=True)
+        return ranked_out[:top_k]
+
+    def causal_symptom_chop(
+        self,
+        seed_ids: list[str] | set[str],
+        task_text: str,
+        max_hops: int = 4,
+    ) -> list[tuple[str, str, list[str]]]:
+        """Compute the Causal Program Chop X_chop(S_0, Sigma) = F_multiplex(S_0) ? B(Sigma).
+        Intersects the forward 4-layer execution cone of `seed_ids` with the backward origin set
+        of HTTP status codes / exception symptoms extracted from `task_text`.
+        Returns list of (origin_node_id, matched_symptom_str, causal_path_node_ids).
+        """
+        t_low = task_text.lower()
+        target_exits: set[str] = set()
+        for m_code in re.finditer(r"\b(4\d\d|5\d\d)\b", t_low):
+            target_exits.add(f"status:{m_code.group(1)}")
+        if "forbidden" in t_low or "403" in t_low or "permission" in t_low:
+            target_exits.update({"status:403", "err:forbidden", "throw:PermissionError"})
+        if "unauthorized" in t_low or "401" in t_low:
+            target_exits.update({"status:401", "err:unauthorized"})
+        if "not found" in t_low or "404" in t_low:
+            target_exits.update({"status:404", "err:not_found", "err:batch_not_found", "err:file_not_found"})
+        if "conflict" in t_low or "409" in t_low or "duplicate" in t_low:
+            target_exits.update({"status:409", "err:conflict", "throw:UniqueViolation", "throw:IntegrityError"})
+        if "422" in t_low or "locked" in t_low or "unprocessable" in t_low:
+            target_exits.update({"status:422", "err:batch_locked", "err:profile_incomplete"})
+        if not target_exits:
+            return []
+
+        valid_starts: list[str] = []
+        for k in seed_ids:
+            if k in self.nodes:
+                valid_starts.append(k)
+            else:
+                norm_k = k.replace("::", ":")
+                if f"fn:{norm_k}" in self.nodes:
+                    valid_starts.append(f"fn:{norm_k}")
+        if not valid_starts:
+            return []
+
+        results: list[tuple[str, str, list[str]]] = []
+        seen_origins: set[str] = set()
+        q: deque[tuple[str, list[str], int]] = deque([(s, [s], 0) for s in valid_starts])
+        visited_hops: dict[str, int] = {s: 0 for s in valid_starts}
+
+        while q:
+            curr_id, path, hop = q.popleft()
+            if hop >= 1 and curr_id not in seen_origins:
+                c_nd = self.nodes.get(curr_id, {})
+                matched = sorted(set(c_nd.get("exit_contracts", [])) & target_exits)
+                if matched:
+                    seen_origins.add(curr_id)
+                    results.append((curr_id, ", ".join(matched), path))
+            if hop >= max_hops:
+                continue
+            for ei in self._adj.get(curr_id, []):
+                e = self.edges[ei]
+                if e["type"] in ("http_flow", "calls", "handles", "state_flow") and e.get("confidence") in ("exact", "import_resolved"):
+                    dst = e["dst"]
+                    if dst not in visited_hops or visited_hops[dst] > hop + 1:
+                        visited_hops[dst] = hop + 1
+                        q.append((dst, path + [dst], hop + 1))
+        return results
     # ── traversal ────────────────────────────────────────────────────────────
 
     def neighbors(

@@ -137,7 +137,7 @@ def _trim_subgraph(subgraph: dict) -> dict:
     return result
 
 
-PARSED_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs", ".java"}
+PARSED_EXTS = {".py", ".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs", ".go", ".rs", ".java", ".sql"}
 
 DEPRIORITY_DIRS = {
     "examples", "example", "demo", "demos",
@@ -457,7 +457,7 @@ class ProjectBrain:
         primary_files: set[str] = set()
         emitted_by_file: dict[str, list[tuple[int, int]]] = {}
         matched_4d_cells_count = 0
-
+        monolith_4d_cells_count = 0
         # Helper to add a file's module globals once (only when max_g > 0 so expanded callees don't prematurely lock out primary globals)
         def _ensure_globals(rel_path: str, buf: list[str], max_g: int = 24) -> None:
             if zoom or max_g <= 0 or rel_path in seen_globals or rel_path not in self._index:
@@ -519,7 +519,8 @@ class ProjectBrain:
 
             matrix_header = ""
             cell_slices: list[str] = []
-            if (slice_e - slice_s) > 200 and not is_caller_slice:
+            cell_focus_terms: list[str] = []
+            if (slice_e - slice_s) >= 10 and not is_caller_slice:
                 pre_cells = self._index[rel].get("cells_4d")
                 if pre_cells:
                     cells = [
@@ -533,10 +534,15 @@ class ProjectBrain:
                         f_lines = []
                     cells = extract_4d_coordinate_matrix(f_lines, slice_s, slice_e, ext=Path(rel).suffix) if f_lines else []
                 if cells:
-                    if len(cells) >= 3:
-                        top_cells, matrix_header = query_4d_coordinate_matrix(
-                            cells, focus_terms=kw_list + ast_calls, raw_query=" ".join(tasks)
-                        )
+                    max_rows = 22 if (slice_e - slice_s) > 200 else 8
+                    top_cells, matrix_header = query_4d_coordinate_matrix(
+                        cells,
+                        focus_terms=kw_list + ast_calls,
+                        raw_query=" ".join(tasks),
+                        max_table_rows=max_rows,
+                    )
+                    nonlocal matched_4d_cells_count, monolith_4d_cells_count
+                    if (slice_e - slice_s) > 200 and len(cells) >= 3:
                         for tc in top_cells[:2]:
                             tc_s, tc_e = tc["line_start"], tc["line_end"]
                             if any(
@@ -547,17 +553,29 @@ class ProjectBrain:
                             if tc["span"] <= 90:
                                 tc_code = slice_lines(self.root, rel, tc_s, tc_e, max_lines=min(55, tc["span"] + 2), focus_terms=kw_list + ast_calls)
                                 if tc_code:
-                                    nonlocal matched_4d_cells_count
                                     matched_4d_cells_count += 1
+                                    monolith_4d_cells_count += 1
                                     seen_spans.append((rel, tc_s, tc_e))
                                     emitted_by_file.setdefault(rel, []).extend(extract_emitted_intervals(tc_code))
                                     cell_slices.append(
                                         f"# [4D Cell Match: {tc['Y_role']} | {tc['X_scope']} (L{tc_s}-L{tc_e})]\n{tc_code}"
                                     )
+                    else:
+                        matched_4d_cells_count += max(1, len(top_cells[:2]))
+                        for tc in top_cells[:2]:
+                            cell_focus_terms.extend(tc.get("Z_write", [])[:3])
+                            cell_focus_terms.extend(tc.get("W_calls", [])[:3])
             code = (
                 ""
                 if cell_slices
-                else slice_lines(self.root, rel, slice_s, slice_e, max_lines=effective_max_l, focus_terms=kw_list + ast_calls)
+                else slice_lines(
+                    self.root,
+                    rel,
+                    slice_s,
+                    slice_e,
+                    max_lines=effective_max_l,
+                    focus_terms=kw_list + ast_calls + cell_focus_terms,
+                )
             )
             if not code and not cell_slices:
                 return
@@ -875,32 +893,115 @@ class ProjectBrain:
                         chain_lines.append(f"- `{seed_id}` -[interprocedural_bubble]-> {' | '.join(parts_eff)}{via_sfx}")
                     for ei_sf in self._graph._adj.get(seed_id, []):
                         esf = self._graph.edges[ei_sf]
-                        if esf["type"] == "state_flow":
-                            chain_lines.append(f"- `{seed_id}` -[state_flow: {esf.get('reason', '')}]-> `{esf['dst']}`")
+                        if esf["type"] in ("state_flow", "http_flow"):
+                            chain_lines.append(f"- `{seed_id}` -[{esf['type']}: {esf.get('reason', '')}]-> `{esf['dst']}`")
                     for ei_sfr in self._graph._radj.get(seed_id, []):
                         esfr = self._graph.edges[ei_sfr]
-                        if esfr["type"] == "state_flow":
-                            chain_lines.append(f"- `{esfr['src']}` -[state_flow: {esfr.get('reason', '')}]-> `{seed_id}`")
+                        if esfr["type"] in ("state_flow", "http_flow"):
+                            chain_lines.append(f"- `{esfr['src']}` -[{esfr['type']}: {esfr.get('reason', '')}]-> `{seed_id}`")
 
-                if chain_lines and not zoom and matched_4d_cells_count == 0:
+                # Multiplex Personalized PageRank (PPR) + Causal Symptom Chop across 4-Layer Graph
+                ppr_results = self._graph.multiplex_ppr({sid: 1.0 for sid in explicit_nodes[:4]}, top_k=10)
+                ppr_scores: dict[str, float] = {nid: prob for nid, prob, _ in ppr_results}
+                existing_exp_ids = {item[0] for item in expanded_nodes}
+
+                chop_hits = self._graph.causal_symptom_chop(explicit_nodes[:4], clean_task_for_search)
+                for chop_nid, chop_sym, chop_path in chop_hits[:2]:
+                    path_str = " -> ".join(f"`{p}`" for p in chop_path)
+                    chain_lines.append(f"- ?? **[Causal Symptom Chop]** {path_str} *(origin of `{chop_sym}`)*")
+                    ppr_scores[chop_nid] = max(ppr_scores.get(chop_nid, 0.0), 0.45)
+                    if chop_nid not in existing_exp_ids and chop_nid not in seen_slices:
+                        expanded_nodes.insert(0, (chop_nid, f"Causal Symptom Chop origin ({chop_sym})", t_kw, 32, 0))
+                        existing_exp_ids.add(chop_nid)
+
+                for p_nid, p_prob, p_rsn in ppr_results[:4]:
+                    if p_nid not in existing_exp_ids and p_nid not in seen_slices and (
+                        "http_flow" in p_rsn or "table:" in p_rsn or p_prob >= 0.085
+                    ):
+                        expanded_nodes.append((p_nid, p_rsn, t_kw, 28, 0))
+                        existing_exp_ids.add(p_nid)
+
+                if chain_lines and not zoom and monolith_4d_cells_count == 0:
                     sec.append("### Static AST Call, State-Channel & Interprocedural Flow Edges")
                     sec.extend(list(dict.fromkeys(chain_lines))[:12])
                 emitted_hops = 99 if (zoom and had_initial_explicit) else 0
-                max_hops_allowed = (2 if not had_initial_explicit else 1) if (zoom or matched_4d_cells_count > 0 or len(filtered_explicit) >= 2) else 2
-                def _hop_priority(item: tuple[str, str, list[str], int, int]) -> tuple[int, int, int, int]:
-                    nd_obj = self._graph.nodes.get(item[0], {}) if self._graph else {}
-                    nd_nm = (nd_obj.get("name") or "").lower()
-                    nd_rel = nd_obj.get("rel_path", "")
-                    nd_span = nd_obj.get("line_end", 1) - nd_obj.get("line_start", 1)
-                    is_1hop = 1 if not item[1].startswith(("2-hop", "3-hop")) else 0
-                    in_top_files = 1 if (nd_rel in top3_query_files and "analytics" not in nd_rel.lower()) else 0
-                    kw_hits = sum(1 for w in t_kw if len(w) >= 4 and (w in nd_nm or w[:4] in nd_nm))
-                    top_kw = 1 if (kw_hits > 0 and in_top_files) else 0
-                    substantive = 1 if nd_span >= 6 else 0
-                    return (-top_kw, -kw_hits, -in_top_files, -is_1hop, -substantive)
-                expanded_nodes.sort(key=_hop_priority)
+                max_hops_allowed = (2 if not had_initial_explicit else 1) if (zoom or monolith_4d_cells_count > 0 or len(filtered_explicit) >= 2) else 2
+
+                # Submodular Marginal Information Gain per Unseen Token Optimizer
+                covered_features: set[str] = set()
+                for s_id in seen_slices:
+                    s_obj = self._graph.nodes.get(s_id, {})
+                    for zw in s_obj.get("local_z_write", []):
+                        covered_features.add(f"zw:{zw.lower()}")
+                    for ex in s_obj.get("exit_contracts", []):
+                        covered_features.add(f"ex:{ex.lower()}")
+
+                remaining_cands: list[tuple[str, str, list[str], int, int]] = []
+                seen_cand_ids: set[str] = set()
+                for item in expanded_nodes:
+                    if item[0] not in seen_cand_ids and item[0] not in seen_slices and item[0] in self._graph.nodes:
+                        seen_cand_ids.add(item[0])
+                        remaining_cands.append(item)
+
+                ordered_cands: list[tuple[str, str, list[str], int, int]] = []
+                while remaining_cands:
+                    best_idx = 0
+                    best_ratio = -1e9
+                    for c_idx, item in enumerate(remaining_cands):
+                        c_nid, c_rsn, _, c_max_l, _ = item
+                        nd_obj = self._graph.nodes.get(c_nid, {})
+                        nd_nm = (nd_obj.get("name") or "").lower()
+                        nd_rel = nd_obj.get("rel_path", "")
+                        nd_s = nd_obj.get("line_start", 1)
+                        nd_e = nd_obj.get("line_end", nd_s)
+                        nd_span = max(1, nd_e - nd_s)
+
+                        # Compute marginal unseen token cost C(u) from Session Interval Ledger
+                        s_plan = self._ledger.plan_slice_intervals(nd_rel, nd_s, nd_e, commit=False)
+                        unseen_lines = sum(ue - us + 1 for us, ue in s_plan["unseen_intervals"])
+                        cost_u = max(4.0, float(min(c_max_l, unseen_lines if unseen_lines > 0 else nd_span)))
+
+                        # Compute marginal epistemic gain ?I(u | U_cov)
+                        gain = 0.0
+                        for w in t_kw:
+                            if len(w) >= 4 and (w in nd_nm or w[:4] in nd_nm):
+                                feat_k = f"kw:{w}"
+                                gain += (6.0 if feat_k not in covered_features else 1.5) * self._idf.get(w, 1.0)
+                        for zw in nd_obj.get("local_z_write", []):
+                            feat_zw = f"zw:{zw.lower()}"
+                            gain += 3.2 if feat_zw not in covered_features else 0.4
+                        for ex in nd_obj.get("exit_contracts", []):
+                            feat_ex = f"ex:{ex.lower()}"
+                            gain += 2.2 if feat_ex not in covered_features else 0.3
+                        if nd_rel in top3_query_files and "analytics" not in nd_rel.lower():
+                            gain += 5.0
+                        if not c_rsn.startswith(("2-hop", "3-hop")):
+                            gain += 3.5
+                        if "http_flow" in c_rsn or "state_flow" in c_rsn:
+                            gain += 4.5
+                        gain += 25.0 * ppr_scores.get(c_nid, 0.0)
+                        if nd_span < 6:
+                            gain *= 0.35
+
+                        ratio = gain / (cost_u ** 0.55)
+                        if ratio > best_ratio:
+                            best_ratio = ratio
+                            best_idx = c_idx
+
+                    chosen = remaining_cands.pop(best_idx)
+                    ordered_cands.append(chosen)
+                    ch_obj = self._graph.nodes.get(chosen[0], {})
+                    ch_nm = (ch_obj.get("name") or "").lower()
+                    for w in t_kw:
+                        if len(w) >= 4 and (w in ch_nm or w[:4] in ch_nm):
+                            covered_features.add(f"kw:{w}")
+                    for zw in ch_obj.get("local_z_write", []):
+                        covered_features.add(f"zw:{zw.lower()}")
+                    for ex in ch_obj.get("exit_contracts", []):
+                        covered_features.add(f"ex:{ex.lower()}")
+
                 hop_pointers: list[str] = []
-                for enid, ereason, ekw, emax_l, emax_g in expanded_nodes:
+                for enid, ereason, ekw, emax_l, emax_g in ordered_cands:
                     if not self._graph or enid not in self._graph.nodes or enid in seen_slices:
                         continue
                     end_node = self._graph.nodes[enid]
@@ -908,10 +1009,12 @@ class ProjectBrain:
                     erel = end_node.get("rel_path", "")
                     espan = end_node.get("line_end", 1) - end_node.get("line_start", 1)
                     sec_lines_now = sum(len(x.splitlines()) for x in sec)
-                    kw_direct = any(w in enm or w[:4] in enm for w in t_kw if len(w) >= 4)
-                    if emitted_hops < max_hops_allowed and (sec_lines_now < 120 or (kw_direct and sec_lines_now < 200)) and espan <= 110:
-                        _add_node_slice(enid, ereason, ekw, sec, max_l=min(emax_l, 26), max_g=0)
-                        emitted_hops += 1
+                    is_chop = "Causal Symptom Chop" in ereason
+                    kw_direct = is_chop or any(w in enm or w[:4] in enm for w in t_kw if len(w) >= 4) or ("http_flow" in ereason) or ("table:" in ereason)
+                    if (emitted_hops < max_hops_allowed or is_chop) and (sec_lines_now < 120 or (kw_direct and sec_lines_now < 235)) and espan <= 110:
+                        _add_node_slice(enid, ereason, ekw, sec, max_l=min(emax_l, 30 if is_chop else 26), max_g=0)
+                        if not is_chop:
+                            emitted_hops += 1
                     else:
                         ptr = f"- `{erel} :: {end_node.get('name')}` (L{end_node.get('line_start', 1)}-L{end_node.get('line_end', 1)}) ? {ereason}"
                         if ptr not in hop_pointers:
@@ -919,9 +1022,14 @@ class ProjectBrain:
                 if hop_pointers:
                     sec.append("### Connected Call-Graph Coordinate Map (1-hop/2-hop neighbors)")
                     sec.extend(hop_pointers[:6])
-
+            diag_lines, diag_nodes = self._compile_6d_contract_diagnostics(task, primary_files | set(emitted_by_file.keys()) | top3_query_files)
+            if diag_lines and not zoom:
+                for d_nid in diag_nodes[:2]:
+                    if len(seen_slices) < 6:
+                        _add_node_slice(d_nid, "6D contract violation site", t_kw, sec, max_l=45, max_g=0)
+                sec.append("### Static 6D Contract, Schema & Dialect Diagnostics")
+                sec.extend(diag_lines[:10])
             md_sections.extend(sec)
-
         # 4. Append Impact / Blast Radius sections
         for imp_file in impact_list:
             norm_f = self._normalize_rel(imp_file)
@@ -1163,8 +1271,33 @@ class ProjectBrain:
                 mode="applied" if apply else "dry_run",
                 all_syntax_valid=bool(res.get("all_syntax_valid", False)),
             )
-        if apply and res.get("all_syntax_valid"):
-            self.index()
+        if res.get("all_syntax_valid"):
+            self._ensure_fresh()
+            patched_rels: set[str] = set()
+            saved_cells: dict[str, list[dict]] = {}
+            for f_item in res.get("files", []):
+                f_rel = self._normalize_rel(f_item.get("file", ""))
+                p_txt = f_item.pop("_patched_text", None)
+                if f_rel:
+                    patched_rels.add(f_rel)
+                    if not apply and p_txt is not None and f_rel in self._index:
+                        saved_cells[f_rel] = self._index[f_rel].get("cells_4d", [])
+                        info_f = self._index[f_rel]
+                        self._index[f_rel]["cells_4d"] = extract_4d_coordinate_matrix(p_txt.splitlines(), ext=Path(f_rel).suffix.lower())
+            if apply:
+                self.index()
+            diag_lines, _ = self._compile_6d_contract_diagnostics(
+                "patch verification", patched_rels, strict_focus=True
+            )
+            for f_rel, orig_c in saved_cells.items():
+                self._index[f_rel]["cells_4d"] = orig_c
+            res["contract_diagnostics"] = diag_lines
+            res["all_contracts_valid"] = len(diag_lines) == 0
+        else:
+            for f_item in res.get("files", []):
+                f_item.pop("_patched_text", None)
+            res["contract_diagnostics"] = []
+            res["all_contracts_valid"] = False
         return res
 
     def savings_stats(self, reset: bool = False) -> dict:
@@ -1234,7 +1367,11 @@ class ProjectBrain:
                                     f"# [Small-File Remainder Guard] Emitting all remaining unread lines ({un_str}) of {rel} ({len(f_lines)} lines total) in one pass:"
                                 )
                             if summary_mode:
-                                target_cap = max(55, min(max_lines_per_symbol, 220 // max(1, len(targets))))
+                                span_req = e_line - s_line + 1
+                                if len(targets) <= 2 and span_req <= max(220, max_lines_per_symbol):
+                                    target_cap = max(span_req, max_lines_per_symbol)
+                                else:
+                                    target_cap = max(55, min(max_lines_per_symbol, 220 // max(1, len(targets))))
                             else:
                                 # Explicit non-summary line-range request: unfold up to 400 lines per target
                                 target_cap = max(max_lines_per_symbol, 400)
@@ -1504,24 +1641,227 @@ class ProjectBrain:
                 score += 0.8 * idf
             elif kw in body_tokens or any(len(kw_stem) >= 4 and kw_stem in bt for bt in body_tokens):
                 score += 0.6 * idf
-        if score == 0.0 and (fn_e - fn_s) > 120 and cells_4d:
+        if cells_4d:
             inner_cells = [
                 c for c in cells_4d
                 if fn_s <= c.get("line_start", 0) and c.get("line_end", 0) <= fn_e
             ]
-            cell_blob = " ".join(
-                f"{c.get('X_scope', '')} {' '.join(c.get('Z_write', []))}"
-                for c in inner_cells
-            ).lower()
-            for kw in keywords:
-                if kw in cell_blob:
-                    score += 0.7 * self._idf.get(kw, 1.0)
+            if inner_cells:
+                cell_blob = " ".join(
+                    f"{c.get('X_scope', '')} {' '.join(c.get('Z_write', []))} {' '.join(c.get('Z_read', []))} {' '.join(c.get('E_exit', []))}"
+                    for c in inner_cells
+                ).lower()
+                for kw in keywords:
+                    idf = self._idf.get(kw, 1.0)
+                    kw_stem = re.sub(r"(?:ed|ing|es|s)$", "", kw) if len(kw) >= 5 else kw
+                    if kw in cell_blob or (len(kw_stem) >= 4 and kw_stem in cell_blob):
+                        score += 0.9 * idf
+                kw_set = set(keywords)
+                if kw_set & {"db", "database", "sql", "sqlite", "postgres", "insert", "query", "connect", "persist", "storage", "table"}:
+                    if any(c.get("Y_role") == "IO" or c.get("sql_inserts") for c in inner_cells):
+                        score += 1.6
+                if kw_set & {"bug", "bugs", "error", "errors", "fail", "crash", "cant", "cannot", "broken", "500", "409"}:
+                    if any(c.get("E_exit") or c.get("sql_inserts") or c.get("sql_dialects") for c in inner_cells):
+                        score += 1.4
         for r in routes:
             if r.get("handler") == fn.get("name"):
                 for kw in keywords:
                     if kw in r.get("path", "").lower() or kw == r.get("method", "").lower():
                         score += 3.0
         return score
+
+    def _compile_6d_contract_diagnostics(self, task: str, focus_files: set[str], strict_focus: bool = False) -> tuple[list[str], list[str]]:
+        """Pass C: Cross-check 6D IO cells (SQL INSERT column sets, SQL dialects, exception contracts)
+        against indexed CREATE TABLE schemas and database adapter capabilities across the repository.
+        Returns (diagnostic_markdown_lines, offending_node_ids).
+        """
+        schemas_by_table: dict[str, list[tuple[str, dict]]] = {}
+        sqlite_adapters: list[tuple[str, str]] = []
+        for rel, info in self._index.items():
+            for tbl, sc in (info.get("sql_schemas") or {}).items():
+                schemas_by_table.setdefault(tbl.lower(), []).append((rel, sc))
+            if rel.endswith(".py") and "sqlite3" in info.get("imports", []):
+                try:
+                    src_txt = (self.root / rel).read_text(encoding="utf-8", errors="ignore")
+                    if "def execute" in src_txt or "_translate_sql" in src_txt:
+                        sqlite_adapters.append((rel, src_txt))
+                except OSError:
+                    pass
+
+
+        t_low = task.lower()
+        wants_all_repo_diag = (not strict_focus) and any(
+            w in t_low
+            for w in ("bug", "bugs", "error", "fail", "db", "database", "sql", "sqlite", "postgres", "connect", "insert", "schema", "backend")
+        )
+        ordered_files = sorted(
+            self._index.keys(),
+            key=lambda r: (0 if r in focus_files else 1, r),
+        )
+        warnings: list[str] = []
+        offending_nodes: list[str] = []
+        seen_warn_keys: set[tuple[str, int, str]] = set()
+        covered_dialect_spans: list[tuple[str, int, int, str]] = []
+
+        def _record_offending_fn(f_rel: str, ln_no: int) -> None:
+            for fn in self._index.get(f_rel, {}).get("functions", []):
+                if fn.get("line_start", 0) <= ln_no <= fn.get("line_end", 0):
+                    nid = fn_id(f_rel, fn["name"], fn.get("parent_class"))
+                    if nid not in offending_nodes:
+                        offending_nodes.append(nid)
+
+        for rel in ordered_files:
+            if not wants_all_repo_diag and rel not in focus_files:
+                continue
+            cells = self._index[rel].get("cells_4d") or []
+            # Prefer finest-grained cell per line
+            cells_sorted = sorted(cells, key=lambda c: c.get("span", 9999))
+            for cell in cells_sorted:
+                scope = cell.get("X_scope", "")
+                c_line = cell.get("line_start", 1)
+                c_end = cell.get("line_end", c_line)
+                # 1. Check INSERT INTO <table> (<cols>) against NOT NULL columns without DEFAULT
+                for ins in cell.get("sql_inserts", []):
+                    tbl_raw = ins["table"]
+                    tbl_key = tbl_raw.lower()
+                    ins_cols_low = {c.lower() for c in ins["cols"]}
+                    ins_line = ins.get("line", c_line)
+                    for schema_rel, sc in schemas_by_table.get(tbl_key, []):
+                        missing = [
+                            req for req in sc.get("required_cols", [])
+                            if req.lower() not in ins_cols_low
+                        ]
+                        if missing:
+                            w_key = (rel, ins_line, f"null:{tbl_key}:{','.join(missing)}")
+                            if w_key not in seen_warn_keys:
+                                seen_warn_keys.add(w_key)
+                                _record_offending_fn(rel, ins_line)
+                                warnings.append(
+                                    f"- ?? **[6D Schema Contract Violation]** `{rel}:L{ins_line}` (`{scope}`) ? "
+                                    f"`INSERT INTO {tbl_raw}({', '.join(ins['cols'][:5])}{'...' if len(ins['cols']) > 5 else ''})` "
+                                    f"omits required `NOT NULL` column(s) `{', '.join(missing)}` "
+                                    f"(declared without `DEFAULT` in `{schema_rel}:L{sc['line_start']}`)."
+                                )
+                # 2. Check PostgreSQL-specific SQL dialect features against SQLite adapters
+                if sqlite_adapters:
+                    ad_rel, ad_src = sqlite_adapters[0]
+                    for feat in cell.get("sql_dialects", []):
+                        if any(
+                            sr == rel and c_line <= ss and se <= c_end and sf == feat
+                            for sr, ss, se, sf in covered_dialect_spans
+                        ):
+                            continue
+                        handled = False
+                        if feat == "interval_literal":
+                            handled = bool(re.search(r"interval\\s\+|interval\s+'", ad_src, re.IGNORECASE))
+                        elif feat == "make_interval":
+                            handled = "make_interval" in ad_src
+                        elif feat == "any_array":
+                            handled = bool(re.search(r"ANY\\s\*\\\(|ANY\s*\(", ad_src, re.IGNORECASE))
+                        if not handled:
+                            covered_dialect_spans.append((rel, c_line, c_end, feat))
+                            w_key = (rel, c_line, f"dialect:{feat}")
+                            if w_key not in seen_warn_keys:
+                                seen_warn_keys.add(w_key)
+                                _record_offending_fn(rel, c_line)
+                                warnings.append(
+                                    f"- ?? **[6D SQL Dialect Mismatch]** `{rel}:L{c_line}` (`{scope}`) ? "
+                                    f"Query uses PostgreSQL construct `{feat}` not translated by SQLite adapter `{ad_rel}`."
+                                )
+                    # 3. Check psycopg exception catch vs sqlite3.IntegrityError on DB mutations
+                    exits = cell.get("E_exit", [])
+                    if (
+                        cell.get("Z_write")
+                        and "catch:UniqueViolation" in exits
+                        and "catch:IntegrityError" not in exits
+                        and "UniqueViolation" not in ad_src
+                    ):
+                        if not any(
+                            sr == rel and c_line <= ss and se <= c_end and sf == "exc:UniqueViolation"
+                            for sr, ss, se, sf in covered_dialect_spans
+                        ):
+                            covered_dialect_spans.append((rel, c_line, c_end, "exc:UniqueViolation"))
+                            w_key = (rel, c_line, "exc:UniqueViolation")
+                            if w_key not in seen_warn_keys:
+                                seen_warn_keys.add(w_key)
+                                _record_offending_fn(rel, c_line)
+                                warnings.append(
+                                    f"- ?? **[6D Exception Contract Mismatch]** `{rel}:L{c_line}` (`{scope}`) ? "
+                                    f"Catches `UniqueViolation` on DB write (`?Z:{','.join(cell['Z_write'][:2])}`) "
+                                    f"without catching `IntegrityError` raised by SQLite adapter `{ad_rel}`."
+                                )
+                # 4. Check Disjoint Runtime Type Algebra (UUID parameter compared directly to SQLite TEXT column)
+                for tc_cmp in cell.get("type_comparisons", []):
+                    cmp_line = tc_cmp["line"]
+                    w_key = (rel, cmp_line, f"type:{tc_cmp['param']}:{tc_cmp['row_key']}")
+                    if w_key not in seen_warn_keys:
+                        seen_warn_keys.add(w_key)
+                        _record_offending_fn(rel, cmp_line)
+                        warnings.append(
+                            f"- ?? **[6D Type Disjointness Violation]** `{rel}:L{cmp_line}` (`{scope}`) ? "
+                            f"Compares `{tc_cmp['param_type']}` parameter `{tc_cmp['param']}` directly against "
+                            f"SQLite `TEXT` row key `['{tc_cmp['row_key']}']` without `str()`/`UUID()` coercion "
+                            f"(`?(UUID) ? ?(str) = ?`)."
+                        )
+
+                # 5. Check Producer-Consumer SQL SELECT Projection vs Row Key Read (Post(SELECT) |= Pre(row[k]))
+                for sv in cell.get("sql_select_violations", []):
+                    sv_line = sv["line"]
+                    w_key = (rel, sv_line, f"sql_proj:{sv['var']}:{sv['read_key']}")
+                    if w_key not in seen_warn_keys:
+                        seen_warn_keys.add(w_key)
+                        _record_offending_fn(rel, sv_line)
+                        warnings.append(
+                            f"- ?? **[6D Producer-Consumer SQL Shape Violation]** `{rel}:L{sv_line}` (`{scope}`) ? "
+                            f"Reads row key `{sv['var']}['{sv['read_key']}']`, which is absent from `SELECT {', '.join(sv['projected_cols'])}` "
+                            f"on `{sv['table']}` (`Post(SELECT) ? Pre(row['{sv['read_key']}'])`)."
+                        )
+
+                # 6. Check Frontend -> Backend HTTP Route Verb & Response Shape Contracts
+                if self._graph and cell.get("http_calls"):
+                    be_routes_by_norm: dict[str, set[str]] = {}
+                    be_ret_keys_by_norm: dict[str, tuple[str, set[str]]] = {}
+                    for r_nid, r_nd in self._graph.nodes.items():
+                        if r_nd.get("type") == "route":
+                            rf = r_nd.get("full_path") or r_nd.get("path") or ""
+                            rn = re.sub(r"\{[^}]+\}|:[a-zA-Z_]\w*", "{*}", rf).rstrip("/") or "/"
+                            be_routes_by_norm.setdefault(rn, set()).add((r_nd.get("method") or "GET").upper())
+                            for ei_h in self._graph._adj.get(r_nid, []):
+                                eh = self._graph.edges[ei_h]
+                                if eh["type"] == "handles":
+                                    h_nd = self._graph.nodes.get(eh["dst"], {})
+                                    r_keys = set(h_nd.get("return_dict_keys", []))
+                                    if r_keys:
+                                        be_ret_keys_by_norm[rn] = (h_nd.get("name") or eh["dst"], r_keys)
+                    if be_routes_by_norm:
+                        for hc in cell.get("http_calls", []):
+                            hu = hc["norm_url"]
+                            hm = hc["method"]
+                            h_line = hc.get("line", c_line)
+                            allowed_verbs = be_routes_by_norm.get(hu)
+                            if allowed_verbs and "ANY" not in allowed_verbs and "ALL" not in allowed_verbs and hm not in allowed_verbs:
+                                w_key = (rel, h_line, f"http_verb:{hm}:{hu}")
+                                if w_key not in seen_warn_keys:
+                                    seen_warn_keys.add(w_key)
+                                    _record_offending_fn(rel, h_line)
+                                    warnings.append(
+                                        f"- ?? **[6D HTTP Route Method Mismatch]** `{rel}:L{h_line}` (`{scope}`) ? "
+                                        f"Frontend calls `{hm} {hc['url']}`, but backend route only accepts `{', '.join(sorted(allowed_verbs))}`."
+                                    )
+                            elif hc.get("expected_keys") and hu in be_ret_keys_by_norm:
+                                be_fn_nm, be_keys = be_ret_keys_by_norm[hu]
+                                missing_rk = [k for k in hc["expected_keys"] if k not in be_keys]
+                                if missing_rk:
+                                    w_key = (rel, h_line, f"http_shape:{hu}:{missing_rk[0]}")
+                                    if w_key not in seen_warn_keys:
+                                        seen_warn_keys.add(w_key)
+                                        _record_offending_fn(rel, h_line)
+                                        warnings.append(
+                                            f"- ?? **[6D Cross-Stack HTTP Shape Violation]** `{rel}:L{h_line}` (`{scope}`) ? "
+                                            f"Reads response property `.{missing_rk[0]}` from `{hm} {hc['url']}`, "
+                                            f"but backend handler `{be_fn_nm}` only returns `{sorted(be_keys)}` (`Post(BE) ? Pre(FE)`)."
+                                        )
+        return warnings, offending_nodes
 
     def _score_class_for_query(self, cls: dict, keywords: list[str]) -> float:
         name_lower = cls.get("name", "").lower()
@@ -3176,6 +3516,8 @@ class ProjectBrain:
         """Summary counts for the current index plus cumulative ROI savings telemetry."""
         if reset:
             return self._ledger.reset()
+        if not self._index and self._db_store.db_path.exists():
+            self.load()
         result = {
             "files": len(self._index),
             "functions": sum(len(v.get("functions", [])) for v in self._index.values()),

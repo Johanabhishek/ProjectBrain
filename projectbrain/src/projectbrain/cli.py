@@ -18,7 +18,7 @@ To cut input tokens by 75–88% and output tokens by 65–80%, ALWAYS follow thi
 2. **Read Specific Symbols Surgically (`brain_slice` / `projectbrain slice`):**
    If you need 1–2 additional symbols or line ranges, call `brain_slice(targets=["file.ts:symbol_or_start-end"])` instead of reading full files.
 3. **Cut Output Tokens with Surgical Anchor Patching (`brain_patch` / `projectbrain patch`):**
-   Instead of repeating verbatim multi-line `Target` + `Replacement` blocks in `edit_file` or writing verbose before/after code blocks, use `brain_patch` (`projectbrain patch --spec "..." [--apply]`):
+   Instead of repeating verbatim multi-line `Target` + `Replacement` blocks in `edit_file` or writing verbose before/after code blocks, use `brain_patch` (`@' ... '@ | projectbrain patch --apply`, `projectbrain patch --spec-file <file> --apply`, or `projectbrain patch --spec "..." --apply`):
    - `@file <rel_path>`
    - `@sub L<line> \\`<old_expr>\\` -> \\`<new_expr>\\`` (or `@sub ALL \\`<old>\\` -> \\`<new>\\`` / `@sub <symbol> \\`<old>\\` -> \\`<new>\\``)
    - `@replace L<start>-L<end>` ... `@end`
@@ -387,6 +387,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "patch":
         spec_str = args.spec
+        if spec_str == "-":
+            spec_str = sys.stdin.read()
         if not spec_str and args.spec_file:
             spec_str = Path(args.spec_file).read_text(encoding="utf-8")
         if not spec_str and not sys.stdin.isatty():
