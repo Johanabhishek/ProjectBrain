@@ -26,15 +26,26 @@ _IMPORTANT_CODE_PAT = re.compile(
 )
 _UPPER_CONST_PAT = re.compile(r"\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b")
 _CODE_STMT_PAT = re.compile(
-    r"^\s*(const\s|let\s|var\s|if\s*\(|else\b|for\s*\(|while\s*\(|try\s*\{|catch\s*\(|return\b|await\s|throw\s|"
-    r"[a-zA-Z0-9_$.]+\.[a-zA-Z0-9_$]+\s*=|"
-    r"[a-zA-Z0-9_$.]+\.(set|get|delete|clear|test|some|race|fetch|json|addEventListener|push|assign)\()"
+    r"^\s*(?:const\s|let\s|var\s|if\s*\(|}\s*else\b|else\b|for\s*\(|while\s*\(|try\s*\{|catch\s*\(|return\b|await\s|throw\s|"
+    r"def\s|async\s|elif\s|except\b|with\s|raise\s|"
+    r"[a-zA-Z_$][a-zA-Z0-9_$]*\s*\(|"
+    r"[a-zA-Z0-9_$.]+\.[a-zA-Z0-9_$]+\s*[=(])"
+)
+_STYLE_PROP_PAT = re.compile(
+    r"^\s*(?:display|flex|flexDirection|flexWrap|flexShrink|alignItems|justifyContent|gap|padding\w*|margin\w*|"
+    r"width|minWidth|maxWidth|height|minHeight|maxHeight|border\w*|borderRadius|background\w*|color|fontSize|"
+    r"fontWeight|fontFamily|lineHeight|letterSpacing|textAlign|textTransform|textDecoration|cursor|transition|"
+    r"transform|opacity|overflow\w*|position|top|right|bottom|left|zIndex|boxShadow|outline|whiteSpace|"
+    r"grid\w*|objectFit|pointerEvents|userSelect|aspectRatio|filter|backdropFilter)\s*:"
 )
 _KV_PROP_PAT = re.compile(
     r"^\s*['\"]?[a-zA-Z_$][a-zA-Z0-9_$]*['\"]?\s*:\s*[^/\s]"
 )
-_JSX_NOISE_PAT = re.compile(r"^\s*(</?[a-z]+[\s>]|className=|d=\"M\d|stroke=|fill=)", re.IGNORECASE)
-
+_JSX_NOISE_PAT = re.compile(
+    r"^\s*(?:</?(?:div|span|p|svg|path|circle|rect|line|polyline|polygon|g|h[1-6]|ul|li|label|section|header|footer|main|aside|nav)[\s>]|"
+    r"style=\{\{|className=|d=\"M\d|stroke=|fill=|strokeWidth=|strokeLinecap=|strokeLinejoin=|viewBox=|xmlns=)",
+    re.IGNORECASE,
+)
 
 def slice_lines(
     root: Path,
@@ -124,27 +135,32 @@ def slice_lines(
             continue
         low = low_lines[i]
         sc = 0.0
-        is_code_stmt = bool(_CODE_STMT_PAT.match(line))
-        is_kv_prop = bool(_KV_PROP_PAT.match(line)) and not _JSX_NOISE_PAT.match(line)
-        is_code_like = is_code_stmt or is_kv_prop or any(ch in stripped for ch in ("=", "{", "}", ";", ":"))
+        is_style_noise = bool(_STYLE_PROP_PAT.match(line)) or bool(_JSX_NOISE_PAT.match(line))
+        is_jsx_handler = bool(re.search(r"\bon[A-Z]\w*\s*=\s*\{", line)) and not bool(
+            re.search(r"\bonMouse(?:Enter|Leave)\s*=", line)
+        )
+        is_code_stmt = bool(_CODE_STMT_PAT.match(line)) and not is_style_noise
+        is_kv_prop = bool(_KV_PROP_PAT.match(line)) and not is_style_noise
+        is_code_like = is_code_stmt or is_kv_prop or is_jsx_handler or any(ch in stripped for ch in ("=", "{", "}", ";", ":"))
         for t in terms:
             if t in low:
-                # Discount matches on pure English prose lines inside template strings
-                sc += term_weights[t] if is_code_like else 0.2
+                # Discount matches on pure English prose lines inside template strings or CSS noise
+                sc += (term_weights[t] if not is_style_noise else 0.4) if is_code_like else 0.2
         if _IMPORTANT_CODE_PAT.search(line):
             sc += 5.0
         if _UPPER_CONST_PAT.search(line) and is_code_like:
             sc += 3.5
         if re.match(r"^\s*for\s*\(", line):
             sc += 3.0
+        if is_jsx_handler:
+            sc += 3.2
         if is_code_stmt:
-            sc += 1.0
-        if is_kv_prop:
-            sc += 1.5
-        if _JSX_NOISE_PAT.match(line) and sc <= 1.5:
-            sc = -1.0
+            sc += 1.8
+        elif is_kv_prop:
+            sc += 0.6
+        if is_style_noise and not is_jsx_handler and sc <= 2.0:
+            sc = -1.5
         line_scores[i] = sc
-
     # Smooth scores over a +/- 2 line window (weighting the center line highest so isolated statements aren't penalized by surrounding comments/blank lines)
     window_scores: list[tuple[float, int]] = []
     for i in range(head_n, total_len - tail_n):
@@ -614,9 +630,9 @@ def _find_balanced_end(lines: list[str], start_idx: int, open_ch: str = "{", clo
             if ch == open_ch:
                 depth += 1
                 started = True
-            elif ch == close_ch:
+            elif ch == close_ch and started:
                 depth -= 1
-                if started and depth <= 0:
+                if depth <= 0:
                     return idx
     return min(n - 1, start_idx + 45)
 
@@ -872,6 +888,352 @@ def _analyze_python_ast_contracts(lines: list[str]) -> dict[int, dict]:
     return result
 
 
+def _count_call_args(arg_str: str) -> int:
+    """Count top-level comma-separated arguments inside a function call's `(...)`."""
+    s = arg_str.strip()
+    if not s:
+        return 0
+    depth = 0
+    in_str: str | None = None
+    escape = False
+    commas = 0
+    for ch in s:
+        if escape:
+            escape = False
+            continue
+        if ch == "\\":
+            escape = True
+            continue
+        if in_str:
+            if ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"', "`"):
+            in_str = ch
+            continue
+        if ch in ("(", "[", "{"):
+            depth += 1
+        elif ch in (")", "]", "}"):
+            depth = max(0, depth - 1)
+        elif ch == "," and depth == 0:
+            commas += 1
+    return commas + 1
+
+
+def _analyze_js_ts_ast_contracts(lines: list[str], ext: str) -> list[dict]:
+    """Universal JS/TS/React static AST & lexical-closure contract analyzer:
+      1. `premature_effect_event_handler`: Callback `H` bound to JSX `on[A-Z]*` prop is also invoked
+         synchronously inside `useEffect` on mount/state-change.
+      2. `stale_hook_closure`: `useEffect(..., [])` / `useCallback(..., [])` with empty deps registers
+         `addEventListener` / `setInterval` invoking a local closure that reads mutable `useState` state.
+      3. `param_outer_state_conflict`: Function `f(p)` guards on `p === stateVar` (proving `p != stateVar`
+         is possible) while unconditionally calling a 0-arg sibling helper `g()` that mutates `setStateVar`
+         from `stateVar` instead of `p`.
+      4. `inconsistent_call_arity`: Local or relative-imported helper `f` is invoked with divergent argument
+         counts across call sites in the same file (omitting an optional context/discriminator parameter).
+    """
+    if ext.lower() not in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs") or not lines:
+        return []
+
+    n = len(lines)
+    state_vars: dict[str, tuple[str, int]] = {}
+    local_fns: dict[str, dict] = {}
+    effect_blocks: list[dict] = []
+    rel_imported_syms: set[str] = set()
+    jsx_handlers: dict[str, tuple[str, int]] = {}
+
+    full_text = "\n".join(lines)
+    for m_imp in re.finditer(
+        r"import\s+\{([^}]+)\}\s+from\s+['\"]\.\.?\/[^'\"]+['\"]",
+        full_text,
+    ):
+        for spec in m_imp.group(1).split(","):
+            tok = spec.strip().split(" as ")[-1].strip()
+            if re.match(r"^[a-z][a-zA-Z0-9_]*$", tok):
+                rel_imported_syms.add(tok)
+
+    _IGNORE_HANDLERS = {
+        "reset", "clear", "init", "load", "fetch", "sync", "measure", "resize", "scroll", "noop",
+    }
+
+    for m_jh in re.finditer(
+        r"\b(on[A-Z]\w*)\s*=\s*\{\s*(?:(?:async\s*)?(?:\([^)]*\)|[a-zA-Z_]\w*)\s*=>\s*\{?\s*)?([a-zA-Z_]\w*)\b",
+        full_text,
+    ):
+        prop_nm, h_nm = m_jh.group(1), m_jh.group(2)
+        if prop_nm in ("onMouseEnter", "onMouseLeave", "onFocus", "onBlur"):
+            continue
+        if h_nm in ("true", "false", "null", "undefined", "e", "ev", "event", "if", "const", "let", "return") or any(
+            h_nm.lower().startswith(p) for p in _IGNORE_HANDLERS
+        ):
+            continue
+        jsx_ln = 1 + full_text.count("\n", 0, m_jh.start())
+        jsx_handlers.setdefault(h_nm, (prop_nm, jsx_ln))
+
+    for i, ln in enumerate(lines):
+        lnum = i + 1
+        st = ln.strip()
+        if not st or st.startswith(("//", "/*")):
+            continue
+
+        for m_st in re.finditer(r"const\s+\[\s*([a-zA-Z_]\w*)\s*,\s*([a-zA-Z_]\w*)\s*\]\s*=\s*useState\b", ln):
+            state_vars[m_st.group(1)] = (m_st.group(2), lnum)
+        m_eff = re.search(r"\b(useEffect|useLayoutEffect|useCallback)\s*\(", st)
+        if m_eff:
+            kind = m_eff.group(1)
+            end_i = _find_balanced_end(lines, i, "(", ")", max_scan=300)
+            eff_body = "\n".join(lines[i : end_i + 1])
+            tail = " ".join(lines[max(i, end_i - 4) : end_i + 1])
+            m_deps = re.search(r",\s*\[\s*([^\]]*?)\s*\]\s*\)\s*;?\s*$", tail)
+            deps_str = m_deps.group(1).strip() if m_deps is not None else None
+            effect_blocks.append({
+                "kind": kind,
+                "start_line": lnum,
+                "end_line": end_i + 1,
+                "deps": deps_str,
+                "body": eff_body,
+            })
+
+        m_fn = re.match(
+            r"^(?:export\s+)?(?:async\s+)?function\s+([a-zA-Z_]\w*)\s*\(([^)]*)\)\s*(?::\s*[^{]+)?\{|"
+            r"^(?:export\s+)?const\s+([a-zA-Z_]\w*)\s*=\s*(?:useCallback\s*\(\s*)?(?:async\s*)?\(([^)]*)\)\s*(?::\s*[^=]+)?=>\s*\{",
+            st,
+        )
+        if m_fn:
+            fn_nm = m_fn.group(1) or m_fn.group(3)
+            raw_params = (m_fn.group(2) if m_fn.group(1) else m_fn.group(4)) or ""
+            if fn_nm and fn_nm not in ("if", "for", "while", "switch", "catch"):
+                end_i = _find_balanced_end(lines, i, "{", "}", max_scan=2600)
+                span = (end_i + 1) - lnum
+                if span <= 220:
+                    parsed_params: list[tuple[str, bool]] = []
+                    if raw_params.strip():
+                        for p_part in raw_params.split(","):
+                            p_clean = p_part.strip()
+                            if not p_clean:
+                                continue
+                            has_opt = ("=" in p_clean) or ("?" in p_clean.split(":")[0])
+                            m_pid = re.match(r"^(?:\.\.\.)?([a-zA-Z_]\w*)", p_clean)
+                            if m_pid:
+                                parsed_params.append((m_pid.group(1), has_opt))
+                    local_fns[fn_nm] = {
+                        "name": fn_nm,
+                        "params": parsed_params,
+                        "start_line": lnum,
+                        "end_line": end_i + 1,
+                        "span": span,
+                        "body": "\n".join(lines[i : end_i + 1]),
+                    }
+
+    violations: list[dict] = []
+
+    # Law 1: Premature Effect-Driven Event Handler Invocation
+    for eff in effect_blocks:
+        if eff["kind"] not in ("useEffect", "useLayoutEffect"):
+            continue
+        eff_s, eff_e = eff["start_line"], eff["end_line"]
+        nested_fn_spans = [
+            (fn["start_line"], fn["end_line"])
+            for fn in local_fns.values()
+            if eff_s < fn["start_line"] and fn["end_line"] <= eff_e
+        ]
+        for ln_idx in range(eff_s - 1, min(n, eff_e)):
+            call_ln = ln_idx + 1
+            if any(ns <= call_ln <= ne for ns, ne in nested_fn_spans):
+                continue
+            ln_txt = lines[ln_idx]
+            st_ln = ln_txt.strip()
+            if not st_ln or st_ln.startswith("//") or "addEventListener" in st_ln or "removeEventListener" in st_ln or st_ln.startswith("return"):
+                continue
+            for h_nm, (prop_nm, jsx_ln) in jsx_handlers.items():
+                if not (jsx_ln < eff_s or jsx_ln > eff_e):
+                    continue
+                if re.search(rf"\b{re.escape(h_nm)}\s*\(", st_ln):
+                    is_mutator_or_cb = h_nm.startswith("on") and len(h_nm) > 2 and h_nm[2].isupper()
+                    if not is_mutator_or_cb and h_nm in local_fns:
+                        h_body = local_fns[h_nm]["body"]
+                        is_mutator_or_cb = bool(
+                            re.search(r"\b(?:on[A-Z]\w*|set[A-Z]\w*|mark[A-Z]\w*|record[A-Z]\w*|localStorage|sessionStorage)\b", h_body)
+                        )
+                    if is_mutator_or_cb:
+                        violations.append({
+                            "kind": "premature_effect_event_handler",
+                            "line": call_ln,
+                            "end_line": min(eff_e, call_ln + 2),
+                            "extra_pin_lines": [eff_s, call_ln, jsx_ln],
+                            "inline_msg": (
+                                f"# >>> [6D-CONTRACT L{call_ln}] Premature effect invocation: '{h_nm}(...)' is called "
+                                f"synchronously inside {eff['kind']} (L{eff_s}-L{eff_e}) on mount/state-change, "
+                                f"but is also bound to interactive JSX prop {prop_nm}={{...}} at L{jsx_ln}"
+                            ),
+                            "summary": (
+                                f"Invokes interactive callback `{h_nm}(...)` synchronously inside `{eff['kind']}` "
+                                f"(`L{eff_s}-L{eff_e}`) on mount/state-change while also binding it to JSX `{prop_nm}` "
+                                f"at `L{jsx_ln}`, firing post-interaction logic prematurely."
+                            ),
+                        })
+
+    # Law 2: Stale Reactive Closure Capture in useEffect/useCallback with empty `[]` deps
+    for eff in effect_blocks:
+        if eff["deps"] != "":
+            continue
+        eff_s, eff_e = eff["start_line"], eff["end_line"]
+        eff_body = eff["body"]
+        for m_reg in re.finditer(
+            r"\b(?:addEventListener\s*\(\s*['\"][^'\"]+['\"]\s*,\s*([a-zA-Z_]\w*)|setInterval\s*\(\s*([a-zA-Z_]\w*))",
+            eff_body,
+        ):
+            cb_nm = m_reg.group(1) or m_reg.group(2)
+            if cb_nm and cb_nm in local_fns:
+                cb_fn = local_fns[cb_nm]
+                captured = [
+                    sv for sv in state_vars
+                    if re.search(rf"\b{re.escape(sv)}\b", cb_fn["body"])
+                ]
+                if captured:
+                    violations.append({
+                        "kind": "stale_hook_closure",
+                        "line": eff_s,
+                        "end_line": eff_e,
+                        "extra_pin_lines": [eff_s, cb_fn["start_line"]],
+                        "inline_msg": (
+                            f"# >>> [6D-CONTRACT L{eff_s}] Stale closure capture: {eff['kind']}(..., []) with empty deps "
+                            f"registers '{cb_nm}' (L{cb_fn['start_line']}-L{cb_fn['end_line']}), which reads mutable "
+                            f"useState variable(s) [{', '.join(captured[:4])}] frozen at initial mount"
+                        ),
+                        "summary": (
+                            f"Registers listener/timer `{cb_nm}` inside `{eff['kind']}` with empty dependency array `[]`, "
+                            f"capturing stale initial `useState` binding(s) `{', '.join(captured[:4])}` read in "
+                            f"`{cb_nm}` (`L{cb_fn['start_line']}-L{cb_fn['end_line']}`)."
+                        ),
+                    })
+
+    # Law 3: Parameter-vs-Outer-State Guard Divergence
+    for fn_a in local_fns.values():
+        if not fn_a["params"]:
+            continue
+        p0 = fn_a["params"][0][0]
+        body_a = fn_a["body"]
+        for sv, (setter_nm, _) in state_vars.items():
+            if sv == p0:
+                continue
+            has_guard = bool(
+                re.search(
+                    rf"\bif\s*\([^)]*\b(?:{re.escape(p0)}\s*(?:===|!==|==|!=)\s*{re.escape(sv)}|"
+                    rf"{re.escape(sv)}\s*(?:===|!==|==|!=)\s*{re.escape(p0)})\b",
+                    body_a,
+                )
+            )
+            if not has_guard:
+                continue
+            for m_call0 in re.finditer(r"\b([a-zA-Z_]\w*)\s*\(\s*\)", body_a):
+                callee_nm = m_call0.group(1)
+                if callee_nm not in local_fns or callee_nm == fn_a["name"]:
+                    continue
+                fn_b = local_fns[callee_nm]
+                if (
+                    re.search(rf"\b{re.escape(sv)}\b", fn_b["body"])
+                    and re.search(rf"\b{re.escape(setter_nm)}\s*\(", fn_b["body"])
+                ):
+                    call_ln = fn_a["start_line"] + body_a.count("\n", 0, m_call0.start())
+                    violations.append({
+                        "kind": "param_outer_state_conflict",
+                        "line": call_ln,
+                        "end_line": fn_a["end_line"],
+                        "extra_pin_lines": [fn_a["start_line"], call_ln, fn_b["start_line"]],
+                        "inline_msg": (
+                            f"# >>> [6D-CONTRACT L{call_ln}] Parameter-vs-State conflict: '{fn_a['name']}({p0})' guards "
+                            f"on '{p0} === {sv}' (proving {p0} != {sv} is possible) but calls 0-arg '{callee_nm}()' "
+                            f"(L{fn_b['start_line']}), which mutates '{setter_nm}' using outer state '{sv}' instead of '{p0}'"
+                        ),
+                        "summary": (
+                            f"`{fn_a['name']}({p0})` guards on `{p0} === {sv}` (allowing `{p0} !== {sv}`) "
+                            f"but invokes 0-arg `{callee_nm}()` (`L{fn_b['start_line']}-L{fn_b['end_line']}`), "
+                            f"which computes `{setter_nm}(...)` from outer state `{sv}` instead of parameter `{p0}`."
+                        ),
+                    })
+
+    # Law 4: Intra-Module Call Arity / Optional Context Omission
+    cand_arity_syms: set[str] = set(rel_imported_syms)
+    for fn_h in local_fns.values():
+        if len(fn_h["params"]) >= 2 and any(has_opt for _, has_opt in fn_h["params"][1:]):
+            cand_arity_syms.add(fn_h["name"])
+
+    for sym_nm in sorted(cand_arity_syms):
+        if sym_nm.startswith(("use", "get", "is", "has", "can", "should", "format", "parse", "render", "create")):
+            continue
+        by_arity: dict[int, list[tuple[int, str]]] = {}
+        decl_s = local_fns[sym_nm]["start_line"] if sym_nm in local_fns else -1
+        decl_e = local_fns[sym_nm]["end_line"] if sym_nm in local_fns else -1
+        for idx_ln, ln_txt in enumerate(lines):
+            c_ln = idx_ln + 1
+            if decl_s <= c_ln <= decl_e:
+                continue
+            st_ln = ln_txt.strip()
+            if st_ln.startswith(("import ", "export ", "function ", "//", "/*")):
+                continue
+            for m_c in re.finditer(rf"(?<![.\w]){re.escape(sym_nm)}\s*\(", ln_txt):
+                open_pos = ln_txt.find("(", m_c.start())
+                if open_pos == -1:
+                    continue
+                # Extract balanced parens across up to 3 lines
+                combined_call = "\n".join(lines[idx_ln : min(n, idx_ln + 3)])[open_pos:]
+                depth = 0
+                in_s: str | None = None
+                esc = False
+                end_pos = -1
+                for ch_i, ch in enumerate(combined_call):
+                    if esc:
+                        esc = False
+                        continue
+                    if ch == "\\":
+                        esc = True
+                        continue
+                    if in_s:
+                        if ch == in_s:
+                            in_s = None
+                        continue
+                    if ch in ("'", '"', "`"):
+                        in_s = ch
+                        continue
+                    if ch == "(":
+                        depth += 1
+                    elif ch == ")":
+                        depth -= 1
+                        if depth == 0:
+                            end_pos = ch_i
+                            break
+                if end_pos > 0:
+                    inner_args = combined_call[1:end_pos]
+                    n_args = _count_call_args(inner_args)
+                    if n_args >= 1:
+                        snip = re.sub(r"\s+", " ", f"{sym_nm}({inner_args.strip()})")[:64]
+                        by_arity.setdefault(n_args, []).append((c_ln, snip))
+        if len(by_arity) >= 2:
+            min_a = min(by_arity.keys())
+            max_a = max(by_arity.keys())
+            if 1 <= min_a < max_a <= 4:
+                low_ln, low_snip = by_arity[min_a][0]
+                high_ln, high_snip = by_arity[max_a][0]
+                violations.append({
+                    "kind": "inconsistent_call_arity",
+                    "symbol": sym_nm,
+                    "line": low_ln,
+                    "end_line": low_ln + 1,
+                    "extra_pin_lines": [low_ln, high_ln] + ([decl_s] if decl_s > 0 else []),
+                    "inline_msg": (
+                        f"# >>> [6D-CONTRACT L{low_ln}] Inconsistent call arity for '{sym_nm}': called here with "
+                        f"{min_a} arg(s) `{low_snip}` vs {max_a} args `{high_snip}` at L{high_ln} (omitting context/scope argument)"
+                    ),
+                    "summary": (
+                        f"Calls `{low_snip}` with `{min_a}` arg(s) at `L{low_ln}` while `L{high_ln}` calls "
+                        f"`{high_snip}` with `{max_a}` args, omitting the secondary context/partition argument."
+                    ),
+                })
+
+    return violations
+
+
 def extract_4d_coordinate_matrix(
     lines: list[str],
     line_start: int = 1,
@@ -894,6 +1256,11 @@ def extract_4d_coordinate_matrix(
     ast_span_by_start: dict[int, int] = {}
     ast_mutations_by_line: dict[int, list[str]] = {}
     py_ast_contracts: dict[int, dict] = _analyze_python_ast_contracts(lines) if ext.lower() == ".py" else {}
+    js_ast_contracts: list[dict] = (
+        _analyze_js_ts_ast_contracts(lines, ext)
+        if ext.lower() in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+        else []
+    )
     parser = _PARSERS.get(ext.lower()) or _PARSERS.get(".tsx")
     if parser and n > 0:
         try:
@@ -1030,7 +1397,7 @@ def extract_4d_coordinate_matrix(
             deps = m_deps.group(1).strip() if m_deps else ""
             role = "EFFECT" if "Effect" in kind else "ACTION"
             raw_blocks.append((role, f"{kind}[{deps[:36]}]", lnum, end_i + 1))
-            i = end_i + 1
+            i = (end_i + 1) if (end_i - i) < 12 else (i + 1)
             continue
 
         # 3. Switch case dispatch branches: case "foo":
@@ -1102,11 +1469,15 @@ def extract_4d_coordinate_matrix(
                     continue
 
         # 5. Conditional dispatch branches: if (...) / elif (...) in JS/TS ({) and Python (:)
-        m_if = re.match(r"^(?:else\s+if|elif|if)\s*\(?([^):{]{3,75})\)?\s*[{:]\s*(?:#.*)?$", st)
+        m_if = re.match(r"^(?:\}\s*)?(?:else\s+if|elif|if)\s*\(?([^):{]{3,75})\)?\s*[{:]\s*(?:#.*)?$", st)
         if m_if:
             cond = m_if.group(1).strip()
             if st.endswith("{"):
-                end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _find_balanced_end(lines, i, "{", "}", max_scan=400)
+                end_i = (
+                    (ast_span_by_start[lnum] - 1)
+                    if (lnum in ast_span_by_start and not st.startswith("}"))
+                    else _find_balanced_end(lines, i, "{", "}", max_scan=400)
+                )
             else:
                 end_i = _py_block_end(i, max_scan=250)
             span = (end_i + 1) - lnum
@@ -1467,6 +1838,34 @@ def extract_4d_coordinate_matrix(
         if return_dict_keys:
             cell_dict["return_dict_keys"] = return_dict_keys[:16]
         cells.append(cell_dict)
+    if js_ast_contracts:
+        for jc in js_ast_contracts:
+            j_ln = jc["line"]
+            if not (s_idx + 1 <= j_ln <= e_idx):
+                continue
+            enclosing = [
+                c for c in cells
+                if c["line_start"] <= j_ln <= c["line_end"]
+            ]
+            if enclosing:
+                finest = min(enclosing, key=lambda c: c["span"])
+                finest.setdefault("js_ast_contracts", []).append(jc)
+            elif cells:
+                cells[0].setdefault("js_ast_contracts", []).append(jc)
+            else:
+                cells.append({
+                    "X_scope": f"contract:{jc['kind']}",
+                    "Y_role": "ACTION",
+                    "Z_write": [],
+                    "Z_read": [],
+                    "W_calls": [],
+                    "E_exit": [],
+                    "T_mode": "SYNC",
+                    "line_start": j_ln,
+                    "line_end": jc.get("end_line", j_ln),
+                    "span": max(1, jc.get("end_line", j_ln) - j_ln + 1),
+                    "js_ast_contracts": [jc],
+                })
     return cells
 
 def query_4d_coordinate_matrix(

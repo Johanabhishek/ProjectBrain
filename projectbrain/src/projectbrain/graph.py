@@ -55,12 +55,14 @@ class CodeGraph:
         confidence: str = "unknown",
         reason: str = "",
         line: int | None = None,
+        lines: list[int] | None = None,
     ) -> None:
         edge = {"src": src, "dst": dst, "type": etype, "confidence": confidence, "reason": reason}
         if line is not None:
             edge["line"] = line
+        if lines and len(lines) > 1:
+            edge["lines"] = lines[:8]
         self.edges.append(edge)
-
     @classmethod
     def build(
         cls,
@@ -205,8 +207,10 @@ class CodeGraph:
                             added_call_dsts.add(cand)
 
                 # 2. Resolve bare/remaining calls
+                call_sites_all = fn.get("call_sites_all", {})
                 for callee_name in fn.get("calls", []):
                     line = call_sites.get(callee_name)
+                    all_lines = call_sites_all.get(callee_name)
                     candidates = [c for c in registry.get(callee_name, []) if c != nid]
                     if not candidates:
                         continue
@@ -222,7 +226,7 @@ class CodeGraph:
 
                     for cand in same_file:
                         if cand not in added_call_dsts:
-                            g._add_edge(nid, cand, "calls", "exact", "same-file function call", line=line)
+                            g._add_edge(nid, cand, "calls", "exact", "same-file function call", line=line, lines=all_lines)
                             added_call_dsts.add(cand)
 
                     cross_file.sort(
@@ -243,17 +247,16 @@ class CodeGraph:
                             g._add_edge(
                                 nid, cand, "calls", "import_resolved",
                                 f"'{callee_name}' resolved via import from {cand_rel_path}",
-                                line=line,
+                                line=line, lines=all_lines,
                             )
                         else:
                             g._add_edge(
                                 nid, cand, "calls", "candidate",
                                 f"'{callee_name}' matches {len(candidates)} symbol(s) by "
                                 "name; target ambiguous without import resolution",
-                                line=line,
+                                line=line, lines=all_lines,
                             )
                         added_call_dsts.add(cand)
-
                 # 3. Connect lexically nested helper/callback functions (e.g., on_file_headers inside upload_file)
                 fn_s = fn.get("line_start", 0)
                 fn_e = fn.get("line_end", 0)

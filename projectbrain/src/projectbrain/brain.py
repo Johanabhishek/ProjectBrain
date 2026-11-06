@@ -491,7 +491,7 @@ class ProjectBrain:
 
         # Helper to add a function/class slice once (skipping nested functions already covered by an outer slice)
         def _add_node_slice(node_id: str, reason: str, kw_list: list[str], buf: list[str], max_l: int = 44, max_g: int = 24) -> None:
-            if node_id in seen_slices or not self._graph or node_id not in self._graph.nodes:
+            if not self._graph or node_id not in self._graph.nodes:
                 return
             nd = self._graph.nodes[node_id]
             if nd.get("type") not in ("fn", "cls"):
@@ -501,35 +501,65 @@ class ProjectBrain:
                 return
             l_start = nd.get("line_start", 1)
             l_end = nd.get("line_end", l_start)
+            is_caller_slice = any(reason.startswith(p) for p in ("calls ", "invokes "))
+            m_call_line = re.search(r"@L(\d+)", reason) if is_caller_slice else None
+            slice_key = f"{node_id}@L{m_call_line.group(1)}" if (m_call_line and (l_end - l_start) > 120) else node_id
+            if slice_key in seen_slices:
+                return
+            effective_max_l = 12 if (l_end - l_start) > 400 and is_caller_slice else max_l
+            slice_s, slice_e = l_start, l_end
+            if m_call_line and (l_end - l_start) > 120:
+                c_ln = int(m_call_line.group(1))
+                slice_s = max(l_start, c_ln - 4)
+                slice_e = min(l_end, c_ln + 7)
+                effective_max_l = 14
             for s_rel, s_start, s_end in seen_spans:
-                if s_rel == rel and s_start <= l_start and l_end <= s_end and (s_end - s_start) <= 130:
-                    seen_slices.add(node_id)
+                if s_rel == rel and s_start <= slice_s and slice_e <= s_end and (s_end - s_start) <= 130:
+                    seen_slices.add(slice_key)
                     return
-            seen_slices.add(node_id)
-            seen_spans.append((rel, l_start, l_end))
+            seen_slices.add(slice_key)
+            seen_spans.append((rel, slice_s, slice_e))
             _ensure_globals(rel, buf, max_g=max_g)
             ast_calls: list[str] = []
-            is_caller_slice = any(reason.startswith(p) for p in ("calls ", "invokes "))
-            if (l_end - l_start) <= 300 and not is_caller_slice:
+            if (l_end - l_start) <= 450 and not is_caller_slice:
                 for f_entry in self._index[rel].get("functions", []):
                     if f_entry.get("line_start") == l_start:
                         ast_calls = [c.lower() for c in f_entry.get("calls", []) if len(c) >= 4]
                         break
-            effective_max_l = 12 if (l_end - l_start) > 400 and is_caller_slice else max_l
-            slice_s, slice_e = l_start, l_end
-            if is_caller_slice and (l_end - l_start) > 120:
-                m_line = re.search(r"@L(\d+)", reason)
-                if m_line:
-                    c_ln = int(m_line.group(1))
-                    slice_s = max(l_start, c_ln - 3)
-                    slice_e = min(l_end, c_ln + 7)
-                    effective_max_l = 12
 
             # Session Zero-Waste Guard inside dossier: skip re-emitting spans already delivered unfolded in this session
             s_plan = self._ledger.plan_slice_intervals(rel, slice_s, slice_e, commit=False)
             if not s_plan["unseen_intervals"]:
-                buf.append(f"### [{rel} :: {nd.get('name')} (L{l_start}-L{l_end}) — [Session Cache] Already delivered in this session (0 duplicate lines)]")
+                buf.append(f"### [{rel} :: {nd.get('name')} (L{slice_s}-L{slice_e}) ? [Session Cache] Already delivered in this session (0 duplicate lines)]")
                 return
+
+            node_pins: set[int] = set(self._last_pin_lines.get(rel, set()))
+            node_anns: dict[int, list[str]] = {
+                k: list(v) for k, v in self._last_line_annotations.get(rel, {}).items()
+            }
+            if self._graph:
+                for ei_hb in self._graph._adj.get(node_id, []):
+                    ehb = self._graph.edges[ei_hb]
+                    if ehb["type"] == "http_flow" and ehb.get("line"):
+                        hl = int(ehb["line"])
+                        dst_nd = self._graph.nodes.get(ehb["dst"], {})
+                        dst_lbl = f"{dst_nd.get('rel_path', '')}:{dst_nd.get('name', '')} (L{dst_nd.get('line_start', 1)})"
+                        b_msg = f"# >>> [HTTP-BRIDGE L{hl}] {ehb.get('reason', '')} -> {dst_lbl}"
+                        node_pins.add(hl)
+                        if b_msg not in node_anns.setdefault(hl, []):
+                            node_anns[hl].append(b_msg)
+            if "Causal Symptom Chop" in reason:
+                for c_cell in self._index[rel].get("cells_4d", []):
+                    cs_ln = c_cell.get("line_start", 0)
+                    ce_ln = c_cell.get("line_end", 0)
+                    if slice_s <= cs_ln <= slice_e and any(
+                        ex.startswith(("status:", "throw:", "err:")) for ex in c_cell.get("E_exit", [])
+                    ):
+                        for gl in range(cs_ln, min(slice_e + 1, ce_ln + 1)):
+                            node_pins.add(gl)
+            in_slice_pins = sorted(p for p in node_pins if slice_s <= p <= slice_e)
+            if len(in_slice_pins) >= 6:
+                effective_max_l = max(effective_max_l, 64)
 
             matrix_header = ""
             cell_slices: list[str] = []
@@ -556,16 +586,29 @@ class ProjectBrain:
                         max_table_rows=max_rows,
                     )
                     nonlocal matched_4d_cells_count, monolith_4d_cells_count
-                    if (slice_e - slice_s) > 200 and len(cells) >= 3:
-                        for tc in top_cells[:2]:
+                    if (slice_e - slice_s) > 450 and len(cells) >= 3:
+                        cands_to_slice = list(top_cells[:3])
+                        for c_item in cells:
+                            if c_item.get("js_ast_contracts") and c_item not in cands_to_slice and len(cands_to_slice) < 5:
+                                cands_to_slice.append(c_item)
+                        for tc in cands_to_slice:
                             tc_s, tc_e = tc["line_start"], tc["line_end"]
                             if any(
                                 sr == rel and ss <= tc_s and tc_e <= se and (se - ss) <= 130
                                 for sr, ss, se in seen_spans
                             ):
                                 continue
-                            if tc["span"] <= 90:
-                                tc_code = slice_lines(self.root, rel, tc_s, tc_e, max_lines=min(55, tc["span"] + 2), focus_terms=kw_list + ast_calls)
+                            if tc["span"] <= 95:
+                                tc_code = slice_lines(
+                                    self.root,
+                                    rel,
+                                    tc_s,
+                                    tc_e,
+                                    max_lines=min(55, tc["span"] + 2),
+                                    focus_terms=kw_list + ast_calls,
+                                    pin_lines=node_pins,
+                                    inline_annotations=node_anns,
+                                )
                                 if tc_code:
                                     matched_4d_cells_count += 1
                                     monolith_4d_cells_count += 1
@@ -574,38 +617,34 @@ class ProjectBrain:
                                     cell_slices.append(
                                         f"# [4D Cell Match: {tc['Y_role']} | {tc['X_scope']} (L{tc_s}-L{tc_e})]\n{tc_code}"
                                     )
+                        # Ensure any pinned 6D contract lines inside the monolith that fell outside top_cells are also sliced
+                        for pin_ln in sorted(node_anns.keys()):
+                            if not (slice_s <= pin_ln <= slice_e):
+                                continue
+                            if any(sr == rel and ss <= pin_ln <= se and (se - ss) <= 130 for sr, ss, se in seen_spans):
+                                continue
+                            p_s = max(slice_s, pin_ln - 3)
+                            p_e = min(slice_e, pin_ln + 7)
+                            p_code = slice_lines(
+                                self.root,
+                                rel,
+                                p_s,
+                                p_e,
+                                max_lines=14,
+                                focus_terms=kw_list,
+                                pin_lines=node_pins,
+                                inline_annotations=node_anns,
+                            )
+                            if p_code:
+                                seen_spans.append((rel, p_s, p_e))
+                                emitted_by_file.setdefault(rel, []).extend(extract_emitted_intervals(p_code))
+                                cell_slices.append(f"# [6D Contract Pin Window (L{p_s}-L{p_e})]\n{p_code}")
                     else:
                         matched_4d_cells_count += max(1, len(top_cells[:2]))
                         for tc in top_cells[:2]:
                             cell_focus_terms.extend(tc.get("Z_write", [])[:3])
                             cell_focus_terms.extend(tc.get("W_calls", [])[:3])
-            node_pins: set[int] = set(self._last_pin_lines.get(rel, set()))
-            node_anns: dict[int, list[str]] = {
-                k: list(v) for k, v in self._last_line_annotations.get(rel, {}).items()
-            }
-            if self._graph:
-                for ei_hb in self._graph._adj.get(node_id, []):
-                    ehb = self._graph.edges[ei_hb]
-                    if ehb["type"] == "http_flow" and ehb.get("line"):
-                        hl = int(ehb["line"])
-                        dst_nd = self._graph.nodes.get(ehb["dst"], {})
-                        dst_lbl = f"{dst_nd.get('rel_path', '')}:{dst_nd.get('name', '')} (L{dst_nd.get('line_start', 1)})"
-                        b_msg = f"# >>> [HTTP-BRIDGE L{hl}] {ehb.get('reason', '')} -> {dst_lbl}"
-                        node_pins.add(hl)
-                        if b_msg not in node_anns.setdefault(hl, []):
-                            node_anns[hl].append(b_msg)
-            if "Causal Symptom Chop" in reason:
-                for c_cell in self._index[rel].get("cells_4d", []):
-                    cs_ln = c_cell.get("line_start", 0)
-                    ce_ln = c_cell.get("line_end", 0)
-                    if slice_s <= cs_ln <= slice_e and any(
-                        ex.startswith(("status:", "throw:", "err:")) for ex in c_cell.get("E_exit", [])
-                    ):
-                        for gl in range(cs_ln, min(slice_e + 1, ce_ln + 1)):
-                            node_pins.add(gl)
-            in_slice_pins = [p for p in node_pins if slice_s <= p <= slice_e]
-            if len(in_slice_pins) >= 6:
-                effective_max_l = max(effective_max_l, 58)
+
             code = (
                 ""
                 if cell_slices
@@ -624,7 +663,8 @@ class ProjectBrain:
                 return
             if code:
                 emitted_by_file.setdefault(rel, []).extend(extract_emitted_intervals(code))
-            buf.append(f"### [{rel} :: {nd.get('name')} (L{l_start}-L{l_end}) — {reason}]")
+            hdr_span = f"L{slice_s}-L{slice_e}" if (m_call_line and (l_end - l_start) > 120) else f"L{l_start}-L{l_end}"
+            buf.append(f"### [{rel} :: {nd.get('name')} ({hdr_span}) ? {reason}]")
             if matrix_header:
                 buf.append(matrix_header)
             for cs in cell_slices:
@@ -633,7 +673,7 @@ class ProjectBrain:
                 buf.append(code)
         for idx, task in enumerate(tasks, start=1):
             clean_task_for_search = task.strip()
-            t_kw = _extract_keywords(clean_task_for_search)
+            t_kw = self._expand_keywords_with_aliases(_extract_keywords(clean_task_for_search))
             t_low = clean_task_for_search.lower()
             sec: list[str] = [f"## Task {idx}: {task}"]
             if not zoom:
@@ -703,7 +743,7 @@ class ProjectBrain:
                     if erel:
                         primary_files.add(erel)
                     filtered_explicit.append(enid)
-                    _add_node_slice(enid, "explicitly referenced in task", t_kw, sec, max_l=75 if e_span <= 180 else 55, max_g=8)
+                    _add_node_slice(enid, "explicitly referenced in task", t_kw, sec, max_l=95 if e_span <= 450 else 55, max_g=8)
             if filtered_explicit:
                 explicit_nodes = filtered_explicit
             had_initial_explicit = bool(explicit_nodes)
@@ -713,10 +753,11 @@ class ProjectBrain:
             if not has_explicit_route:
                 ranked_all = self.query(clean_task_for_search, top_n=3)
                 top3_query_files = {r["rel_path"] for r in ranked_all}
-                ranked = ranked_all[: (1 if had_initial_explicit else 2)]
+                ranked = ranked_all[: (1 if had_initial_explicit else 3)]
                 top1_file_score = ranked[0]["score"] if ranked else 1.0
                 for file_rank, r in enumerate(ranked):
-                    if file_rank > 0 and r["score"] < top1_file_score * 0.72:
+                    min_ratio = 0.72 if file_rank == 1 else 0.52
+                    if file_rank > 0 and r["score"] < top1_file_score * min_ratio:
                         continue
                     rp = r["rel_path"]
                     step2_ranked_files.add(rp)
@@ -751,7 +792,7 @@ class ProjectBrain:
                     for rank_idx, (sc, kind, sym) in enumerate(dedup_scored[:top_k]):
                         nid = fn_id(rp, sym["name"], sym.get("parent_class")) if kind == "fn" else cls_id(rp, sym["name"])
                         sym_span = sym.get("line_end", 1) - sym.get("line_start", 1)
-                        rank_max_l = (75 if sym_span <= 180 else 55) if rank_idx == 0 else 42
+                        rank_max_l = (95 if sym_span <= 450 else 55) if rank_idx == 0 else 48
                         _add_node_slice(nid, f"top match in {rp}", t_kw, sec, max_l=rank_max_l, max_g=16 if file_rank == 0 else 8)
                         if not had_initial_explicit and nid not in explicit_nodes and len(explicit_nodes) < 4:
                             explicit_nodes.append(nid)
@@ -763,7 +804,9 @@ class ProjectBrain:
                                     c_nd = self._graph.nodes.get(c_src, {})
                                     c_nm = (c_nd.get("name") or "").lower()
                                     if c_nd.get("rel_path") == rp and not c_nm.startswith(("clear", "remove")):
-                                        same_file_callers_to_add.append((c_src, f"calls {sym['name']} @L{ec.get('line', 0)}", t_kw))
+                                        c_lines = ec.get("lines") or ([ec.get("line", 0)] if ec.get("line") else [0])
+                                        for call_ln in c_lines[:3]:
+                                            same_file_callers_to_add.append((c_src, f"calls {sym['name']} @L{call_ln}", t_kw))
                                         added_for_sym += 1
                                         if added_for_sym >= 2:
                                             break
@@ -867,12 +910,14 @@ class ProjectBrain:
                         caller_nd = self._graph.nodes.get(caller_id, {})
                         caller_name = caller_nd.get("name", "")
                         caller_rel = caller_nd.get("rel_path", "")
-                        chain_lines.append(f"- `{caller_id}` (L{e_in.get('line', '?')}) -[calls]-> `{seed_id}`")
-                        if caller_rel in caller_files_seen and c_span > 150:
+                        c_lines = e_in.get("lines") or ([e_in.get("line", 0)] if e_in.get("line") else [0])
+                        c_lines_str = ",".join(f"L{x}" for x in c_lines[:4]) if c_lines and c_lines[0] else "L?"
+                        chain_lines.append(f"- `{caller_id}` ({c_lines_str}) -[calls]-> `{seed_id}`")
+                        if caller_rel in caller_files_seen and c_span > 150 and len(c_lines) <= 1:
                             continue
                         caller_files_seen.add(caller_rel)
-                        bwd_expanded.append((caller_id, f"calls {seed_id.split(':')[-1]} @L{e_in.get('line', 0)}", [seed_id.split(":")[-1].lower()], 18, 0))
-                        if any(w[:4] in caller_name.lower() for w in t_kw if len(w) >= 4):
+                        for call_ln in c_lines[:3]:
+                            bwd_expanded.append((caller_id, f"calls {seed_id.split(':')[-1]} @L{call_ln}", [seed_id.split(":")[-1].lower()], 18, 0))
                             for ei_b2 in self._graph._radj.get(caller_id, []):
                                 eb2 = self._graph.edges[ei_b2]
                                 if eb2["type"] == "calls" and eb2.get("confidence") in ("exact", "import_resolved"):
@@ -1002,10 +1047,11 @@ class ProjectBrain:
                 remaining_cands: list[tuple[str, str, list[str], int, int]] = []
                 seen_cand_ids: set[str] = set()
                 for item in expanded_nodes:
-                    if item[0] not in seen_cand_ids and item[0] not in seen_slices and item[0] in self._graph.nodes:
-                        seen_cand_ids.add(item[0])
+                    m_cl = re.search(r"@L(\d+)", item[1])
+                    cand_key = f"{item[0]}@L{m_cl.group(1)}" if m_cl else item[0]
+                    if cand_key not in seen_cand_ids and cand_key not in seen_slices and item[0] in self._graph.nodes:
+                        seen_cand_ids.add(cand_key)
                         remaining_cands.append(item)
-
                 ordered_cands: list[tuple[str, str, list[str], int, int]] = []
                 while remaining_cands:
                     best_idx = 0
@@ -1065,18 +1111,20 @@ class ProjectBrain:
 
                 hop_pointers: list[str] = []
                 for enid, ereason, ekw, emax_l, emax_g in ordered_cands:
-                    if not self._graph or enid not in self._graph.nodes or enid in seen_slices:
+                    m_cl = re.search(r"@L(\d+)", ereason)
+                    cand_key = f"{enid}@L{m_cl.group(1)}" if m_cl else enid
+                    if not self._graph or enid not in self._graph.nodes or cand_key in seen_slices:
                         continue
                     end_node = self._graph.nodes[enid]
                     enm = (end_node.get("name") or "").lower()
                     erel = end_node.get("rel_path", "")
-                    espan = end_node.get("line_end", 1) - end_node.get("line_start", 1)
+                    espan = 12 if m_cl else (end_node.get("line_end", 1) - end_node.get("line_start", 1))
                     sec_lines_now = sum(len(x.splitlines()) for x in sec)
                     is_chop = "Causal Symptom Chop" in ereason
-                    kw_direct = is_chop or any(w in enm or w[:4] in enm for w in t_kw if len(w) >= 4) or ("http_flow" in ereason) or ("table:" in ereason)
-                    if (emitted_hops < max_hops_allowed or is_chop) and (sec_lines_now < 120 or (kw_direct and sec_lines_now < 235)) and espan <= 110:
+                    kw_direct = is_chop or bool(m_cl) or any(w in enm or w[:4] in enm for w in t_kw if len(w) >= 4) or ("http_flow" in ereason) or ("table:" in ereason)
+                    if (emitted_hops < max_hops_allowed or is_chop or bool(m_cl)) and (sec_lines_now < 160 or (kw_direct and sec_lines_now < 310)) and espan <= 120:
                         _add_node_slice(enid, ereason, ekw, sec, max_l=min(emax_l, 30 if is_chop else 26), max_g=0)
-                        if not is_chop:
+                        if not is_chop and not m_cl:
                             emitted_hops += 1
                     else:
                         ptr = f"- `{erel} :: {end_node.get('name')}` (L{end_node.get('line_start', 1)}-L{end_node.get('line_end', 1)}) ? {ereason}"
@@ -1427,10 +1475,7 @@ class ProjectBrain:
                                 )
                             if summary_mode:
                                 span_req = e_line - s_line + 1
-                                if len(targets) <= 2 and span_req <= max(220, max_lines_per_symbol):
-                                    target_cap = max(span_req, max_lines_per_symbol)
-                                else:
-                                    target_cap = max(55, min(max_lines_per_symbol, 220 // max(1, len(targets))))
+                                target_cap = max_lines_per_symbol if max_lines_per_symbol < 110 else max(max_lines_per_symbol, min(260, span_req))
                             else:
                                 # Explicit non-summary line-range request: unfold up to 400 lines per target
                                 target_cap = max(max_lines_per_symbol, 400)
@@ -1439,7 +1484,7 @@ class ProjectBrain:
                                 u_len = (
                                     min(400, u_e - u_s + 1)
                                     if not summary_mode
-                                    else min(target_cap, max(45, target_cap // max(1, len(unseen))))
+                                    else min(target_cap, max(65, target_cap // max(1, len(unseen))))
                                 )
                                 chunk_code = slice_lines(self.root, rel, u_s, u_e, max_lines=u_len)
                                 parts_out.append(chunk_code)
@@ -2019,6 +2064,24 @@ class ProjectBrain:
                                             f"Reads response property `.{missing_rk[0]}` from `{hm} {hc['url']}`, "
                                             f"but backend handler `{be_fn_nm}` only returns `{sorted(be_keys)}` (`Post(BE) ? Pre(FE)`)."
                                         )
+                # 7. Check Universal JS/TS/React Static AST & Closure Contracts (scoped to focus_files when non-empty)
+                for jc in (cell.get("js_ast_contracts", []) if (not focus_files or rel in focus_files) else []):
+                    j_line = jc["line"]
+                    j_kind = jc["kind"]
+                    w_key = (rel, j_line, f"js_ast:{j_kind}:{jc.get('symbol', '')}")
+                    if w_key not in seen_warn_keys:
+                        seen_warn_keys.add(w_key)
+                        for ex_ln in jc.get("extra_pin_lines", []):
+                            pin_map.setdefault(rel, set()).add(ex_ln)
+                        _record_offending_fn(
+                            rel,
+                            j_line,
+                            span_end=jc.get("end_line", j_line + 1),
+                            inline_msg=jc["inline_msg"],
+                        )
+                        warnings.append(
+                            f"- ?? **[6D AST Contract Violation (`{j_kind}`)]** `{rel}:L{j_line}` (`{scope}`) ? {jc['summary']}"
+                        )
         self._last_line_annotations = line_ann
         self._last_pin_lines = pin_map
         return warnings, offending_nodes
@@ -2429,9 +2492,15 @@ class ProjectBrain:
         self._ast_hashes = {}
         self._z_write_sets = {}
         self._cell_4d_tokens = {}
+        self._const_aliases: dict[str, list[str]] = {}
         doc_freq: dict[str, int] = {}
 
         for rel_path, info in self._index.items():
+            for ak, a_vals in (info.get("const_aliases") or {}).items():
+                dst_list = self._const_aliases.setdefault(ak, [])
+                for av in a_vals:
+                    if av not in dst_list:
+                        dst_list.append(av)
             symbol_names = (
                 [f["name"] for f in info.get("functions", [])]
                 + [c["name"] for c in info.get("classes", [])]
@@ -2682,14 +2751,25 @@ class ProjectBrain:
         elif self.is_stale():
             self.incremental_index()
 
+    def _expand_keywords_with_aliases(self, keywords: list[str]) -> list[str]:
+        """Expand query keywords using bijective symbolic constant-map aliases discovered across the repo."""
+        aliases_map = getattr(self, "_const_aliases", None) or {}
+        if not aliases_map or not keywords:
+            return keywords
+        expanded = list(keywords)
+        for kw in keywords:
+            for al in aliases_map.get(kw, [])[:2]:
+                if al not in expanded:
+                    expanded.append(al)
+        return expanded
+
     def query(self, prompt: str, top_n: int = 10) -> list[dict]:
         """Return the top_n most relevant files for a natural language prompt."""
         self._ensure_fresh()
 
-        keywords = _extract_keywords(prompt)
+        keywords = self._expand_keywords_with_aliases(_extract_keywords(prompt))
         if not keywords:
             return []
-
         intent = classify_intent(prompt)
 
         scores: dict[str, float] = {}

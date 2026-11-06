@@ -405,6 +405,32 @@ def _js_const_map_and_leading_docs(root) -> tuple[dict[str, str], dict[int, str]
     return cmap, leading_docs
 
 
+def _extract_const_aliases(const_map: dict[str, str]) -> dict[str, list[str]]:
+    """Extract bijective symbolic token mappings (e.g. `videos: 'watch'`) from top-level lookup dicts/objects."""
+    aliases: dict[str, list[str]] = {}
+    if not const_map:
+        return aliases
+    _PAIR_PAT = re.compile(
+        r"""(?:['"]([a-z][a-z0-9_-]{2,20})['"]|\b([a-z][a-z0-9_-]{2,20}))\s*:\s*['"]([a-z][a-z0-9_-]{2,20})['"]"""
+    )
+    for c_text in const_map.values():
+        if "{" not in c_text or "}" not in c_text:
+            continue
+        pairs = _PAIR_PAT.findall(c_text)
+        if not (1 <= len(pairs) <= 25):
+            continue
+        for k1, k2, val in pairs:
+            key = (k1 or k2).strip()
+            val = val.strip()
+            if key == val or key in _BODY_NOISE or val in _BODY_NOISE:
+                continue
+            if val not in aliases.setdefault(key, []):
+                aliases[key].append(val)
+            if key not in aliases.setdefault(val, []):
+                aliases[val].append(key)
+    return aliases
+
+
 def _parse_python(root) -> dict:
     functions, classes, routes = [], [], []
     method_to_class: dict[tuple, str] = {}
@@ -453,6 +479,7 @@ def _parse_python(root) -> dict:
         callee_matches = _matches(_PY, _PY_CALLS, func_node)
         calls = []
         call_sites = {}
+        call_sites_all: dict[str, list[int]] = {}
         qualified_calls = {}
         for _, mc in callee_matches:
             callee_nodes = mc.get("callee", [])
@@ -465,12 +492,15 @@ def _parse_python(root) -> dict:
                     calls.append(callee_text)
                 if callee_text not in call_sites or line < call_sites[callee_text]:
                     call_sites[callee_text] = line
+                s_list = call_sites_all.setdefault(callee_text, [])
+                if line not in s_list and len(s_list) < 8:
+                    s_list.append(line)
+                    s_list.sort()
                 if receiver_nodes:
                     receiver_text = _text(receiver_nodes[0])
                     qual = f"{receiver_text}.{callee_text}"
                     if qual not in qualified_calls or line < qualified_calls[qual]:
                         qualified_calls[qual] = line
-
         sig, params, ret_type = _py_func_signature(func_node)
         entry = {
             "name": _text(name_node),
@@ -483,6 +513,7 @@ def _parse_python(root) -> dict:
             "body_tokens": _extract_body_tokens(func_node, py_consts),
             "calls": calls,
             "call_sites": call_sites,
+            "call_sites_all": call_sites_all,
             "qualified_calls": qualified_calls,
             "ast_hash": _ast_hash(_text(func_node)),
         }
@@ -546,6 +577,7 @@ def _parse_python(root) -> dict:
         "imports": imports,
         "import_bindings": import_bindings,
         "routes": routes,
+        "const_aliases": _extract_const_aliases(py_consts),
     }
 
 
@@ -601,6 +633,12 @@ _JS_CALLS = """
 (call_expression function:
   [(identifier) @callee
    (member_expression object: (_) @receiver property: (property_identifier) @callee)])
+"""
+_JSX_CALLS = """
+[
+  (jsx_self_closing_element name: (identifier) @callee)
+  (jsx_opening_element name: (identifier) @callee)
+]
 """
 
 
@@ -832,9 +870,15 @@ def _parse_js(root, lang: Language) -> dict:
         if not name_node:
             continue
         fn_name = _text(name_node)
-        callee_matches = _matches(lang, _JS_CALLS, func_node)
+        callee_matches = list(_matches(lang, _JS_CALLS, func_node))
+        if lang in (_TSX, _JS):
+            for m_jsx in _matches(lang, _JSX_CALLS, func_node):
+                c_nodes = m_jsx[1].get("callee", [])
+                if c_nodes and _text(c_nodes[0])[:1].isupper():
+                    callee_matches.append(m_jsx)
         calls = []
         call_sites = {}
+        call_sites_all: dict[str, list[int]] = {}
         qualified_calls = {}
         for _, mc in callee_matches:
             callee_nodes = mc.get("callee", [])
@@ -847,12 +891,15 @@ def _parse_js(root, lang: Language) -> dict:
                     calls.append(callee_text)
                 if callee_text not in call_sites or line < call_sites[callee_text]:
                     call_sites[callee_text] = line
+                s_list = call_sites_all.setdefault(callee_text, [])
+                if line not in s_list and len(s_list) < 8:
+                    s_list.append(line)
+                    s_list.sort()
                 if receiver_nodes:
                     receiver_text = _text(receiver_nodes[0])
                     qual = f"{receiver_text}.{callee_text}"
                     if qual not in qualified_calls or line < qualified_calls[qual]:
                         qualified_calls[qual] = line
-
         sig, params, ret_type = _js_func_signature(func_node, fn_name)
         l_start = _line(func_node)
         doc = leading_docs.get(l_start)
@@ -867,6 +914,7 @@ def _parse_js(root, lang: Language) -> dict:
             "body_tokens": _extract_body_tokens(func_node, js_consts),
             "calls": calls,
             "call_sites": call_sites,
+            "call_sites_all": call_sites_all,
             "qualified_calls": qualified_calls,
             "ast_hash": _ast_hash(_text(func_node)),
         }
@@ -970,6 +1018,7 @@ def _parse_js(root, lang: Language) -> dict:
         "import_bindings": import_bindings,
         "exports": exports,
         "routes": routes,
+        "const_aliases": _extract_const_aliases(js_consts),
     }
 
 

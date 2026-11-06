@@ -404,13 +404,20 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "slice":
         res = brain.slice_symbols(args.targets, max_lines_per_symbol=args.max_lines, summary_mode=bool(args.summary))
         if args.summary:
+            out_lines: list[str] = []
             for s in res.get("slices", []):
                 if s.get("error"):
-                    print(f"[ERROR] {s['error']}")
+                    out_lines.append(f"[ERROR] {s['error']}")
                 else:
-                    print(f"=== {s.get('rel_path')} :: {s.get('symbol')} ({s.get('lines', 'skeleton')}) ===")
-                    print(s.get("code") or s.get("skeleton") or "")
-                    print()
+                    out_lines.append(f"=== {s.get('rel_path')} :: {s.get('symbol')} ({s.get('lines', 'skeleton')}) ===")
+                    out_lines.append(s.get("code") or s.get("skeleton") or "")
+                    out_lines.append("")
+            full_txt = "\n".join(out_lines)
+            try:
+                (brain.root / ".projectbrain_slice.md").write_text(full_txt, encoding="utf-8")
+            except OSError:
+                pass
+            print(full_txt)
         else:
             print(json.dumps(res, indent=2))
         return 0

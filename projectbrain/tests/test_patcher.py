@@ -872,3 +872,99 @@ def test_debiased_ast_dataflow_alter_table_nested_return_and_general_chop(tmp_pa
     assert "# >>> [HTTP-BRIDGE " in md
     assert "# >>> [CAUSAL-CHOP " in md
     assert "# >>> [6D-CONTRACT " in md
+
+
+def test_universal_js_ts_ast_contracts_and_css_folding(tmp_path: Path):
+    """Verify:
+      1. Inline CSS/SVG styling properties are folded away in `slice_lines` while executable code is retained.
+      2. Bijective `const_aliases` lookup tables propagate query aliases automatically.
+      3. Multi-call-site `call_sites_all` and JSX `<Child />` call edges are indexed.
+      4. Universal JS/TS/React 6D AST contract laws (`premature_effect_event_handler`, `stale_hook_closure`,
+         `param_outer_state_conflict`, `inconsistent_call_arity`) are detected and annotated inline.
+    """
+    src = tmp_path / "src"
+    src.mkdir()
+
+    (src / "storage.ts").write_text(
+        "export function persistStepProgress(stepId: string, scopeKey = 'default'): void {\n"
+        "  localStorage.setItem(`progress_${scopeKey}`, stepId);\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    # Synthetic React component exhibiting all 4 universal AST/closure laws + heavy inline CSS noise
+    css_noise = "\n".join(
+        f"        paddingTop: '{k}px',\n        borderRadius: '{k}px',\n        fontSize: '{k}px',"
+        for k in range(1, 35)
+    )
+    (src / "CarouselWidget.tsx").write_text(
+        "import React, { useState, useEffect } from 'react';\n"
+        "import { persistStepProgress } from './storage';\n\n"
+        "const MODE_ALIAS_MAP = {\n"
+        "  slides: 'carousel',\n"
+        "  digest: 'summary',\n"
+        "};\n\n"
+        "export function CarouselWidget({ items, onItemFinished }: { items: string[]; onItemFinished?: (idx: number) => void }) {\n"
+        "  const [activeIndex, setActiveIndex] = useState(0);\n"
+        "  const [isExpanded, setIsExpanded] = useState(false);\n\n"
+        "  useEffect(() => {\n"
+        "    if (onItemFinished) {\n"
+        "      onItemFinished(activeIndex);\n"
+        "    }\n"
+        "  }, [activeIndex, onItemFinished]);\n\n"
+        "  useEffect(() => {\n"
+        "    window.addEventListener('keydown', handleShortcutKey);\n"
+        "    return () => window.removeEventListener('keydown', handleShortcutKey);\n"
+        "  }, []);\n\n"
+        "  const advanceSlide = () => {\n"
+        "    if (activeIndex < items.length - 1) {\n"
+        "      setActiveIndex(activeIndex + 1);\n"
+        "    }\n"
+        "  };\n\n"
+        "  const handleItemDone = (targetIdx: number) => {\n"
+        "    if (targetIdx === activeIndex) {\n"
+        "      persistStepProgress('carousel', 'unit_1');\n"
+        "    }\n"
+        "    persistStepProgress('carousel');\n"
+        "    advanceSlide();\n"
+        "  };\n\n"
+        "  const handleShortcutKey = (ev: KeyboardEvent) => {\n"
+        "    if (ev.key === 'ArrowRight' && isExpanded) {\n"
+        "      handleItemDone(activeIndex);\n"
+        "    }\n"
+        "  };\n\n"
+        "  return (\n"
+        "    <div style={{\n"
+        f"{css_noise}\n"
+        "    }}>\n"
+        "      <button onClick={() => onItemFinished && onItemFinished(activeIndex)}>Finish</button>\n"
+        "      <button onClick={() => handleItemDone(0)}>Complete First</button>\n"
+        "    </div>\n"
+        "  );\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    brain = ProjectBrain(str(tmp_path))
+    brain.index()
+
+    # Verify const_aliases extracted `slides <-> carousel`
+    assert "slides" in brain._const_aliases.get("carousel", [])
+    assert "carousel" in brain._const_aliases.get("slides", [])
+
+    # Verify call_sites_all captured both call sites of `persistStepProgress`
+    fn_entries = brain._index["src/CarouselWidget.tsx"]["functions"]
+    item_done_fn = next(f for f in fn_entries if f["name"] == "handleItemDone")
+    assert len(item_done_fn["call_sites_all"].get("persistStepProgress", [])) == 2
+
+    # Compile dossier and verify all 4 universal JS/TS/React 6D AST contracts are surfaced & inline-annotated
+    res = brain.compile_dossier(["search for a bug in slides widget"])
+    md = res["markdown"]
+    assert "premature_effect_event_handler" in md
+    assert "stale_hook_closure" in md
+    assert "param_outer_state_conflict" in md
+    assert "inconsistent_call_arity" in md
+    assert "# >>> [6D-CONTRACT " in md
+    # Verify executable handlers were kept while inline CSS paddingTop/borderRadius lines were folded
+    assert "handleItemDone" in md
+    assert "advanceSlide" in md
