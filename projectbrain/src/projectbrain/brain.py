@@ -190,7 +190,8 @@ class ProjectBrain:
         self._served_slices: set[str] = set()
         self._served_skeletons: set[str] = set()
         self._source_cache: dict[str, str] = {}
-
+        self._last_line_annotations: dict[str, dict[int, list[str]]] = {}
+        self._last_pin_lines: dict[str, set[int]] = {}
     def _get_file_text(self, rel_path: str) -> str | None:
         if rel_path in self._source_cache:
             return self._source_cache[rel_path]
@@ -578,6 +579,33 @@ class ProjectBrain:
                         for tc in top_cells[:2]:
                             cell_focus_terms.extend(tc.get("Z_write", [])[:3])
                             cell_focus_terms.extend(tc.get("W_calls", [])[:3])
+            node_pins: set[int] = set(self._last_pin_lines.get(rel, set()))
+            node_anns: dict[int, list[str]] = {
+                k: list(v) for k, v in self._last_line_annotations.get(rel, {}).items()
+            }
+            if self._graph:
+                for ei_hb in self._graph._adj.get(node_id, []):
+                    ehb = self._graph.edges[ei_hb]
+                    if ehb["type"] == "http_flow" and ehb.get("line"):
+                        hl = int(ehb["line"])
+                        dst_nd = self._graph.nodes.get(ehb["dst"], {})
+                        dst_lbl = f"{dst_nd.get('rel_path', '')}:{dst_nd.get('name', '')} (L{dst_nd.get('line_start', 1)})"
+                        b_msg = f"# >>> [HTTP-BRIDGE L{hl}] {ehb.get('reason', '')} -> {dst_lbl}"
+                        node_pins.add(hl)
+                        if b_msg not in node_anns.setdefault(hl, []):
+                            node_anns[hl].append(b_msg)
+            if "Causal Symptom Chop" in reason:
+                for c_cell in self._index[rel].get("cells_4d", []):
+                    cs_ln = c_cell.get("line_start", 0)
+                    ce_ln = c_cell.get("line_end", 0)
+                    if slice_s <= cs_ln <= slice_e and any(
+                        ex.startswith(("status:", "throw:", "err:")) for ex in c_cell.get("E_exit", [])
+                    ):
+                        for gl in range(cs_ln, min(slice_e + 1, ce_ln + 1)):
+                            node_pins.add(gl)
+            in_slice_pins = [p for p in node_pins if slice_s <= p <= slice_e]
+            if len(in_slice_pins) >= 6:
+                effective_max_l = max(effective_max_l, 58)
             code = (
                 ""
                 if cell_slices
@@ -588,6 +616,8 @@ class ProjectBrain:
                     slice_e,
                     max_lines=effective_max_l,
                     focus_terms=kw_list + ast_calls + cell_focus_terms,
+                    pin_lines=node_pins,
+                    inline_annotations=node_anns,
                 )
             )
             if not code and not cell_slices:
@@ -606,6 +636,8 @@ class ProjectBrain:
             t_kw = _extract_keywords(clean_task_for_search)
             t_low = clean_task_for_search.lower()
             sec: list[str] = [f"## Task {idx}: {task}"]
+            if not zoom:
+                self._compile_6d_contract_diagnostics(task, set(self._index.keys()))
 
             # 1. Identify explicitly named code symbols (camelCase, snake_case, or backtick/paren-wrapped) or routes
             explicit_nodes: list[str] = []
@@ -923,10 +955,28 @@ class ProjectBrain:
                     path_str = " -> ".join(f"`{p}`" for p in chop_path)
                     chain_lines.append(f"- ?? **[Causal Symptom Chop]** {path_str} *(origin of `{chop_sym}`)*")
                     ppr_scores[chop_nid] = max(ppr_scores.get(chop_nid, 0.0), 0.45)
+                    for u_hop, v_hop in zip(chop_path, chop_path[1:]):
+                        u_nd = self._graph.nodes.get(u_hop, {})
+                        v_nd = self._graph.nodes.get(v_hop, {})
+                        u_rel = u_nd.get("rel_path", "")
+                        v_nm = v_nd.get("name", v_hop.split(":")[-1])
+                        if u_rel:
+                            for ei_ch in self._graph._adj.get(u_hop, []):
+                                ech = self._graph.edges[ei_ch]
+                                if ech["dst"] == v_hop and ech.get("line") and ech["type"] == "calls":
+                                    ch_ln = int(ech["line"])
+                                    for p_ln in range(max(1, ch_ln - 1), ch_ln + 2):
+                                        self._last_pin_lines.setdefault(u_rel, set()).add(p_ln)
+                                    ch_msg = (
+                                        f"# >>> [CAUSAL-CHOP L{ch_ln}] calls {v_nm} -> origin of {chop_sym} "
+                                        f"({v_nd.get('rel_path', '')}:L{v_nd.get('line_start', 1)})"
+                                    )
+                                    ann_l = self._last_line_annotations.setdefault(u_rel, {}).setdefault(ch_ln, [])
+                                    if ch_msg not in ann_l:
+                                        ann_l.append(ch_msg)
                     if chop_nid not in existing_exp_ids and chop_nid not in seen_slices:
                         expanded_nodes.insert(0, (chop_nid, f"Causal Symptom Chop origin ({chop_sym})", t_kw, 32, 0))
                         existing_exp_ids.add(chop_nid)
-
                 for p_nid, p_prob, p_rsn in ppr_results[:4]:
                     if p_nid not in existing_exp_ids and p_nid not in seen_slices and (
                         "http_flow" in p_rsn or "table:" in p_rsn or p_prob >= 0.085
@@ -1039,9 +1089,9 @@ class ProjectBrain:
             if diag_lines and not zoom:
                 for d_nid in diag_nodes[:2]:
                     if len(seen_slices) < 6:
-                        _add_node_slice(d_nid, "6D contract violation site", t_kw, sec, max_l=45, max_g=0)
-                sec.append("### Static 6D Contract, Schema & Dialect Diagnostics")
-                sec.extend(diag_lines[:10])
+                        _add_node_slice(d_nid, "6D contract violation site", t_kw, sec, max_l=58, max_g=0)
+                diag_block = ["### Static 6D Contract, Schema & Dialect Diagnostics"] + diag_lines[:10]
+                sec[1:1] = diag_block
             md_sections.extend(sec)
         # 4. Append Impact / Blast Radius sections
         for imp_file in impact_list:
@@ -1725,14 +1775,22 @@ class ProjectBrain:
         offending_nodes: list[str] = []
         seen_warn_keys: set[tuple[str, int, str]] = set()
         covered_dialect_spans: list[tuple[str, int, int, str]] = []
+        line_ann: dict[str, dict[int, list[str]]] = {}
+        pin_map: dict[str, set[int]] = {}
 
-        def _record_offending_fn(f_rel: str, ln_no: int) -> None:
+        def _record_offending_fn(f_rel: str, ln_no: int, span_end: int = 0, inline_msg: str = "") -> None:
+            end_p = max(ln_no, span_end)
+            for p_ln in range(max(1, ln_no - 1), min(end_p + 1, ln_no + 6) + 1):
+                pin_map.setdefault(f_rel, set()).add(p_ln)
+            if inline_msg:
+                ann_list = line_ann.setdefault(f_rel, {}).setdefault(ln_no, [])
+                if inline_msg not in ann_list:
+                    ann_list.append(inline_msg)
             for fn in self._index.get(f_rel, {}).get("functions", []):
                 if fn.get("line_start", 0) <= ln_no <= fn.get("line_end", 0):
                     nid = fn_id(f_rel, fn["name"], fn.get("parent_class"))
                     if nid not in offending_nodes:
                         offending_nodes.append(nid)
-
         for rel in ordered_files:
             if not wants_all_repo_diag and rel not in focus_files:
                 continue
@@ -1760,7 +1818,15 @@ class ProjectBrain:
                             w_key = (rel, ins_line, f"null:{tbl_key}:{','.join(missing)}")
                             if w_key not in seen_warn_keys:
                                 seen_warn_keys.add(w_key)
-                                _record_offending_fn(rel, ins_line)
+                                _record_offending_fn(
+                                    rel,
+                                    ins_line,
+                                    span_end=min(c_end, ins_line + 5),
+                                    inline_msg=(
+                                        f"# >>> [6D-CONTRACT L{ins_line}] INSERT INTO {tbl_raw} omits required NOT NULL "
+                                        f"column(s): {', '.join(missing)} (schema: {schema_rel}:L{sc['line_start']})"
+                                    ),
+                                )
                                 warnings.append(
                                     f"- ?? **[6D Schema Contract Violation]** `{rel}:L{ins_line}` (`{scope}`) ? "
                                     f"`INSERT INTO {tbl_raw}({', '.join(ins['cols'][:5])}{'...' if len(ins['cols']) > 5 else ''})` "
@@ -1788,7 +1854,15 @@ class ProjectBrain:
                             w_key = (rel, c_line, f"dialect:{feat}")
                             if w_key not in seen_warn_keys:
                                 seen_warn_keys.add(w_key)
-                                _record_offending_fn(rel, c_line)
+                                _record_offending_fn(
+                                    rel,
+                                    c_line,
+                                    span_end=min(c_end, c_line + 3),
+                                    inline_msg=(
+                                        f"# >>> [6D-CONTRACT L{c_line}] PostgreSQL construct '{feat}' is not translated "
+                                        f"by SQLite adapter ({ad_rel})"
+                                    ),
+                                )
                                 warnings.append(
                                     f"- ?? **[6D SQL Dialect Mismatch]** `{rel}:L{c_line}` (`{scope}`) ? "
                                     f"Query uses PostgreSQL construct `{feat}` not translated by SQLite adapter `{ad_rel}`."
@@ -1809,7 +1883,15 @@ class ProjectBrain:
                             w_key = (rel, c_line, "exc:UniqueViolation")
                             if w_key not in seen_warn_keys:
                                 seen_warn_keys.add(w_key)
-                                _record_offending_fn(rel, c_line)
+                                _record_offending_fn(
+                                    rel,
+                                    c_line,
+                                    span_end=min(c_end, c_line + 2),
+                                    inline_msg=(
+                                        f"# >>> [6D-CONTRACT L{c_line}] Catches UniqueViolation on DB write without "
+                                        f"catching sqlite3.IntegrityError ({ad_rel})"
+                                    ),
+                                )
                                 warnings.append(
                                     f"- ?? **[6D Exception Contract Mismatch]** `{rel}:L{c_line}` (`{scope}`) ? "
                                     f"Catches `UniqueViolation` on DB write (`?Z:{','.join(cell['Z_write'][:2])}`) "
@@ -1821,8 +1903,17 @@ class ProjectBrain:
                     w_key = (rel, cmp_line, f"type:{tc_cmp['param']}:{tc_cmp['row_key']}")
                     if w_key not in seen_warn_keys:
                         seen_warn_keys.add(w_key)
-                        _record_offending_fn(rel, cmp_line)
                         if tc_cmp.get("other_var"):
+                            _record_offending_fn(
+                                rel,
+                                cmp_line,
+                                span_end=cmp_line + 1,
+                                inline_msg=(
+                                    f"# >>> [6D-CONTRACT L{cmp_line}] Disjoint type comparison: {tc_cmp['param']} "
+                                    f"({tc_cmp['param_type']}) vs {tc_cmp['other_var']} ({tc_cmp['other_type']}) ? "
+                                    f"?({tc_cmp['param_type']}) ? ?({tc_cmp['other_type']}) = ?"
+                                ),
+                            )
                             warnings.append(
                                 f"- ?? **[6D Type Disjointness Violation]** `{rel}:L{cmp_line}` (`{scope}`) ? "
                                 f"Compares `{tc_cmp['param_type']}` expression `{tc_cmp['param']}` directly against "
@@ -1830,6 +1921,16 @@ class ProjectBrain:
                                 f"(`?({tc_cmp['param_type']}) ? ?({tc_cmp['other_type']}) = ?`)."
                             )
                         else:
+                            _record_offending_fn(
+                                rel,
+                                cmp_line,
+                                span_end=cmp_line + 1,
+                                inline_msg=(
+                                    f"# >>> [6D-CONTRACT L{cmp_line}] Disjoint type comparison: {tc_cmp['param']} "
+                                    f"({tc_cmp['param_type']}) vs SQLite TEXT row['{tc_cmp['row_key']}'] without "
+                                    f"str()/{tc_cmp['param_type']}() coercion"
+                                ),
+                            )
                             warnings.append(
                                 f"- ?? **[6D Type Disjointness Violation]** `{rel}:L{cmp_line}` (`{scope}`) ? "
                                 f"Compares `{tc_cmp['param_type']}` expression `{tc_cmp['param']}` directly against "
@@ -1843,7 +1944,15 @@ class ProjectBrain:
                     w_key = (rel, sv_line, f"sql_proj:{sv['var']}:{sv['read_key']}")
                     if w_key not in seen_warn_keys:
                         seen_warn_keys.add(w_key)
-                        _record_offending_fn(rel, sv_line)
+                        _record_offending_fn(
+                            rel,
+                            sv_line,
+                            span_end=sv_line + 1,
+                            inline_msg=(
+                                f"# >>> [6D-CONTRACT L{sv_line}] Row key {sv['var']}['{sv['read_key']}'] is absent "
+                                f"from SELECT {', '.join(sv['projected_cols'])} on {sv['table']}"
+                            ),
+                        )
                         warnings.append(
                             f"- ?? **[6D Producer-Consumer SQL Shape Violation]** `{rel}:L{sv_line}` (`{scope}`) ? "
                             f"Reads row key `{sv['var']}['{sv['read_key']}']`, which is absent from `SELECT {', '.join(sv['projected_cols'])}` "
@@ -1876,7 +1985,15 @@ class ProjectBrain:
                                 w_key = (rel, h_line, f"http_verb:{hm}:{hu}")
                                 if w_key not in seen_warn_keys:
                                     seen_warn_keys.add(w_key)
-                                    _record_offending_fn(rel, h_line)
+                                    _record_offending_fn(
+                                        rel,
+                                        h_line,
+                                        span_end=h_line + 2,
+                                        inline_msg=(
+                                            f"# >>> [6D-CONTRACT L{h_line}] HTTP verb mismatch: calls {hm} {hc['url']}, "
+                                            f"but backend route only accepts {', '.join(sorted(allowed_verbs))}"
+                                        ),
+                                    )
                                     warnings.append(
                                         f"- ?? **[6D HTTP Route Method Mismatch]** `{rel}:L{h_line}` (`{scope}`) ? "
                                         f"Frontend calls `{hm} {hc['url']}`, but backend route only accepts `{', '.join(sorted(allowed_verbs))}`."
@@ -1888,12 +2005,22 @@ class ProjectBrain:
                                     w_key = (rel, h_line, f"http_shape:{hu}:{missing_rk[0]}")
                                     if w_key not in seen_warn_keys:
                                         seen_warn_keys.add(w_key)
-                                        _record_offending_fn(rel, h_line)
+                                        _record_offending_fn(
+                                            rel,
+                                            h_line,
+                                            span_end=h_line + 2,
+                                            inline_msg=(
+                                                f"# >>> [6D-CONTRACT L{h_line}] Response property .{missing_rk[0]} is absent "
+                                                f"from backend handler {be_fn_nm} return keys {sorted(be_keys)}"
+                                            ),
+                                        )
                                         warnings.append(
                                             f"- ?? **[6D Cross-Stack HTTP Shape Violation]** `{rel}:L{h_line}` (`{scope}`) ? "
                                             f"Reads response property `.{missing_rk[0]}` from `{hm} {hc['url']}`, "
                                             f"but backend handler `{be_fn_nm}` only returns `{sorted(be_keys)}` (`Post(BE) ? Pre(FE)`)."
                                         )
+        self._last_line_annotations = line_ann
+        self._last_pin_lines = pin_map
         return warnings, offending_nodes
 
     def _score_class_for_query(self, cls: dict, keywords: list[str]) -> float:

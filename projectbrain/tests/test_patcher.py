@@ -864,3 +864,11 @@ def test_debiased_ast_dataflow_alter_table_nested_return_and_general_chop(tmp_pa
     # 2c. Nested dict return shape + `${API_BASE}` fetch URL must still catch `.missing_client_field`
     assert "[6D Cross-Stack HTTP Shape Violation]" in md
     assert "missing_client_field" in md
+
+    # 2d. Verify Transformer-Native Attention compilation:
+    #     - Causal-Mask Topological Pre-Conditioning: Diagnostics header precedes code slices
+    #     - Delta-p=1 inline annotations (`# >>> [6D-CONTRACT ...]` / `# >>> [HTTP-BRIDGE ...]` / `# >>> [CAUSAL-CHOP ...]`)
+    assert md.index("### Static 6D Contract, Schema & Dialect Diagnostics") < md.index("### [client.ts :: triggerDocValidation")
+    assert "# >>> [HTTP-BRIDGE " in md
+    assert "# >>> [CAUSAL-CHOP " in md
+    assert "# >>> [6D-CONTRACT " in md

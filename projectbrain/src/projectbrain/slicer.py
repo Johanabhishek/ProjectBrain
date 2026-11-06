@@ -43,14 +43,16 @@ def slice_lines(
     line_end: int,
     max_lines: int = 80,
     focus_terms: list[str] | None = None,
+    pin_lines: set[int] | list[int] | None = None,
+    inline_annotations: dict[int, list[str]] | None = None,
 ) -> str:
     """Read [line_start..line_end] (1-indexed, inclusive) from root/rel_path,
     prefixed with line numbers.
 
     When the range exceeds `max_lines`, performs smart focus-window folding
-    (keeping the signature header + high-signal windows matching `focus_terms`,
-    calls, timers, and control flow, while collapsing boilerplate/JSX gaps)
-    rather than blindly chopping off the bottom of the function.
+    (keeping the signature header + pinned causal/contract lines + high-signal
+    windows matching `focus_terms`, calls, timers, and control flow, while
+    collapsing boilerplate/JSX gaps) and injects delta-p=1 inline annotations.
     """
     full_path = root / rel_path
     try:
@@ -63,24 +65,45 @@ def slice_lines(
     selected = lines[start_idx:end_idx]
     total_len = len(selected)
 
+    def _emit_kept_line(idx_0: int, out_list: list[str]) -> None:
+        actual_ln = start_idx + idx_0 + 1
+        raw_line = selected[idx_0]
+        if inline_annotations and actual_ln in inline_annotations:
+            indent_m = re.match(r"^(\s*)", raw_line)
+            ind = indent_m.group(1) if indent_m else ""
+            for ann_msg in inline_annotations[actual_ln]:
+                out_list.append(f"   ! | {ind}{ann_msg}")
+        out_list.append(f"{actual_ln:4d} | {raw_line}")
+
     if total_len <= max_lines:
-        return "\n".join(
-            f"{start_idx + i + 1:4d} | {line}"
-            for i, line in enumerate(selected)
-        )
+        out_short: list[str] = []
+        for i in range(total_len):
+            _emit_kept_line(i, out_short)
+        return "\n".join(out_short)
 
     # Smart Focus-Window Folding for long functions / React monoliths
     terms = list(dict.fromkeys(t.lower() for t in (focus_terms or []) if len(t) >= 3))
     keep = [False] * total_len
 
     # Always keep the first head_n lines (signature + initial guardrails) and last tail_n lines
-    head_n = min(15, max(5, max_lines // 4))
+    pinned_in_range = [
+        pln for pln in sorted(set(pin_lines or ()))
+        if line_start <= pln <= line_end
+    ]
+    head_n = min(10 if len(pinned_in_range) >= 4 else 15, max(5, max_lines // 4))
     tail_n = min(4, max(2, max_lines // 12))
     for i in range(head_n):
         keep[i] = True
     for i in range(max(0, total_len - tail_n), total_len):
         keep[i] = True
-
+    # Causal-Spine & Violation-Site Unfolding: pin exact AST violation / bridge lines first
+    for pln in pinned_in_range:
+        p_idx = pln - start_idx - 1
+        if 0 <= p_idx < total_len:
+            keep[p_idx] = True
+            for nb in (p_idx - 1, p_idx + 1):
+                if 0 <= nb < total_len and sum(1 for k in keep if k) < max_lines - 2:
+                    keep[nb] = True
     # Compute term frequency inside the function to discount ubiquitous local variable names
     low_lines = [ln.lower() for ln in selected]
     term_weights: dict[str, float] = {}
@@ -169,7 +192,7 @@ def slice_lines(
     i = 0
     while i < total_len:
         if keep[i]:
-            formatted.append(f"{start_idx + i + 1:4d} | {selected[i]}")
+            _emit_kept_line(i, formatted)
             i += 1
         else:
             gap_start = i
