@@ -12,6 +12,7 @@ Instead of returning bare file paths (which forces the LLM agent to call
 """
 from __future__ import annotations
 
+import ast
 import re
 from pathlib import Path
 from .parsers import _PARSERS
@@ -597,6 +598,257 @@ def _find_balanced_end(lines: list[str], start_idx: int, open_ch: str = "{", clo
     return min(n - 1, start_idx + 45)
 
 
+_NOMINAL_DISJOINT_TYPES = {
+    "UUID", "str", "int", "float", "bool", "bytes",
+    "datetime", "date", "Decimal", "dict", "list",
+}
+
+
+def _norm_py_type_annotation(ann_node: ast.AST | None) -> str | None:
+    if ann_node is None:
+        return None
+    try:
+        raw = ast.unparse(ann_node).strip()
+    except Exception:
+        return None
+    m_opt = re.match(r"^(?:typing\.)?Optional\[\s*(.+)\s*\]$", raw)
+    if m_opt:
+        raw = m_opt.group(1).strip()
+    parts = [p.strip() for p in raw.split("|") if p.strip() != "None"]
+    if len(parts) == 1:
+        raw = parts[0]
+    base = raw.split("[")[0].split(".")[-1].strip()
+    return base if base else None
+
+
+def _infer_py_expr_type(
+    expr: ast.AST,
+    type_env: dict[str, str],
+    row_env: dict[str, str],
+) -> tuple[str | None, str | None, str | None]:
+    """Return (expr_label, nominal_type, uncoerced_row_col) for a Python AST expression."""
+    if isinstance(expr, ast.Name):
+        v = expr.id
+        if v in row_env and type_env.get(v) in (None, "TEXT"):
+            return v, "TEXT", row_env[v]
+        return v, type_env.get(v), None
+    if isinstance(expr, ast.Constant):
+        val = expr.value
+        if isinstance(val, bool):
+            return repr(val), "bool", None
+        if isinstance(val, int):
+            return repr(val), "int", None
+        if isinstance(val, float):
+            return repr(val), "float", None
+        if isinstance(val, str):
+            return repr(val), "str", None
+        if isinstance(val, bytes):
+            return repr(val), "bytes", None
+    if isinstance(expr, ast.Dict):
+        return "{...}", "dict", None
+    if isinstance(expr, ast.List):
+        return "[...]", "list", None
+    if isinstance(expr, ast.Call):
+        fn_name = ""
+        if isinstance(expr.func, ast.Name):
+            fn_name = expr.func.id
+        elif isinstance(expr.func, ast.Attribute):
+            fn_name = expr.func.attr
+        if fn_name in ("str", "int", "float", "bool", "bytes", "UUID", "Decimal", "dict", "list"):
+            return f"{fn_name}(...)", fn_name, None
+    if isinstance(expr, ast.Subscript):
+        sl = expr.slice
+        if isinstance(sl, ast.Constant) and isinstance(sl.value, str):
+            base_nm = expr.value.id if isinstance(expr.value, ast.Name) else "row"
+            if base_nm not in type_env or type_env.get(base_nm) in ("Row", "dict", "Mapping", "Any"):
+                return f"{base_nm}[{sl.value!r}]", "TEXT", sl.value
+    return None, None, None
+
+
+def _analyze_python_ast_contracts(lines: list[str]) -> dict[int, dict]:
+    """Universal Python AST intra-procedural dataflow analyzer for:
+      1. Parameter & local variable nominal type propagation (`type_env`) and row-column tracking (`row_env`).
+      2. Disjoint type equality/inequality detection (`tau(e_1) ? tau(e_2) = ?`).
+      3. Arbitrary-depth dictionary return shape & class/model return field extraction (`return_dict_keys`).
+    Returns a mapping from 1-based function start line to `{type_comparisons, return_dict_keys}`.
+    """
+    src = "\n".join(lines)
+    try:
+        tree = ast.parse(src)
+    except SyntaxError:
+        return {}
+
+    cls_fields: dict[str, list[str]] = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef):
+            f_list: list[str] = []
+            for item in node.body:
+                if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                    fnm = item.target.id
+                    if not fnm.startswith("_") and fnm not in f_list:
+                        f_list.append(fnm)
+                elif isinstance(item, ast.Assign):
+                    for t in item.targets:
+                        if isinstance(t, ast.Name) and not t.id.startswith("_") and t.id not in f_list:
+                            f_list.append(t.id)
+            if f_list:
+                cls_fields[node.name] = f_list
+
+    result: dict[int, dict] = {}
+    for node in ast.walk(tree):
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        type_env: dict[str, str] = {}
+        row_env: dict[str, str] = {}
+        all_args = (
+            list(getattr(node.args, "posonlyargs", []))
+            + list(node.args.args)
+            + list(node.args.kwonlyargs)
+        )
+        for arg in all_args:
+            t_norm = _norm_py_type_annotation(arg.annotation)
+            if t_norm:
+                type_env[arg.arg] = t_norm
+
+        type_comparisons: list[dict] = []
+        return_dict_keys: list[str] = []
+        has_dynamic_dict_spread = False
+
+        def _check_expr_comparisons(stmt_node: ast.AST) -> None:
+            for sub in ast.walk(stmt_node):
+                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                if isinstance(sub, ast.Compare):
+                    operands = [sub.left] + list(sub.comparators)
+                    for op, left_e, right_e in zip(sub.ops, operands, operands[1:]):
+                        if not isinstance(op, (ast.Eq, ast.NotEq)):
+                            continue
+                        l_lbl, l_ty, l_col = _infer_py_expr_type(left_e, type_env, row_env)
+                        r_lbl, r_ty, r_col = _infer_py_expr_type(right_e, type_env, row_env)
+                        if l_col and r_ty in ("UUID", "datetime", "date", "Decimal", "bytes"):
+                            type_comparisons.append({
+                                "param": r_lbl or "expr",
+                                "param_type": r_ty,
+                                "row_key": l_col,
+                                "line": getattr(sub, "lineno", node.lineno),
+                            })
+                        elif r_col and l_ty in ("UUID", "datetime", "date", "Decimal", "bytes"):
+                            type_comparisons.append({
+                                "param": l_lbl or "expr",
+                                "param_type": l_ty,
+                                "row_key": r_col,
+                                "line": getattr(sub, "lineno", node.lineno),
+                            })
+                        elif (
+                            not l_col
+                            and not r_col
+                            and l_ty in _NOMINAL_DISJOINT_TYPES
+                            and r_ty in _NOMINAL_DISJOINT_TYPES
+                            and l_ty != r_ty
+                            and {l_ty, r_ty} != {"int", "float"}
+                        ):
+                            type_comparisons.append({
+                                "param": l_lbl or "lhs",
+                                "param_type": l_ty,
+                                "other_var": r_lbl or "rhs",
+                                "other_type": r_ty,
+                                "row_key": f"{r_lbl}:{r_ty}",
+                                "line": getattr(sub, "lineno", node.lineno),
+                            })
+
+        def _walk_stmt_block(stmts: list[ast.stmt]) -> None:
+            nonlocal has_dynamic_dict_spread
+            for st in stmts:
+                if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    continue
+                if isinstance(st, ast.Assign):
+                    _check_expr_comparisons(st.value)
+                    _, rhs_ty, rhs_col = _infer_py_expr_type(st.value, type_env, row_env)
+                    for tgt in st.targets:
+                        if isinstance(tgt, ast.Name):
+                            if rhs_col:
+                                row_env[tgt.id] = rhs_col
+                                type_env[tgt.id] = "TEXT"
+                            else:
+                                row_env.pop(tgt.id, None)
+                                if rhs_ty:
+                                    type_env[tgt.id] = rhs_ty
+                elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+                    if st.value:
+                        _check_expr_comparisons(st.value)
+                    ann_t = _norm_py_type_annotation(st.annotation)
+                    _, rhs_ty, rhs_col = (
+                        _infer_py_expr_type(st.value, type_env, row_env)
+                        if st.value is not None
+                        else (None, None, None)
+                    )
+                    if rhs_col and not ann_t:
+                        row_env[st.target.id] = rhs_col
+                        type_env[st.target.id] = "TEXT"
+                    else:
+                        row_env.pop(st.target.id, None)
+                        if ann_t or rhs_ty:
+                            type_env[st.target.id] = ann_t or rhs_ty  # type: ignore[assignment]
+                elif isinstance(st, ast.Return) and st.value is not None:
+                    _check_expr_comparisons(st.value)
+                    rv = st.value
+                    if isinstance(rv, ast.Dict):
+                        if any(k is None for k in rv.keys):
+                            has_dynamic_dict_spread = True
+                        else:
+                            for k_node in rv.keys:
+                                if isinstance(k_node, ast.Constant) and isinstance(k_node.value, str):
+                                    if k_node.value not in return_dict_keys:
+                                        return_dict_keys.append(k_node.value)
+                    elif isinstance(rv, ast.Call):
+                        fn_nm = (
+                            rv.func.id
+                            if isinstance(rv.func, ast.Name)
+                            else (rv.func.attr if isinstance(rv.func, ast.Attribute) else "")
+                        )
+                        if fn_nm in cls_fields:
+                            for cf in cls_fields[fn_nm]:
+                                if cf not in return_dict_keys:
+                                    return_dict_keys.append(cf)
+                        elif fn_nm == "dict":
+                            for kw in rv.keywords:
+                                if kw.arg and kw.arg not in return_dict_keys:
+                                    return_dict_keys.append(kw.arg)
+                else:
+                    if isinstance(st, (ast.If, ast.While)):
+                        _check_expr_comparisons(st.test)
+                        _walk_stmt_block(st.body)
+                        _walk_stmt_block(st.orelse)
+                    elif isinstance(st, (ast.For, ast.AsyncFor)):
+                        _check_expr_comparisons(st.iter)
+                        _walk_stmt_block(st.body)
+                        _walk_stmt_block(st.orelse)
+                    elif isinstance(st, (ast.With, ast.AsyncWith)):
+                        _walk_stmt_block(st.body)
+                    elif isinstance(st, ast.Try):
+                        _walk_stmt_block(st.body)
+                        for h in st.handlers:
+                            _walk_stmt_block(h.body)
+                        _walk_stmt_block(st.orelse)
+                        _walk_stmt_block(st.finalbody)
+                    else:
+                        _check_expr_comparisons(st)
+
+        _walk_stmt_block(node.body)
+        if has_dynamic_dict_spread:
+            return_dict_keys = []
+        elif not return_dict_keys and node.returns is not None:
+            ret_t = _norm_py_type_annotation(node.returns)
+            if ret_t and ret_t in cls_fields:
+                return_dict_keys = list(cls_fields[ret_t])
+
+        result[node.lineno] = {
+            "type_comparisons": type_comparisons,
+            "return_dict_keys": return_dict_keys,
+        }
+    return result
+
+
 def extract_4d_coordinate_matrix(
     lines: list[str],
     line_start: int = 1,
@@ -618,6 +870,7 @@ def extract_4d_coordinate_matrix(
     # Pass 0: Tree-sitter AST traversal for exact block end lines & AST assignment mutations
     ast_span_by_start: dict[int, int] = {}
     ast_mutations_by_line: dict[int, list[str]] = {}
+    py_ast_contracts: dict[int, dict] = _analyze_python_ast_contracts(lines) if ext.lower() == ".py" else {}
     parser = _PARSERS.get(ext.lower()) or _PARSERS.get(".tsx")
     if parser and n > 0:
         try:
@@ -1085,7 +1338,7 @@ def extract_4d_coordinate_matrix(
 
         http_calls: list[dict] = []
         for m_fe in re.finditer(
-            r"\bfetch\s*\(\s*[`'\"](\/[a-zA-Z0-9_/\-${}:.]+)[`'\"](?:\s*,\s*\{([\s\S]{0,260}?)\})?",
+            r"\bfetch\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?[`'\"](?:\$\{[^}]+\})?(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"](?:\s*,\s*\{([\s\S]{0,260}?)\})?",
             chunk,
         ):
             raw_u = m_fe.group(1).split("?")[0]
@@ -1099,7 +1352,7 @@ def extract_4d_coordinate_matrix(
                 hc_entry["expected_keys"] = expected_res_keys[:8]
             http_calls.append(hc_entry)
         for m_ax in re.finditer(
-            r"\b(?:axios|api|client|http)\.(get|post|put|delete|patch)\s*\(\s*[`'\"](\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]",
+            r"\b(?:axios|api|client|http)\.(get|post|put|delete|patch)\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?[`'\"](?:\$\{[^}]+\})?(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]",
             chunk,
             re.IGNORECASE,
         ):
@@ -1107,34 +1360,18 @@ def extract_4d_coordinate_matrix(
             raw_u = m_ax.group(2).split("?")[0]
             norm_u = re.sub(r"\$\{[^}]+\}|:[a-zA-Z_]\w*", "{*}", raw_u).rstrip("/") or "/"
             ax_line = s + chunk.count("\n", 0, m_ax.start())
-            http_calls.append({"method": verb_u, "url": raw_u, "norm_url": norm_u, "line": ax_line})
-        # Disjoint runtime type comparisons (e.g. Python UUID parameter compared directly to SQLite TEXT row["col"])
+            hc_entry_ax: dict = {"method": verb_u, "url": raw_u, "norm_url": norm_u, "line": ax_line}
+            if expected_res_keys:
+                hc_entry_ax["expected_keys"] = expected_res_keys[:8]
+            http_calls.append(hc_entry_ax)
+        # Intra-procedural AST type disjointness & return shape contracts
         type_comparisons: list[dict] = []
-        if scope.startswith("fn:"):
-            sig_head = "\n".join(lines[s - 1 : min(e, s + 8)])
-            uuid_params = set(re.findall(r"\b([a-zA-Z_]\w*)\s*:\s*(?:uuid\.)?UUID\b", sig_head))
-            if uuid_params:
-                for off_idx, raw_ln in enumerate(lines[s - 1 : e]):
-                    if "str(" in raw_ln or "UUID(" in raw_ln:
-                        continue
-                    for up in uuid_params:
-                        m_cmp = re.search(
-                            rf"\b\w+\[\s*['\"]([a-zA-Z_]\w*)['\"]\s*\]\s*(?:==|!=)\s*{re.escape(up)}\b"
-                            rf"|\b{re.escape(up)}\s*(?:==|!=)\s*\w+\[\s*['\"]([a-zA-Z_]\w*)['\"]\s*\]",
-                            raw_ln,
-                        )
-                        if m_cmp:
-                            col_k = m_cmp.group(1) or m_cmp.group(2)
-                            type_comparisons.append({
-                                "param": up,
-                                "param_type": "UUID",
-                                "row_key": col_k,
-                                "line": s + off_idx,
-                            })
-        # Producer-Consumer SQL SELECT projection vs row["key"] read algebra
         sql_select_violations: list[dict] = []
         return_dict_keys: list[str] = []
         if scope.startswith("fn:"):
+            if ext.lower() == ".py" and s in py_ast_contracts:
+                type_comparisons.extend(py_ast_contracts[s].get("type_comparisons", []))
+                return_dict_keys.extend(py_ast_contracts[s].get("return_dict_keys", []))
             for m_sel in re.finditer(
                 r"\b([a-zA-Z_]\w*)\s*=\s*[\w.]+\.execute\(\s*(?:f?['\"]{1,3})\s*SELECT\s+([\s\S]+?)\s+FROM\s+([a-zA-Z_]\w*)\b[\s\S]*?\)\.fetchone\(\)",
                 chunk,
@@ -1174,7 +1411,7 @@ def extract_4d_coordinate_matrix(
                             "line": rk_line,
                         })
 
-            if ext == ".py":
+            if ext.lower() == ".py" and not return_dict_keys and s not in py_ast_contracts:
                 ret_blocks = re.findall(r"\breturn\s*\{([^{};]+)\}", chunk)
                 if ret_blocks and not any("**" in rb for rb in ret_blocks):
                     for rb in ret_blocks:
@@ -1182,7 +1419,6 @@ def extract_4d_coordinate_matrix(
                             k_str = mk.group(1)
                             if k_str not in return_dict_keys:
                                 return_dict_keys.append(k_str)
-
         cell_dict: dict = {
             "X_scope": scope,
             "Y_role": role,

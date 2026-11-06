@@ -764,3 +764,103 @@ def test_causal_symptom_chop_shape_algebra_and_predisk_patch_contracts(tmp_path)
     assert patch_res["all_syntax_valid"] is True
     assert patch_res["all_contracts_valid"] is False
     assert any("[6D Schema Contract Violation]" in d and "status" in d for d in patch_res["contract_diagnostics"])
+
+
+def test_debiased_ast_dataflow_alter_table_nested_return_and_general_chop(tmp_path: Path):
+    """Verify general, zero-overfit CS laws:
+      1. Relational schema evolution via chronological SQL `ALTER TABLE ... DROP NOT NULL` folding.
+      2. Python AST intra-procedural dataflow (`_analyze_python_ast_contracts`) across multi-line variable aliases
+         (`owner = row['uploaded_by']; if owner != user_id:`) and general disjoint nominal types (`int` vs `str`).
+      3. Nested dictionary return shapes (`return {'ok': True, 'meta': {'nested': 1}, 'item_id': '123'}`) +
+         `${API_BASE}/api/...` frontend URL template normalization.
+      4. Universal lexical-stem Causal Symptom Chop on arbitrary custom exceptions (`QuotaLimitExceededError`).
+    """
+    mig_dir = tmp_path / "migrations"
+    mig_dir.mkdir()
+    (mig_dir / "001_init.sql").write_text(
+        "CREATE TABLE validation_documents (\n"
+        "    id TEXT PRIMARY KEY,\n"
+        "    doc_name TEXT NOT NULL,\n"
+        "    validator_id TEXT NOT NULL,\n"
+        "    approver_id TEXT NOT NULL\n"
+        ");\n",
+        encoding="utf-8",
+    )
+    (mig_dir / "002_relax_validators.sql").write_text(
+        "ALTER TABLE validation_documents ALTER COLUMN validator_id DROP NOT NULL;\n"
+        "ALTER TABLE validation_documents ALTER COLUMN approver_id DROP NOT NULL;\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "service.py").write_text(
+        "from uuid import UUID\n"
+        "from fastapi import APIRouter\n\n"
+        "router = APIRouter()\n\n"
+        "class QuotaLimitExceededError(Exception):\n"
+        "    pass\n\n"
+        "def verify_quota_and_owner(\n"
+        "    conn,\n"
+        "    doc_id: str,\n"
+        "    *,  # multi-line keyword-only signature beyond 8 lines\n"
+        "    flag_a: int = 1,\n"
+        "    flag_b: int = 2,\n"
+        "    flag_c: int = 3,\n"
+        "    flag_d: int = 4,\n"
+        "    flag_e: int = 5,\n"
+        "    user_id: UUID,\n"
+        "    expected_tag: str = 'v1',\n"
+        "):\n"
+        "    row = conn.execute('SELECT id, uploaded_by FROM validation_documents').fetchone()\n"
+        "    owner = row['uploaded_by']\n"
+        "    if owner != user_id:\n"
+        "        raise QuotaLimitExceededError('quota or owner mismatch')\n"
+        "    if flag_a == expected_tag:\n"
+        "        return False\n"
+        "    return True\n\n"
+        "@router.post('/api/v1/docs/{doc_id}/validate')\n"
+        "def validate_doc_endpoint(conn, doc_id: str, user_id: UUID):\n"
+        "    verify_quota_and_owner(conn, doc_id, user_id=user_id)\n"
+        "    conn.execute(\"INSERT INTO validation_documents (id, doc_name) VALUES ('1', 'spec.pdf')\")\n"
+        "    return {'ok': True, 'meta': {'nested_depth': 2}, 'doc_id': doc_id}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "client.ts").write_text(
+        "const API_BASE = 'https://api.example.com';\n"
+        "export async function triggerDocValidation(docId: string) {\n"
+        "    const res = await fetch(`${API_BASE}/api/v1/docs/${docId}/validate`, { method: 'POST' });\n"
+        "    const payload = await res.json();\n"
+        "    return payload.missing_client_field;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    from projectbrain.brain import ProjectBrain
+
+    brain = ProjectBrain(root=str(tmp_path))
+    brain.index()
+
+    # 1. Verify universal stem-based Causal Symptom Chop traces from client.ts -> validate_doc_endpoint -> verify_quota_and_owner (throw:QuotaLimitExceededError)
+    chops = brain._graph.causal_symptom_chop(
+        ["client.ts::triggerDocValidation"],
+        "triggerDocValidation fails when quota limit is exceeded",
+    )
+    assert len(chops) >= 1, f"Expected custom exception chop hit, got: {chops}"
+    origin_nid, sym_str, _ = chops[0]
+    assert "verify_quota_and_owner" in origin_nid
+    assert "throw:QuotaLimitExceededError" in sym_str
+
+    # 2. Compile dossier and check diagnostics
+    res = brain.compile_dossier(["triggerDocValidation fails when quota limit is exceeded or database error"])
+    md = res["markdown"]
+
+    # 2a. ALTER TABLE DROP NOT NULL must prevent false-positive NOT NULL warning on validator_id / approver_id!
+    assert "validator_id" not in md, f"False positive NOT NULL violation on dropped NOT NULL column: {md}"
+    assert "approver_id" not in md, f"False positive NOT NULL violation on dropped NOT NULL column: {md}"
+
+    # 2b. AST dataflow must catch BOTH multi-line row alias (`owner != user_id`) AND general disjoint types (`flag_a == expected_tag`, int vs str)
+    assert "[6D Type Disjointness Violation]" in md
+    assert "uploaded_by" in md
+    assert "?(int) ? ?(str) = ?" in md
+
+    # 2c. Nested dict return shape + `${API_BASE}` fetch URL must still catch `.missing_client_field`
+    assert "[6D Cross-Stack HTTP Shape Violation]" in md
+    assert "missing_client_field" in md

@@ -637,17 +637,35 @@ class CodeGraph:
         target_exits: set[str] = set()
         for m_code in re.finditer(r"\b(4\d\d|5\d\d)\b", t_low):
             target_exits.add(f"status:{m_code.group(1)}")
-        if "forbidden" in t_low or "403" in t_low or "permission" in t_low:
-            target_exits.update({"status:403", "err:forbidden", "throw:PermissionError"})
-        if "unauthorized" in t_low or "401" in t_low:
+        # Universal RFC-9110 HTTP status & standard runtime exception alignment
+        if "unauthorized" in t_low or "401" in t_low or "unauthenticated" in t_low:
             target_exits.update({"status:401", "err:unauthorized"})
-        if "not found" in t_low or "404" in t_low:
-            target_exits.update({"status:404", "err:not_found", "err:batch_not_found", "err:file_not_found"})
-        if "conflict" in t_low or "409" in t_low or "duplicate" in t_low:
+        if "forbidden" in t_low or "403" in t_low or "permission" in t_low or "access denied" in t_low:
+            target_exits.update({"status:403", "err:forbidden", "throw:PermissionError"})
+        if "not found" in t_low or "404" in t_low or "missing" in t_low:
+            target_exits.update({"status:404", "err:not_found", "throw:KeyError", "throw:FileNotFoundError"})
+        if "conflict" in t_low or "409" in t_low or "duplicate" in t_low or "unique" in t_low:
             target_exits.update({"status:409", "err:conflict", "throw:UniqueViolation", "throw:IntegrityError"})
-        if "422" in t_low or "locked" in t_low or "unprocessable" in t_low:
-            target_exits.update({"status:422", "err:batch_locked", "err:profile_incomplete"})
-        if not target_exits:
+        if "422" in t_low or "unprocessable" in t_low or "validation" in t_low:
+            target_exits.update({"status:422", "throw:ValueError", "throw:ValidationError"})
+        if "400" in t_low or "bad request" in t_low:
+            target_exits.update({"status:400", "throw:ValueError"})
+        if "429" in t_low or "rate limit" in t_low or "too many requests" in t_low:
+            target_exits.update({"status:429"})
+
+        # Universal lexical stem extraction for matching arbitrary domain exceptions/error codes
+        _chop_stop = {
+            "the", "and", "for", "with", "when", "from", "into", "that", "this",
+            "why", "how", "what", "does", "fail", "fails", "failed", "failing",
+            "error", "errors", "exception", "bug", "issue", "status", "code",
+            "http", "route", "endpoint", "function", "method", "call", "calls",
+            "return", "returns", "throw", "throws", "raise", "raises",
+        }
+        raw_words = re.findall(r"[A-Za-z][a-z0-9]+|[A-Z]+(?=[A-Z][a-z]|\b)|[a-z0-9]+", task_text)
+        query_stems: set[str] = {
+            w.lower() for w in raw_words if len(w) >= 3 and w.lower() not in _chop_stop
+        }
+        if not target_exits and not query_stems:
             return []
 
         valid_starts: list[str] = []
@@ -661,6 +679,21 @@ class CodeGraph:
         if not valid_starts:
             return []
 
+        def _matches_exit_contract(ec: str) -> bool:
+            if ec in target_exits:
+                return True
+            if ec.startswith(("err:", "throw:")) and query_stems:
+                payload = ec.split(":", 1)[1]
+                ec_parts = re.findall(r"[A-Za-z][a-z0-9]+|[A-Z]+(?=[A-Z][a-z]|\b)|[a-z0-9]+", payload)
+                ec_stems = {
+                    p.lower()
+                    for p in ec_parts
+                    if len(p) >= 3 and p.lower() not in _chop_stop and p.lower() != "err"
+                }
+                if ec_stems and (ec_stems & query_stems):
+                    return True
+            return False
+
         results: list[tuple[str, str, list[str]]] = []
         seen_origins: set[str] = set()
         q: deque[tuple[str, list[str], int]] = deque([(s, [s], 0) for s in valid_starts])
@@ -670,7 +703,9 @@ class CodeGraph:
             curr_id, path, hop = q.popleft()
             if hop >= 1 and curr_id not in seen_origins:
                 c_nd = self.nodes.get(curr_id, {})
-                matched = sorted(set(c_nd.get("exit_contracts", [])) & target_exits)
+                matched = sorted(
+                    ec for ec in set(c_nd.get("exit_contracts", [])) if _matches_exit_contract(ec)
+                )
                 if matched:
                     seen_origins.add(curr_id)
                     results.append((curr_id, ", ".join(matched), path))

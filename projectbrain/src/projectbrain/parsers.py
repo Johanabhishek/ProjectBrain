@@ -1085,8 +1085,100 @@ def extract_sql_table_schemas(source: str) -> dict[str, dict]:
     return schemas
 
 
+def extract_sql_schema_alters(source: str) -> dict[str, list[dict]]:
+    """Extract standard SQL ALTER TABLE schema evolution operations (DROP/SET NOT NULL, SET DEFAULT, ADD/DROP COLUMN)."""
+    alters: dict[str, list[dict]] = {}
+    if "ALTER" not in source.upper():
+        return alters
+    clean_src = "\n".join(re.sub(r"--.*$", "", ln) for ln in source.splitlines())
+    for m in re.finditer(
+        r"\bALTER\s+TABLE\s+(?:IF\s+EXISTS\s+)?(?:ONLY\s+)?(?:[a-zA-Z_]\w*\.)?[\"`]?([a-zA-Z_][a-zA-Z0-9_]*)[\"`]?\s+([\s\S]+?);",
+        clean_src,
+        re.IGNORECASE,
+    ):
+        tbl = m.group(1)
+        body = m.group(2)
+        ops: list[dict] = []
+        for m_dn in re.finditer(
+            r"\bALTER\s+(?:COLUMN\s+)?[\"`]?([a-zA-Z_][a-zA-Z0-9_]*)[\"`]?\s+DROP\s+NOT\s+NULL\b",
+            body,
+            re.IGNORECASE,
+        ):
+            ops.append({"op": "drop_not_null", "col": m_dn.group(1)})
+        for m_sn in re.finditer(
+            r"\bALTER\s+(?:COLUMN\s+)?[\"`]?([a-zA-Z_][a-zA-Z0-9_]*)[\"`]?\s+SET\s+NOT\s+NULL\b",
+            body,
+            re.IGNORECASE,
+        ):
+            ops.append({"op": "set_not_null", "col": m_sn.group(1)})
+        for m_sd in re.finditer(
+            r"\bALTER\s+(?:COLUMN\s+)?[\"`]?([a-zA-Z_][a-zA-Z0-9_]*)[\"`]?\s+SET\s+DEFAULT\b",
+            body,
+            re.IGNORECASE,
+        ):
+            ops.append({"op": "set_default", "col": m_sd.group(1)})
+        for m_dc in re.finditer(
+            r"\bDROP\s+(?:COLUMN\s+)?(?:IF\s+EXISTS\s+)?[\"`]?([a-zA-Z_][a-zA-Z0-9_]*)[\"`]?\b",
+            body,
+            re.IGNORECASE,
+        ):
+            col_d = m_dc.group(1)
+            if col_d.upper() not in ("NOT", "DEFAULT", "CONSTRAINT", "INDEX", "KEY"):
+                ops.append({"op": "drop_col", "col": col_d})
+        for m_ac in re.finditer(
+            r"\bADD\s+(?:COLUMN\s+)?(?:IF\s+NOT\s+EXISTS\s+)?[\"`]?([a-zA-Z_][a-zA-Z0-9_]*)[\"`]?\s+([A-Za-z][A-Za-z0-9_()]*)(.*?)(?:,|$)",
+            body,
+            re.IGNORECASE | re.DOTALL,
+        ):
+            col_a = m_ac.group(1)
+            if col_a.upper() in ("CONSTRAINT", "PRIMARY", "FOREIGN", "UNIQUE", "CHECK", "INDEX"):
+                continue
+            rest_a = m_ac.group(3) or ""
+            is_nn = bool(re.search(r"\bNOT\s+NULL\b", rest_a, re.IGNORECASE))
+            has_def = bool(re.search(r"\b(?:DEFAULT\b|SERIAL\b|GENERATED\b|AUTOINCREMENT\b)", rest_a, re.IGNORECASE))
+            ops.append({"op": "add_col", "col": col_a, "required": is_nn and not has_def})
+        if ops:
+            alters.setdefault(tbl, []).extend(ops)
+    return alters
+
+
+def apply_sql_alters_to_schema(sc: dict, ops: list[dict]) -> None:
+    """Mutate a table schema dict in-place according to chronological ALTER TABLE operations."""
+    all_c: list[str] = list(sc.get("all_cols", []))
+    req_c: list[str] = list(sc.get("required_cols", []))
+    def_c: list[str] = list(sc.get("defaulted_cols", []))
+    for item in ops:
+        op = item.get("op")
+        col = item.get("col", "")
+        col_low = col.lower()
+        if op in ("drop_not_null", "set_default"):
+            req_c = [c for c in req_c if c.lower() != col_low]
+            if op == "set_default" and all(c.lower() != col_low for c in def_c):
+                def_c.append(col)
+        elif op == "set_not_null":
+            if all(c.lower() != col_low for c in def_c) and all(c.lower() != col_low for c in req_c):
+                req_c.append(col)
+        elif op == "drop_col":
+            all_c = [c for c in all_c if c.lower() != col_low]
+            req_c = [c for c in req_c if c.lower() != col_low]
+            def_c = [c for c in def_c if c.lower() != col_low]
+        elif op == "add_col":
+            if all(c.lower() != col_low for c in all_c):
+                all_c.append(col)
+            if item.get("required") and all(c.lower() != col_low for c in req_c):
+                req_c.append(col)
+    sc["all_cols"] = all_c
+    sc["required_cols"] = req_c
+    sc["defaulted_cols"] = def_c
+
+
 def _parse_sql(source: str) -> dict:
     schemas = extract_sql_table_schemas(source)
+    alters = extract_sql_schema_alters(source)
+    for tbl_k, ops in alters.items():
+        for sc_k, sc_obj in schemas.items():
+            if sc_k.lower() == tbl_k.lower():
+                apply_sql_alters_to_schema(sc_obj, ops)
     classes: list[dict] = []
     functions: list[dict] = []
     for tbl_name, sc in schemas.items():
@@ -1138,6 +1230,7 @@ def _parse_sql(source: str) -> dict:
         "exports": list(schemas.keys()),
         "routes": [],
         "sql_schemas": schemas,
+        "sql_alters": alters,
         "parse_status": "ok",
     }
 
@@ -1159,10 +1252,19 @@ def parse(source: str, ext: str) -> dict:
     root = tree.root_node
 
     result = _parse_python(root) if ext == ".py" else _parse_js(root, lang)
-    if "CREATE TABLE" in source.upper():
+    up_src = source.upper()
+    if "CREATE TABLE" in up_src:
         sql_sc = extract_sql_table_schemas(source)
         if sql_sc:
             result["sql_schemas"] = sql_sc
+    if "ALTER TABLE" in up_src:
+        sql_alt = extract_sql_schema_alters(source)
+        if sql_alt:
+            result["sql_alters"] = sql_alt
+            for tbl_k, ops in sql_alt.items():
+                for sc_k, sc_obj in (result.get("sql_schemas") or {}).items():
+                    if sc_k.lower() == tbl_k.lower():
+                        apply_sql_alters_to_schema(sc_obj, ops)
     result["parse_status"] = "partial" if root.has_error else "ok"
     return result
 

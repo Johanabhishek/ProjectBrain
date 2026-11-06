@@ -22,7 +22,7 @@ from .graph import CodeGraph, fn_id, cls_id, file_id, route_id
 from .intent import classify_intent, LOCATE_SYMBOL, LOCATE_ROUTE, UNDERSTAND_FLOW, IMPACT_ANALYSIS, ADD_FEATURE
 from .ledger import SavingsLedger
 from .memory import RepoMemory
-from .parsers import parse
+from .parsers import parse, apply_sql_alters_to_schema
 from .patcher import apply_patch_spec
 from .session import SessionManager
 from .store import SQLiteIndexStore
@@ -189,7 +189,20 @@ class ProjectBrain:
         # never waste tokens re-sending identical code slices.
         self._served_slices: set[str] = set()
         self._served_skeletons: set[str] = set()
+        self._source_cache: dict[str, str] = {}
 
+    def _get_file_text(self, rel_path: str) -> str | None:
+        if rel_path in self._source_cache:
+            return self._source_cache[rel_path]
+        fpath = self.root / rel_path
+        if not fpath.exists():
+            return None
+        try:
+            txt = fpath.read_text(encoding="utf-8", errors="ignore")
+            self._source_cache[rel_path] = txt
+            return txt
+        except OSError:
+            return None
     # ── v2 Power Tools: Context Compiler, Surgical Slicer, Explorer, Check, Memory ──
 
     def compile_context(
@@ -1104,12 +1117,8 @@ class ProjectBrain:
                 omitted_prod_hits: list[str] = []
                 for sk in target_keys:
                     for rp in sorted(self._index.keys()):
-                        fpath = self.root / rp
-                        if not fpath.exists():
-                            continue
-                        try:
-                            raw_txt = fpath.read_text(encoding="utf-8", errors="ignore")
-                        except OSError:
+                        raw_txt = self._get_file_text(rp)
+                        if raw_txt is None:
                             continue
                         if sk not in raw_txt:
                             continue
@@ -1676,19 +1685,33 @@ class ProjectBrain:
         Returns (diagnostic_markdown_lines, offending_node_ids).
         """
         schemas_by_table: dict[str, list[tuple[str, dict]]] = {}
+        all_sql_alters: dict[str, list[dict]] = {}
         sqlite_adapters: list[tuple[str, str]] = []
-        for rel, info in self._index.items():
+        for rel in sorted(self._index.keys()):
+            info = self._index[rel]
             for tbl, sc in (info.get("sql_schemas") or {}).items():
-                schemas_by_table.setdefault(tbl.lower(), []).append((rel, sc))
+                sc_copy = {
+                    "name": sc.get("name", tbl),
+                    "line_start": sc.get("line_start", 1),
+                    "line_end": sc.get("line_end", 1),
+                    "all_cols": list(sc.get("all_cols", [])),
+                    "required_cols": list(sc.get("required_cols", [])),
+                    "defaulted_cols": list(sc.get("defaulted_cols", [])),
+                    "fields": list(sc.get("fields", [])),
+                }
+                schemas_by_table.setdefault(tbl.lower(), []).append((rel, sc_copy))
+            sql_alters_map = info.get("sql_alters") or {}
+            if isinstance(sql_alters_map, dict):
+                for alt_tbl, ops in sql_alters_map.items():
+                    all_sql_alters.setdefault(alt_tbl.lower(), []).extend(ops)
             if rel.endswith(".py") and "sqlite3" in info.get("imports", []):
-                try:
-                    src_txt = (self.root / rel).read_text(encoding="utf-8", errors="ignore")
-                    if "def execute" in src_txt or "_translate_sql" in src_txt:
-                        sqlite_adapters.append((rel, src_txt))
-                except OSError:
-                    pass
-
-
+                src_txt = self._get_file_text(rel)
+                if src_txt and ("def execute" in src_txt or "_translate_sql" in src_txt):
+                    sqlite_adapters.append((rel, src_txt))
+        if all_sql_alters and schemas_by_table:
+            for alt_tbl_low, ops in all_sql_alters.items():
+                for _, sc_copy in schemas_by_table.get(alt_tbl_low, []):
+                    apply_sql_alters_to_schema(sc_copy, ops)
         t_low = task.lower()
         wants_all_repo_diag = (not strict_focus) and any(
             w in t_low
@@ -1726,7 +1749,9 @@ class ProjectBrain:
                     tbl_key = tbl_raw.lower()
                     ins_cols_low = {c.lower() for c in ins["cols"]}
                     ins_line = ins.get("line", c_line)
-                    for schema_rel, sc in schemas_by_table.get(tbl_key, []):
+                    cand_schemas = schemas_by_table.get(tbl_key, [])
+                    local_schemas = [(s_rel, sc) for s_rel, sc in cand_schemas if s_rel == rel]
+                    for schema_rel, sc in (local_schemas or cand_schemas):
                         missing = [
                             req for req in sc.get("required_cols", [])
                             if req.lower() not in ins_cols_low
@@ -1797,12 +1822,20 @@ class ProjectBrain:
                     if w_key not in seen_warn_keys:
                         seen_warn_keys.add(w_key)
                         _record_offending_fn(rel, cmp_line)
-                        warnings.append(
-                            f"- ?? **[6D Type Disjointness Violation]** `{rel}:L{cmp_line}` (`{scope}`) ? "
-                            f"Compares `{tc_cmp['param_type']}` parameter `{tc_cmp['param']}` directly against "
-                            f"SQLite `TEXT` row key `['{tc_cmp['row_key']}']` without `str()`/`UUID()` coercion "
-                            f"(`?(UUID) ? ?(str) = ?`)."
-                        )
+                        if tc_cmp.get("other_var"):
+                            warnings.append(
+                                f"- ?? **[6D Type Disjointness Violation]** `{rel}:L{cmp_line}` (`{scope}`) ? "
+                                f"Compares `{tc_cmp['param_type']}` expression `{tc_cmp['param']}` directly against "
+                                f"`{tc_cmp['other_type']}` expression `{tc_cmp['other_var']}` without type coercion "
+                                f"(`?({tc_cmp['param_type']}) ? ?({tc_cmp['other_type']}) = ?`)."
+                            )
+                        else:
+                            warnings.append(
+                                f"- ?? **[6D Type Disjointness Violation]** `{rel}:L{cmp_line}` (`{scope}`) ? "
+                                f"Compares `{tc_cmp['param_type']}` expression `{tc_cmp['param']}` directly against "
+                                f"SQLite `TEXT` row key `['{tc_cmp['row_key']}']` without `str()`/`{tc_cmp['param_type']}()` coercion "
+                                f"(`?({tc_cmp['param_type']}) ? ?(str) = ?`)."
+                            )
 
                 # 5. Check Producer-Consumer SQL SELECT Projection vs Row Key Read (Post(SELECT) |= Pre(row[k]))
                 for sv in cell.get("sql_select_violations", []):

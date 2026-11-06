@@ -4,5 +4,5 @@
 # Any bump invalidates existing caches, forcing a full reindex on next load().
 
 SCHEMA_VERSION = 6
-PARSER_VERSION = "2026-11-05.3"
-GRAPH_VERSION = "2026-11-05.3"
+PARSER_VERSION = "2026-11-06.1"
+GRAPH_VERSION = "2026-11-06.1"
