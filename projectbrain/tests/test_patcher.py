@@ -880,7 +880,7 @@ def test_universal_js_ts_ast_contracts_and_css_folding(tmp_path: Path):
       2. Bijective `const_aliases` lookup tables propagate query aliases automatically.
       3. Multi-call-site `call_sites_all` and JSX `<Child />` call edges are indexed.
       4. Universal JS/TS/React 6D AST contract laws (`premature_effect_event_handler`, `stale_hook_closure`,
-         `param_outer_state_conflict`, `inconsistent_call_arity`) are detected and annotated inline.
+         `param_outer_state_conflict`) are detected and annotated inline; omitting a defaulted parameter is not flagged.
     """
     src = tmp_path / "src"
     src.mkdir()
@@ -963,8 +963,124 @@ def test_universal_js_ts_ast_contracts_and_css_folding(tmp_path: Path):
     assert "premature_effect_event_handler" in md
     assert "stale_hook_closure" in md
     assert "param_outer_state_conflict" in md
-    assert "inconsistent_call_arity" in md
+    # `persistStepProgress('carousel')` omits a DEFAULTED parameter -> legal, must not be reported.
+    assert "missing_required_argument" not in md
+    assert "inconsistent_call_arity" not in md
     assert "# >>> [6D-CONTRACT " in md
     # Verify executable handlers were kept while inline CSS paddingTop/borderRadius lines were folded
     assert "handleItemDone" in md
     assert "advanceSlide" in md
+
+
+def test_required_arity_and_listener_pairing_laws_are_sound():
+    """Law 4 fires only on calls missing REQUIRED params of a visible declaration; Law 5 fires only
+    when add/removeEventListener use different function identities (or the pair is never removed)."""
+    from projectbrain.slicer import _analyze_js_ts_ast_contracts
+
+    src = [
+        "import { useEffect } from 'react';",
+        "function track(eventName, payload) {",
+        "  send(eventName, payload);",
+        "}",
+        "function tag(label: string, scope?: string) {",
+        "  return label + (scope || '');",
+        "}",
+        "function store(key: string, value = 'x') {",
+        "  localStorage.setItem(key, value);",
+        "}",
+        "function pick({ a, b }: Props, mode: Map<string, number>) {",
+        "  return a;",
+        "}",
+        "export function Player() {",
+        "  useEffect(() => {",
+        "    const el = ref.current;",
+        "    el.addEventListener('canplay', onReady);",
+        "    el.addEventListener('ended', onEnded);",
+        "    el.addEventListener('pause', onPause);",
+        "    return () => {",
+        "      el.removeEventListener('canplay', onDetect);",
+        "      el.removeEventListener('ended', onEnded);",
+        "    };",
+        "  }, [src]);",
+        "  track('open');",
+        "  track('open', { id: 1 });",
+        "  tag('a');",
+        "  store('k');",
+        "  pick(props);",
+        "  return null;",
+        "}",
+    ]
+    v = _analyze_js_ts_ast_contracts(src, ".tsx")
+    arity = [x for x in v if x["kind"] == "missing_required_argument"]
+    leaks = [x for x in v if x["kind"] == "listener_cleanup_mismatch"]
+
+    # Only `track('open')` omits a required parameter; optional `?`, defaulted and
+    # destructured-first signatures are judged by their real required count.
+    assert [(x["symbol"], x["line"]) for x in arity] == [("track", 25), ("pick", 29)]
+    # canplay: removed with a different function; pause: never removed while cleanup exists.
+    # ended: correctly paired -> not reported.
+    assert sorted((x["symbol"], x["line"]) for x in leaks) == [("onPause", 19), ("onReady", 17)]
+
+
+def test_query_ranking_resists_hub_centrality_and_honours_aliases(tmp_path: Path):
+    """A widely-imported hub whose only contact with a query word is as a SUBSTRING of a different
+    token (`audit` inside `auditors`) must not outrank the file whose own name is the identifier the
+    codebase itself declares equivalent to that word (`ledger: 'audit'`)."""
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "labels.ts").write_text(
+        "export const TAB_LABELS = {\n  ledger: 'audit',\n  invoices: 'billing',\n};\n",
+        encoding="utf-8",
+    )
+    (src / "Registry.ts").write_text(
+        "export const auditors = [];\n"
+        "export function register(fn) { auditors.push(fn); }\n"
+        "export function getTab(tab) { return tab; }\n",
+        encoding="utf-8",
+    )
+    for k in range(12):
+        (src / f"Screen{k}.ts").write_text(
+            f"import {{ register }} from './Registry';\nexport function screen{k}() {{ return register({k}); }}\n",
+            encoding="utf-8",
+        )
+    (src / "LedgerPanel.tsx").write_text(
+        "export function LedgerPanel({ ledger }) {\n"
+        "  const total = ledger.reduce((a, b) => a + b.amount, 0);\n"
+        "  return total;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    brain = ProjectBrain(str(tmp_path))
+    brain.index()
+    ranked = [r["rel_path"] for r in brain.query("audit tab bugs", top_n=6)]
+    assert ranked.index("src/LedgerPanel.tsx") < ranked.index("src/Registry.ts")
+
+def test_contract_diagnostics_are_gated_by_query_relevance(tmp_path: Path):
+    """A finding in an unrelated region of a large host file must not be reported for a query about a
+    different feature; it IS reported when the query names that region."""
+    src = tmp_path / "src"
+    src.mkdir()
+    filler = "\n".join(f"  const pad{k} = {k};" for k in range(40))
+    (src / "Host.tsx").write_text(
+        "import { useEffect, useState } from 'react';\n"
+        "export function Host() {\n"
+        "  const [mode, setMode] = useState('a');\n"
+        f"{filler}\n"
+        "  useEffect(() => {\n"
+        "    if (mode === 'gallery') {\n"
+        "      const img = document.getElementById('g');\n"
+        "      img.addEventListener('load', onGalleryLoad);\n"
+        "      return () => img.removeEventListener('load', onGalleryDone);\n"
+        "    }\n"
+        "  }, [mode]);\n"
+        "  const renderCheckout = () => setMode('checkout');\n"
+        "  return renderCheckout;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    brain = ProjectBrain(str(tmp_path))
+    brain.index()
+    unrelated = brain.compile_dossier(["checkout button bugs"])["markdown"]
+    related = brain.compile_dossier(["gallery image load bugs"])["markdown"]
+    assert "listener_cleanup_mismatch" not in unrelated
+    assert "listener_cleanup_mismatch" in related

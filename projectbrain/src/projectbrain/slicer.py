@@ -929,8 +929,10 @@ def _analyze_js_ts_ast_contracts(lines: list[str], ext: str) -> list[dict]:
       3. `param_outer_state_conflict`: Function `f(p)` guards on `p === stateVar` (proving `p != stateVar`
          is possible) while unconditionally calling a 0-arg sibling helper `g()` that mutates `setStateVar`
          from `stateVar` instead of `p`.
-      4. `inconsistent_call_arity`: Local or relative-imported helper `f` is invoked with divergent argument
-         counts across call sites in the same file (omitting an optional context/discriminator parameter).
+      4. `missing_required_argument`: A function whose declaration is visible in the same file is called
+         with fewer arguments than its REQUIRED parameters (no `?`, default, or rest).
+      5. `listener_cleanup_mismatch`: Inside an effect whose cleanup removes listeners, an
+         `addEventListener(evt, h)` pair is never removed with the same function identity.
     """
     if ext.lower() not in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs") or not lines:
         return []
@@ -1007,18 +1009,26 @@ def _analyze_js_ts_ast_contracts(lines: list[str], ext: str) -> list[dict]:
                 span = (end_i + 1) - lnum
                 if span <= 220:
                     parsed_params: list[tuple[str, bool]] = []
+                    params_unparsed = False
                     if raw_params.strip():
-                        for p_part in raw_params.split(","):
-                            p_clean = p_part.strip()
-                            if not p_clean:
-                                continue
-                            has_opt = ("=" in p_clean) or ("?" in p_clean.split(":")[0])
-                            m_pid = re.match(r"^(?:\.\.\.)?([a-zA-Z_]\w*)", p_clean)
+                        split_params = _split_top_level_params(raw_params)
+                        if split_params is None:
+                            params_unparsed = True
+                            split_params = []
+                        for p_clean in split_params:
+                            name_part = p_clean.split(":")[0]
+                            is_rest = p_clean.startswith("...")
+                            has_opt = is_rest or ("=" in p_clean.replace("=>", "")) or ("?" in name_part)
+                            m_pid = re.match(r"^(?:\.\.\.)?([a-zA-Z_$][\w$]*)", p_clean)
                             if m_pid:
                                 parsed_params.append((m_pid.group(1), has_opt))
+                            else:
+                                # Destructured pattern ({...} / [...]): one positional parameter.
+                                parsed_params.append(("<destructured>", has_opt))
                     local_fns[fn_nm] = {
                         "name": fn_nm,
                         "params": parsed_params,
+                        "params_unparsed": params_unparsed,
                         "start_line": lnum,
                         "end_line": end_i + 1,
                         "span": span,
@@ -1053,7 +1063,7 @@ def _analyze_js_ts_ast_contracts(lines: list[str], ext: str) -> list[dict]:
                     if not is_mutator_or_cb and h_nm in local_fns:
                         h_body = local_fns[h_nm]["body"]
                         is_mutator_or_cb = bool(
-                            re.search(r"\b(?:on[A-Z]\w*|set[A-Z]\w*|mark[A-Z]\w*|record[A-Z]\w*|localStorage|sessionStorage)\b", h_body)
+                            re.search(r"\b(?:on[A-Z]\w*|set[A-Z]\w*|localStorage|sessionStorage)\b", h_body)
                         )
                     if is_mutator_or_cb:
                         violations.append({
@@ -1153,85 +1163,175 @@ def _analyze_js_ts_ast_contracts(lines: list[str], ext: str) -> list[dict]:
                         ),
                     })
 
-    # Law 4: Intra-Module Call Arity / Optional Context Omission
-    cand_arity_syms: set[str] = set(rel_imported_syms)
+    # Law 4: Required-Parameter Arity Violation (intra-module, declaration visible).
+    # A call is only reported when the callee's declaration is parsed in this file and the
+    # call supplies FEWER arguments than the number of REQUIRED parameters (no `?`, no default,
+    # no rest). Optional/defaulted parameters may legally be omitted, and callees whose
+    # signature is not visible (imports) are never judged: no signature, no claim.
     for fn_h in local_fns.values():
-        if len(fn_h["params"]) >= 2 and any(has_opt for _, has_opt in fn_h["params"][1:]):
-            cand_arity_syms.add(fn_h["name"])
-
-    for sym_nm in sorted(cand_arity_syms):
-        if sym_nm.startswith(("use", "get", "is", "has", "can", "should", "format", "parse", "render", "create")):
+        if fn_h.get("params_unparsed"):
             continue
-        by_arity: dict[int, list[tuple[int, str]]] = {}
-        decl_s = local_fns[sym_nm]["start_line"] if sym_nm in local_fns else -1
-        decl_e = local_fns[sym_nm]["end_line"] if sym_nm in local_fns else -1
+        sym_nm = fn_h["name"]
+        required = 0
+        for _p_nm, p_opt in fn_h["params"]:
+            if p_opt:
+                break
+            required += 1
+        if required < 2:
+            continue
+        decl_s, decl_e = fn_h["start_line"], fn_h["end_line"]
+        short_calls: list[tuple[int, int, str]] = []
+        full_call: tuple[int, str] | None = None
         for idx_ln, ln_txt in enumerate(lines):
             c_ln = idx_ln + 1
-            if decl_s <= c_ln <= decl_e:
+            if decl_s <= c_ln <= decl_e and c_ln == decl_s:
                 continue
             st_ln = ln_txt.strip()
-            if st_ln.startswith(("import ", "export ", "function ", "//", "/*")):
+            if st_ln.startswith(("import ", "//", "/*", "*")):
                 continue
-            for m_c in re.finditer(rf"(?<![.\w]){re.escape(sym_nm)}\s*\(", ln_txt):
-                open_pos = ln_txt.find("(", m_c.start())
-                if open_pos == -1:
+            for m_c in re.finditer(rf"(?<![.\w$]){re.escape(sym_nm)}\s*\(", ln_txt):
+                if re.search(r"\bfunction\s*$", ln_txt[: m_c.start()]):
                     continue
-                # Extract balanced parens across up to 3 lines
-                combined_call = "\n".join(lines[idx_ln : min(n, idx_ln + 3)])[open_pos:]
-                depth = 0
-                in_s: str | None = None
-                esc = False
-                end_pos = -1
-                for ch_i, ch in enumerate(combined_call):
-                    if esc:
-                        esc = False
-                        continue
-                    if ch == "\\":
-                        esc = True
-                        continue
-                    if in_s:
-                        if ch == in_s:
-                            in_s = None
-                        continue
-                    if ch in ("'", '"', "`"):
-                        in_s = ch
-                        continue
-                    if ch == "(":
-                        depth += 1
-                    elif ch == ")":
-                        depth -= 1
-                        if depth == 0:
-                            end_pos = ch_i
-                            break
-                if end_pos > 0:
-                    inner_args = combined_call[1:end_pos]
-                    n_args = _count_call_args(inner_args)
-                    if n_args >= 1:
-                        snip = re.sub(r"\s+", " ", f"{sym_nm}({inner_args.strip()})")[:64]
-                        by_arity.setdefault(n_args, []).append((c_ln, snip))
-        if len(by_arity) >= 2:
-            min_a = min(by_arity.keys())
-            max_a = max(by_arity.keys())
-            if 1 <= min_a < max_a <= 4:
-                low_ln, low_snip = by_arity[min_a][0]
-                high_ln, high_snip = by_arity[max_a][0]
-                violations.append({
-                    "kind": "inconsistent_call_arity",
-                    "symbol": sym_nm,
-                    "line": low_ln,
-                    "end_line": low_ln + 1,
-                    "extra_pin_lines": [low_ln, high_ln] + ([decl_s] if decl_s > 0 else []),
-                    "inline_msg": (
-                        f"# >>> [6D-CONTRACT L{low_ln}] Inconsistent call arity for '{sym_nm}': called here with "
-                        f"{min_a} arg(s) `{low_snip}` vs {max_a} args `{high_snip}` at L{high_ln} (omitting context/scope argument)"
-                    ),
-                    "summary": (
-                        f"Calls `{low_snip}` with `{min_a}` arg(s) at `L{low_ln}` while `L{high_ln}` calls "
-                        f"`{high_snip}` with `{max_a}` args, omitting the secondary context/partition argument."
-                    ),
-                })
+                open_pos = ln_txt.find("(", m_c.start())
+                combined_call = "\n".join(lines[idx_ln : min(n, idx_ln + 4)])[open_pos:]
+                end_pos = _balanced_paren_end(combined_call)
+                if end_pos <= 0:
+                    continue
+                inner_args = combined_call[1:end_pos]
+                if "..." in inner_args:
+                    continue  # spread arguments: arity is not statically known
+                n_args = _count_call_args(inner_args)
+                snip = re.sub(r"\s+", " ", f"{sym_nm}({inner_args.strip()})")[:64]
+                if n_args < required:
+                    short_calls.append((c_ln, n_args, snip))
+                elif full_call is None:
+                    full_call = (c_ln, snip)
+        for c_ln, n_args, snip in short_calls[:2]:
+            missing = [p for p, _ in fn_h["params"][n_args:required]]
+            violations.append({
+                "kind": "missing_required_argument",
+                "symbol": sym_nm,
+                "line": c_ln,
+                "end_line": c_ln + 1,
+                "extra_pin_lines": [c_ln, decl_s] + ([full_call[0]] if full_call else []),
+                "inline_msg": (
+                    f"# >>> [6D-CONTRACT L{c_ln}] Arity: '{sym_nm}' declares {required} required param(s) at L{decl_s} "
+                    f"but is called with {n_args}; required param(s) [{', '.join(missing)}] will be undefined"
+                ),
+                "summary": (
+                    f"`{snip}` passes {n_args} arg(s) but `{sym_nm}` (`L{decl_s}`) declares {required} required "
+                    f"parameter(s); `{', '.join(missing)}` will be `undefined`."
+                ),
+            })
+
+    # Law 5: Event-Listener Registration / Cleanup Pairing.
+    # `removeEventListener` only detaches the exact (event, function-identity) pair passed to
+    # `addEventListener`. Inside an effect whose cleanup removes listeners, an added
+    # (event, handler) pair that is never removed with the same handler identity stays attached:
+    # each effect re-run stacks another live listener holding a stale closure.
+    _ADD_PAT = re.compile(r"\.addEventListener\(\s*(['\"])([^'\"]+)\1\s*,\s*([A-Za-z_$][\w$]*)\s*[,)]")
+    _REM_PAT = re.compile(r"\.removeEventListener\(\s*(['\"])([^'\"]+)\1\s*,\s*([A-Za-z_$][\w$]*)\s*[,)]")
+    for eff in effect_blocks:
+        if eff["kind"] not in ("useEffect", "useLayoutEffect"):
+            continue
+        body = eff["body"]
+        adds = [(m.group(2), m.group(3), eff["start_line"] + body.count("\n", 0, m.start())) for m in _ADD_PAT.finditer(body)]
+        rems = [(m.group(2), m.group(3), eff["start_line"] + body.count("\n", 0, m.start())) for m in _REM_PAT.finditer(body)]
+        if not adds or not rems:
+            continue
+        removed_pairs = {(ev, h) for ev, h, _ in rems}
+        for ev, h, add_ln in adds:
+            if (ev, h) in removed_pairs:
+                continue
+            wrong = [(rh, r_ln) for rev, rh, r_ln in rems if rev == ev and rh != h]
+            if wrong:
+                rh, r_ln = wrong[0]
+                detail = f"cleanup at L{r_ln} removes '{ev}' with a different function '{rh}'"
+                pins = [add_ln, r_ln]
+            else:
+                detail = f"the effect cleanup removes other listeners but never '{ev}'/'{h}'"
+                pins = [add_ln, rems[0][2]]
+            violations.append({
+                "kind": "listener_cleanup_mismatch",
+                "symbol": h,
+                "line": add_ln,
+                "end_line": add_ln + 1,
+                "extra_pin_lines": pins,
+                "inline_msg": (
+                    f"# >>> [6D-CONTRACT L{add_ln}] Listener leak: addEventListener('{ev}', {h}) is never removed with "
+                    f"the same function; {detail}"
+                ),
+                "summary": (
+                    f"`addEventListener('{ev}', {h})` at `L{add_ln}` inside {eff['kind']} (`L{eff['start_line']}-L{eff['end_line']}`) "
+                    f"is never detached: {detail}. Each effect re-run stacks another live listener."
+                ),
+            })
 
     return violations
+
+
+def _balanced_paren_end(text: str) -> int:
+    """Index of the `)` closing the `(` at text[0], skipping string literals; -1 if unbalanced."""
+    depth = 0
+    in_s: str | None = None
+    esc = False
+    for ch_i, ch in enumerate(text):
+        if esc:
+            esc = False
+            continue
+        if ch == "\\":
+            esc = True
+            continue
+        if in_s:
+            if ch == in_s:
+                in_s = None
+            continue
+        if ch in ("'", '"', "`"):
+            in_s = ch
+            continue
+        if ch == "(":
+            depth += 1
+        elif ch == ")":
+            depth -= 1
+            if depth == 0:
+                return ch_i
+    return -1
+
+
+def _split_top_level_params(raw: str) -> list[str] | None:
+    """Split a parameter list on top-level commas, respecting (), [], {}, <> nesting and strings.
+    Returns None when nesting is unbalanced (signature not reliably parseable)."""
+    parts: list[str] = []
+    depth = 0
+    buf: list[str] = []
+    in_s: str | None = None
+    prev = ""
+    for ch in raw:
+        if in_s:
+            buf.append(ch)
+            if ch == in_s and prev != "\\":
+                in_s = None
+            prev = ch
+            continue
+        if ch in ("'", '"', "`"):
+            in_s = ch
+        elif ch in "([{<":
+            depth += 1
+        elif ch in ")]}" or (ch == ">" and prev != "="):
+            depth -= 1
+            if depth < 0:
+                return None
+        elif ch == "," and depth == 0:
+            parts.append("".join(buf))
+            buf = []
+            prev = ch
+            continue
+        buf.append(ch)
+        prev = ch
+    if depth != 0 or in_s:
+        return None
+    parts.append("".join(buf))
+    return [p.strip() for p in parts if p.strip()]
 
 
 def extract_4d_coordinate_matrix(

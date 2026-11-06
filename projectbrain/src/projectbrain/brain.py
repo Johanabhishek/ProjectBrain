@@ -589,7 +589,15 @@ class ProjectBrain:
                     if (slice_e - slice_s) > 450 and len(cells) >= 3:
                         cands_to_slice = list(top_cells[:3])
                         for c_item in cells:
-                            if c_item.get("js_ast_contracts") and c_item not in cands_to_slice and len(cands_to_slice) < 5:
+                            if (
+                                c_item.get("js_ast_contracts")
+                                and c_item not in cands_to_slice
+                                and len(cands_to_slice) < 5
+                                and any(
+                                    self._contract_in_query_scope(rel, c_item.get("X_scope", ""), jc0.get("summary", ""), kw_list)
+                                    for jc0 in c_item["js_ast_contracts"]
+                                )
+                            ):
                                 cands_to_slice.append(c_item)
                         for tc in cands_to_slice:
                             tc_s, tc_e = tc["line_start"], tc["line_end"]
@@ -1135,9 +1143,10 @@ class ProjectBrain:
                     sec.extend(hop_pointers[:6])
             diag_lines, diag_nodes = self._compile_6d_contract_diagnostics(task, primary_files | set(emitted_by_file.keys()) | top3_query_files)
             if diag_lines and not zoom:
+                # In-scope verified findings outrank low-value graph hops: always slice up to 2
+                # finding sites (each bounded by max_l) regardless of how many slices exist.
                 for d_nid in diag_nodes[:2]:
-                    if len(seen_slices) < 6:
-                        _add_node_slice(d_nid, "6D contract violation site", t_kw, sec, max_l=58, max_g=0)
+                    _add_node_slice(d_nid, "6D contract violation site", t_kw, sec, max_l=58, max_g=0)
                 diag_block = ["### Static 6D Contract, Schema & Dialect Diagnostics"] + diag_lines[:10]
                 sec[1:1] = diag_block
             md_sections.extend(sec)
@@ -1774,6 +1783,52 @@ class ProjectBrain:
                         score += 3.0
         return score
 
+    def _contract_in_query_scope(self, rel: str, scope_text: str, summary: str, terms: list[str]) -> bool:
+        """Is a static-contract finding relevant to the current query?
+
+        Decided purely from query-term evidence (no repository-specific names):
+          * if the file's own name (stem) contains a query concept, the file IS the query's
+            subject and every finding in it is in scope;
+          * otherwise, the query is split into concepts (a term plus the aliases the codebase
+            declares for it). Only concepts that actually occur in this file can be expected in
+            one of its regions. The finding is in scope when the IDF-weighted fraction of those
+            concepts matched by the finding's enclosing scope + summary is >= 1/2, i.e. the
+            region carries at least half of the query's information that this file carries
+            (IDF-weighted coordination). A generic term alone cannot pull in an unrelated region
+            when a more specific query concept is present in the file but absent from it.
+        """
+        terms = list(dict.fromkeys(t.lower() for t in terms if len(t) >= 3))
+        if not terms:
+            return True
+        stem = Path(rel).stem.lower()
+        if any(len(t) >= 4 and t in stem for t in terms):
+            return True
+        # Build concept groups from the supplied terms and their declared aliases.
+        groups: list[list[str]] = []
+        seen_t: set[str] = set()
+        for t in terms:
+            if t in seen_t:
+                continue
+            members = [t] + [a for a in self._expand_keywords_with_aliases([t])[1:] if a in terms and a not in seen_t]
+            seen_t.update(members)
+            groups.append(members)
+        file_toks = self._token_sets.get(rel, set())
+        file_blob = self._blobs.get(rel, "")
+        region = f"{scope_text} {summary}".lower()
+        present_w = 0.0
+        matched_w = 0.0
+        for members in groups:
+            in_file = any(m in file_toks or (len(m) >= 4 and m in file_blob) for m in members)
+            if not in_file:
+                continue
+            w = max(self._idf.get(m, 1.0) for m in members)
+            present_w += w
+            if any(m in region for m in members):
+                matched_w += w
+        if present_w <= 0:
+            return False
+        return matched_w / present_w >= 0.5
+
     def _compile_6d_contract_diagnostics(self, task: str, focus_files: set[str], strict_focus: bool = False) -> tuple[list[str], list[str]]:
         """Pass C: Cross-check 6D IO cells (SQL INSERT column sets, SQL dialects, exception contracts)
         against indexed CREATE TABLE schemas and database adapter capabilities across the repository.
@@ -1808,6 +1863,7 @@ class ProjectBrain:
                 for _, sc_copy in schemas_by_table.get(alt_tbl_low, []):
                     apply_sql_alters_to_schema(sc_copy, ops)
         t_low = task.lower()
+        q_terms = [t for t in self._expand_keywords_with_aliases(_extract_keywords(task)) if len(t) >= 4]
         wants_all_repo_diag = (not strict_focus) and any(
             w in t_low
             for w in ("bug", "bugs", "error", "fail", "db", "database", "sql", "sqlite", "postgres", "connect", "insert", "schema", "backend")
@@ -2065,7 +2121,13 @@ class ProjectBrain:
                                             f"but backend handler `{be_fn_nm}` only returns `{sorted(be_keys)}` (`Post(BE) ? Pre(FE)`)."
                                         )
                 # 7. Check Universal JS/TS/React Static AST & Closure Contracts (scoped to focus_files when non-empty)
-                for jc in (cell.get("js_ast_contracts", []) if (not focus_files or rel in focus_files) else []):
+                for jc in (
+                    [
+                        jc0 for jc0 in cell.get("js_ast_contracts", [])
+                        if strict_focus or self._contract_in_query_scope(rel, scope, jc0.get("summary", ""), q_terms)
+                    ]
+                    if (not focus_files or rel in focus_files) else []
+                ):
                     j_line = jc["line"]
                     j_kind = jc["kind"]
                     w_key = (rel, j_line, f"js_ast:{j_kind}:{jc.get('symbol', '')}")
@@ -2620,13 +2682,20 @@ class ProjectBrain:
         boosted = dict(base_scores)
         top_files = sorted(base_scores, key=lambda p: base_scores[p], reverse=True)[:top_n * 2]
 
+        def _deg(p: str) -> int:
+            return max(1, len(self._import_targets.get(p, [])) + len(self._imported_by.get(p, [])))
+
+        # Symmetric degree normalisation (D^-1/2 A D^-1/2): mass propagated along an
+        # edge is divided by sqrt(deg(src) * deg(dst)), so universally-imported hubs
+        # cannot accumulate rank simply by being adjacent to everything.
         reach_count: dict[str, float] = {}
         for rel_path in top_files:
             score = base_scores[rel_path]
+            d_src = _deg(rel_path)
             for connected in self._import_targets.get(rel_path, []):
-                reach_count[connected] = reach_count.get(connected, 0) + score * 0.3
+                reach_count[connected] = reach_count.get(connected, 0) + score * 0.3 / math.sqrt(d_src * _deg(connected))
             for connected in self._imported_by.get(rel_path, []):
-                reach_count[connected] = reach_count.get(connected, 0) + score * 0.2
+                reach_count[connected] = reach_count.get(connected, 0) + score * 0.2 / math.sqrt(d_src * _deg(connected))
 
         for rel_path, reach_score in reach_count.items():
             if rel_path in boosted:
@@ -2767,46 +2836,74 @@ class ProjectBrain:
         """Return the top_n most relevant files for a natural language prompt."""
         self._ensure_fresh()
 
-        keywords = self._expand_keywords_with_aliases(_extract_keywords(prompt))
+        base_keywords = _extract_keywords(prompt)
+        keywords = self._expand_keywords_with_aliases(base_keywords)
         if not keywords:
             return []
         intent = classify_intent(prompt)
 
+        # Concept groups: a query term and the identifiers the codebase itself declares
+        # equivalent to it (bijective constant-map aliases) denote ONE concept. Scoring
+        # takes the best-matching member per concept, so a file is not double-counted for
+        # containing both spellings (e.g. the mapping table itself), and a file that only
+        # uses the programmatic identifier fully covers the concept.
+        concept_groups: list[list[str]] = []
+        grouped: set[str] = set()
+        for kw in base_keywords:
+            if kw in grouped:
+                continue
+            members = [kw] + [a for a in self._expand_keywords_with_aliases([kw])[1:] if a not in grouped]
+            grouped.update(members)
+            concept_groups.append(members)
+        multi_kw = len(keywords) > 1
+
         scores: dict[str, float] = {}
         for rel_path, blob in self._blobs.items():
-            path_lower = rel_path.lower()
+            p_obj = Path(rel_path)
+            # Field split (BM25F-style): the filename stem is the "title" field of a code
+            # file and carries far stronger topical evidence than directory names.
+            stem_low = p_obj.stem.lower()
+            stem_tokens = set(_tokenize_symbol(p_obj.stem)) | {stem_low}
+            dir_lower = "/".join(p_obj.parts[:-1]).lower()
             defns = self._defn_sets.get(rel_path, set())
             z_writes = self._z_write_sets.get(rel_path, set())
-            c4d_toks = self._cell_4d_tokens.get(rel_path, set())
             tokens = self._token_sets.get(rel_path, set())
             score = 0.0
-            for kw in keywords:
-                # Prefer exact token match (avoids "id" matching "middleware"),
-                # fall back to substring only for longer keywords (>= 4 chars)
-                matched_token = kw in tokens
-                matched_sub = len(kw) >= 4 and kw in blob
-                if matched_token or matched_sub:
-                    # Use gentle IDF scaling when multiple keywords exist so rare terms
-                    # win ties without breaking single-keyword exact score ratios
-                    idf_weight = 1.0 if len(keywords) == 1 else (0.7 + 0.3 * self._idf.get(kw, 1.0))
+            for members in concept_groups:
+                best = 0.0
+                for kw in members:
+                    # Prefer exact token match (avoids "id" matching "middleware"),
+                    # fall back to substring only for longer keywords (>= 4 chars)
+                    matched_token = kw in tokens
+                    matched_sub = len(kw) >= 4 and kw in blob
+                    in_stem = kw in stem_tokens or (len(kw) >= 4 and kw in stem_low)
+                    if not (matched_token or matched_sub or in_stem):
+                        continue
+                    # Gentle IDF scaling when multiple keywords exist so rare terms win ties
+                    idf_weight = (0.7 + 0.3 * self._idf.get(kw, 1.0)) if multi_kw else 1.0
                     if kw in defns:
                         base_hit = 2.0
                     elif kw in z_writes:
                         base_hit = 1.5
                     elif matched_token:
                         base_hit = 1.0
-                    else:
+                    elif matched_sub:
                         base_hit = 0.6
-                    score += base_hit * idf_weight
-                    if kw in path_lower:
-                        score += 0.5 * idf_weight
+                    else:
+                        base_hit = 0.0
+                    field_bonus = 1.5 if in_stem else (0.5 if kw in dir_lower else 0.0)
+                    best = max(best, (base_hit + field_bonus) * idf_weight)
+                score += best
 
             if score > 0:
                 score *= _path_multiplier(rel_path)
 
+                # Centrality is a query-independent prior: it should break ties, not
+                # dominate relevance. Log-damped so a hub imported by dozens of files is
+                # not doubled on every query merely for being widely imported.
                 importer_count = self._importer_counts.get(rel_path, 0)
                 if importer_count:
-                    score *= 1.0 + 0.2 * min(importer_count, 5)
+                    score *= 1.0 + 0.06 * math.log2(1 + importer_count)
 
                 score = self._apply_intent_boost(
                     score, rel_path, intent, keywords,
