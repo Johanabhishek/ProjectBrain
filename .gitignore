@@ -1,5 +1,6 @@
+# Python build & bytecode artifacts
 __pycache__/
-*.pyc
+*.py[cod]
 *.egg-info/
 build/
 dist/
@@ -9,33 +10,29 @@ dist/
 .env.*
 .pypirc
 
-# ProjectBrain regenerable cache/index artifacts
+# Pytest & Tooling Caches
+.pytest_cache/
+.pytest-tmp/
+.pytest-v2/
+.pytest-patcher/
+projectbrain/.pytest_cache/
+projectbrain/.pytest-tmp/
+projectbrain/.pytest-v2/
+projectbrain/.pytest-patcher/
+
+# ProjectBrain local index, session, and IDE config artifacts
+*.projectbrain.db*
+.projectbrain.db*
 .projectbrain.json
 .projectbrain_graph.json
 .projectbrain_session.json
 .projectbrain_ledger.json
+.projectbrain_memory.json
 .projectbrain_dossier.md
 .projectbrain_patch.diff
-
-.pytest-tmp/
-.pytest-v2/
-projectbrain/.pytest-v2/
-*.projectbrain.db
-.projectbrain.db
-Dasari_Johan_Abhishek_Resume.md
-Brain notes 1.md
-FUTURE_ROADMAP.md
-projectbrain_recommendations.md
-projectbrain/AGENT_CONTEXT_RUNTIME.md
 .agents/
-
-Dasari_Johan_Abhishek_Resume.html
-Dasari_Johan_Abhishek_Resume.pdf
-ARCHITECTURE_AND_SETUP.md
-projectbrain-prompt.md
-projectbrain/PROJECTBRAIN_NOTES.md
-projectbrain/.pytest-patcher/
-projectbrain/.pytest-tmp/
-projectbrain/.projectbrain.db
-projectbrain/.projectbrain.db-shm
-projectbrain/.projectbrain.db-wal
+.mcp.json
+projectbrain/.agents/
+projectbrain/.mcp.json
+projectbrain/.projectbrain_memory.json
+projectbrain/publish.bat

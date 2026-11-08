@@ -1,5 +1,6 @@
+# Python build & bytecode artifacts
 __pycache__/
-*.pyc
+*.py[cod]
 *.egg-info/
 build/
 dist/
@@ -9,10 +10,22 @@ dist/
 .env.*
 .pypirc
 
-# ProjectBrain cache
+# Pytest & Tooling Caches
+.pytest_cache/
+.pytest-tmp/
+.pytest-v2/
+.pytest-patcher/
+
+# ProjectBrain local index, session, and IDE config artifacts
+*.projectbrain.db*
+.projectbrain.db*
 .projectbrain.json
 .projectbrain_graph.json
 .projectbrain_session.json
 .projectbrain_ledger.json
+.projectbrain_memory.json
 .projectbrain_dossier.md
 .projectbrain_patch.diff
+.agents/
+.mcp.json
+publish.bat
