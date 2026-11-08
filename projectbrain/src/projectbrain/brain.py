@@ -2050,9 +2050,123 @@ class ProjectBrain:
           - A file range: `"src/brain.py:100-150"`
           - A file path (returns its signature skeleton): `"src/brain.py"`
         """
-        self._ensure_fresh()
         if isinstance(targets, (str, Path)):
             targets = [str(targets)]
+
+        # Fast cold-start SQLite path: slice directly from `.projectbrain.db` in <5ms
+        # without loading the entire repository index/graph into memory.
+        if (
+            not self._index
+            and self._db_store.db_path.exists()
+            and not self._cache_path.exists()
+            and self._db_store.is_compatible_meta(SCHEMA_VERSION, PARSER_VERSION, GRAPH_VERSION)
+        ):
+            fast_slices: list[dict] = []
+            fast_ok = True
+            for raw_target in targets:
+                t = raw_target.strip()
+                if not t:
+                    continue
+                range_m = re.match(r"^(.+?):(\d+)-(\d+)$", t)
+                if range_m:
+                    fpath, s_line, e_line = range_m.group(1), int(range_m.group(2)), int(range_m.group(3))
+                    f_hit = self._db_store.get_file_fast(self._normalize_rel(fpath) or fpath)
+                    if not f_hit:
+                        fast_ok = False
+                        break
+                    rel = f_hit["rel_path"]
+                    disk_p = self.root / rel
+                    if not disk_p.exists() or disk_p.stat().st_mtime != f_hit["mtime"]:
+                        fast_ok = False
+                        break
+                    f_lines = disk_p.read_text(encoding="utf-8", errors="replace").splitlines()
+                    s_line, e_line = snap_to_block_boundaries(f_lines, s_line, e_line)
+                    span_len = max_lines_per_symbol if summary_mode else max(max_lines_per_symbol, min(400, e_line - s_line + 1))
+                    code = slice_lines(self.root, rel, s_line, e_line, max_lines=span_len)
+                    self._ledger.commit_slice_intervals(rel, extract_emitted_intervals(code))
+                    fast_slices.append({
+                        "target": t,
+                        "rel_path": rel,
+                        "symbol": f"L{s_line}-{e_line}",
+                        "name": f"L{s_line}-{e_line}",
+                        "lines": f"L{s_line}-{e_line}",
+                        "line_start": s_line,
+                        "line_end": e_line,
+                        "code": code,
+                    })
+                    continue
+
+                if t.startswith("file:"):
+                    f_hit = self._db_store.get_file_fast(t[5:])
+                    if not f_hit:
+                        fast_ok = False
+                        break
+                    rel = f_hit["rel_path"]
+                    skel = build_file_skeleton(rel, f_hit["info"], root=self.root)
+                    fast_slices.append({"node_id": t, "rel_path": rel, "symbol": rel, "name": rel, "skeleton": skel, "code": skel})
+                    continue
+
+                rel_try = self._normalize_rel(t)
+                f_direct = self._db_store.get_file_fast(rel_try) if ("/" in t or "." in t) and ":" not in t else None
+                if f_direct and f_direct["rel_path"] == rel_try:
+                    disk_p = self.root / rel_try
+                    if not disk_p.exists() or disk_p.stat().st_mtime != f_direct["mtime"]:
+                        fast_ok = False
+                        break
+                    skel = build_file_skeleton(rel_try, f_direct["info"], root=self.root)
+                    self._served_skeletons.add(rel_try)
+                    fast_slices.append({"target": t, "rel_path": rel_try, "symbol": rel_try, "name": rel_try, "skeleton": skel, "code": skel})
+                    continue
+
+                file_filter = None
+                sym_query = t
+                if ":" in t and not t.startswith(("fn:", "cls:", "file:", "route:", "mod:")):
+                    parts = t.rsplit(":", 1)
+                    file_filter = parts[0].lower().replace("\\", "/")
+                    sym_query = parts[1]
+
+                sym_hits = self._db_store.find_symbols_fast(sym_query, file_filter=file_filter)
+                if not sym_hits:
+                    fast_ok = False
+                    break
+                for sh in sym_hits:
+                    rel = sh["rel_path"]
+                    disk_p = self.root / rel
+                    if not disk_p.exists() or (sh["mtime"] is not None and disk_p.stat().st_mtime != sh["mtime"]):
+                        fast_ok = False
+                        break
+                    l_start, l_end = sh["line_start"], sh["line_end"]
+                    code = slice_lines(self.root, rel, l_start, l_end, max_lines=max_lines_per_symbol)
+                    self._ledger.commit_slice_intervals(rel, extract_emitted_intervals(code))
+                    self._served_slices.add(sh["node_id"])
+                    fast_slices.append({
+                        "node_id": sh["node_id"],
+                        "rel_path": rel,
+                        "symbol": sh["qname"],
+                        "name": sh["qname"],
+                        "signature": sh["signature"],
+                        "lines": f"L{l_start}-{l_end}",
+                        "line_start": l_start,
+                        "line_end": l_end,
+                        "code": code,
+                    })
+                if not fast_ok:
+                    break
+
+            if fast_ok and fast_slices:
+                total_slice_chars = sum(len(s.get("code") or s.get("skeleton") or "") for s in fast_slices)
+                if total_slice_chars > 0:
+                    s_files = {s.get("rel_path") for s in fast_slices if s.get("rel_path")}
+                    self._ledger.record_input_op(
+                        op="slice",
+                        query=", ".join(targets)[:120],
+                        files_covered=len(s_files),
+                        touched_files=s_files,
+                        slices_included=len(fast_slices),
+                    )
+                return {"slices": fast_slices, "count": len(fast_slices)}
+
+        self._ensure_fresh()
         slices: list[dict] = []
 
         for raw_target in targets:
@@ -3042,15 +3156,46 @@ class ProjectBrain:
 
     def index(self) -> dict:
         """Parse all Python and JS/TS files under root and cache the result."""
+        import time as _time
+
+        if not self._index and self._db_store.db_path.exists() and not self._cache_path.exists():
+            self.load()
+
+        prev_index = dict(self._index)
+        prev_sizes = dict(self._sizes)
+        prev_skipped = dict(self._skipped)
+        prev_graph = self._graph
+
         self._index = {}
         self._sizes = {}
         self._skipped = {}
         self._source_cache.clear()
 
+        now_ts = _time.time()
+        any_changed = False
+
         for path in self._walk():
             rel = str(path.relative_to(self.root)).replace("\\", "/")
             ext = path.suffix.lower()
 
+            try:
+                st = path.stat()
+            except OSError as e:
+                self._skipped[rel] = f"read_error:{e.__class__.__name__}"
+                if prev_skipped.get(rel) != self._skipped[rel]:
+                    any_changed = True
+                continue
+
+            is_settled = (now_ts - st.st_mtime) > 2.0
+            if is_settled and rel in prev_index and st.st_mtime == prev_index[rel].get("mtime") and st.st_size == prev_sizes.get(rel):
+                self._index[rel] = prev_index[rel]
+                self._sizes[rel] = st.st_size
+                continue
+            if is_settled and rel in prev_skipped:
+                self._skipped[rel] = prev_skipped[rel]
+                continue
+
+            any_changed = True
             try:
                 source = path.read_text(encoding="utf-8", errors="ignore")
             except OSError as e:
@@ -3061,13 +3206,27 @@ class ProjectBrain:
                 self._skipped[rel] = "minified_or_generated"
                 continue
 
-            st = path.stat()
             info, ts_tree = parse_with_tree(source, ext)
             info.setdefault("routes", []).extend(frameworks.infer_file_based_routes(rel, info))
             info["cells_4d"] = extract_4d_coordinate_matrix(source.splitlines(), ext=ext, tree=ts_tree)
             info["mtime"] = st.st_mtime
             self._index[rel] = info
             self._sizes[rel] = st.st_size
+
+        if (
+            not any_changed
+            and prev_index
+            and set(self._index.keys()) == set(prev_index.keys())
+            and set(self._skipped.keys()) == set(prev_skipped.keys())
+            and prev_graph is not None
+            and self._db_store.db_path.exists()
+            and not self._cache_path.exists()
+        ):
+            self._graph = prev_graph
+            if not self._blobs:
+                self._build_blobs()
+                self._sync_interprocedural_effects()
+            return self.stats()
 
         self._build_blobs()
         self._graph = CodeGraph.build(
@@ -3086,7 +3245,7 @@ class ProjectBrain:
             self._index,
             self._sizes,
             self._skipped,
-            graph_json=self._graph.to_json(),
+            graph_json=self._graph.to_dict(),
         )
         for legacy in (self._cache_path, self._graph_path):
             if legacy.exists():
@@ -3397,9 +3556,10 @@ class ProjectBrain:
         }
         if not current and self._index and self._db_store.db_path.exists():
             return False
-        if current.keys() != self._index.keys():
+        known_keys = set(self._index.keys()) | set(self._skipped.keys())
+        if current.keys() != known_keys:
             return True
-        return any(current[rel] != self._index[rel].get("mtime") for rel in current)
+        return any(current[rel] != self._index[rel].get("mtime") for rel in self._index if rel in current)
 
     def incremental_index(self) -> dict:
         """Re-parse only changed files instead of a full re-index."""
@@ -3411,12 +3571,12 @@ class ProjectBrain:
             rel = str(path.relative_to(self.root)).replace("\\", "/")
             current_files[rel] = path
 
-        old_keys = set(self._index.keys())
+        old_keys = set(self._index.keys()) | set(self._skipped.keys())
         new_keys = set(current_files.keys())
 
         added = new_keys - old_keys
         deleted = old_keys - new_keys
-        potentially_modified = old_keys & new_keys
+        potentially_modified = set(self._index.keys()) & new_keys
 
         modified: set[str] = set()
         for rel in potentially_modified:
@@ -3435,35 +3595,46 @@ class ProjectBrain:
                 "total_files": len(self._index),
             }
 
+        deleted_indexed: set[str] = set()
         for rel in deleted:
+            if rel in self._index:
+                deleted_indexed.add(rel)
             self._index.pop(rel, None)
             self._sizes.pop(rel, None)
             self._skipped.pop(rel, None)
             self._source_cache.pop(rel, None)
             self._ledger.invalidate_file(rel)
 
-        all_interfaces_unchanged = bool(modified and not added and not deleted)
+        all_interfaces_unchanged = bool(modified and not added and not deleted_indexed)
+        indexed_added = 0
+        indexed_modified = 0
         for rel in added | modified:
             path = current_files[rel]
             ext = path.suffix.lower()
             self._source_cache.pop(rel, None)
             self._ledger.invalidate_file(rel)
+            was_in_index = rel in self._index
             old_iface_hash = (self._index.get(rel) or {}).get("interface_hash")
 
             try:
                 source = path.read_text(encoding="utf-8", errors="ignore")
             except OSError as e:
                 self._skipped[rel] = f"read_error:{e.__class__.__name__}"
-                self._index.pop(rel, None)
+                if was_in_index:
+                    self._index.pop(rel, None)
+                    deleted_indexed.add(rel)
                 all_interfaces_unchanged = False
                 continue
 
             if _is_minified(source):
                 self._skipped[rel] = "minified_or_generated"
-                self._index.pop(rel, None)
+                if was_in_index:
+                    self._index.pop(rel, None)
+                    deleted_indexed.add(rel)
                 all_interfaces_unchanged = False
                 continue
 
+            self._skipped.pop(rel, None)
             st = path.stat()
             info, ts_tree = parse_with_tree(source, ext)
             info.setdefault("routes", []).extend(frameworks.infer_file_based_routes(rel, info))
@@ -3473,10 +3644,24 @@ class ProjectBrain:
                 all_interfaces_unchanged = False
             self._index[rel] = info
             self._sizes[rel] = st.st_size
+            if was_in_index:
+                indexed_modified += 1
+            else:
+                indexed_added += 1
             # Invalidate served session cache for modified files
             self._served_skeletons.discard(rel)
             self._served_slices = {
                 s for s in self._served_slices if f":{rel}:" not in s
+            }
+
+        # If newly added files were all skipped (minified/vendored) and no indexed file changed,
+        # persist the updated skipped table without rebuilding blobs or the graph.
+        if indexed_added == 0 and indexed_modified == 0 and not deleted_indexed:
+            self._db_store.update_skipped_only(self._skipped)
+            return {
+                "status": "up_to_date",
+                "added": 0, "modified": 0, "deleted": 0,
+                "total_files": len(self._index),
             }
 
         self._build_blobs()
@@ -3495,9 +3680,9 @@ class ProjectBrain:
             },
             {r: self._index[r] for r in (added | modified) if r in self._index},
             self._sizes,
-            deleted,
+            deleted_indexed,
             self._skipped,
-            graph_json=self._graph.to_json(),
+            graph_json=None if all_interfaces_unchanged else self._graph.to_dict(),
         )
         for legacy in (self._cache_path, self._graph_path):
             if legacy.exists():
@@ -3505,9 +3690,9 @@ class ProjectBrain:
 
         return {
             "status": "incremental_update",
-            "added": len(added),
-            "modified": len(modified),
-            "deleted": len(deleted),
+            "added": indexed_added,
+            "modified": indexed_modified,
+            "deleted": len(deleted_indexed),
             "total_files": len(self._index),
             "salsa_early_cutoff": all_interfaces_unchanged,
         }

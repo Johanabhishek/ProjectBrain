@@ -260,6 +260,7 @@ class SQLiteIndexStore:
                 symbol_rows = []
                 fts_rows = []
                 blob_rows = []
+                store_blobs = len(index) <= 400
                 for rel, info in index.items():
                     mtime = float(info.get("mtime") or 0.0)
                     size = int(sizes.get(rel) or 0)
@@ -269,9 +270,10 @@ class SQLiteIndexStore:
                     s_r, f_r = self._extract_symbol_and_fts_rows(rel, info)
                     symbol_rows.extend(s_r)
                     fts_rows.extend(f_r)
-                    b_row = self._read_source_for_blob(rel, info)
-                    if b_row is not None:
-                        blob_rows.append(b_row)
+                    if store_blobs:
+                        b_row = self._read_source_for_blob(rel, info)
+                        if b_row is not None:
+                            blob_rows.append(b_row)
 
                 conn.executemany(
                     "INSERT INTO files (rel_path, mtime, size, interface_hash, info_json) VALUES (?, ?, ?, ?, ?);",
@@ -589,7 +591,7 @@ class SQLiteIndexStore:
             return None
 
     def get_symbol_slice_from_graph(self, node_id_or_name: str) -> dict | None:
-        """Pure Graph-as-Storage symbol slicer: joins `symbols` + `source_blobs` inside SQLite with zero disk reads."""
+        """Pure Graph-as-Storage symbol slicer: joins `symbols` + `source_blobs` (or disk fallback)."""
         if not self.db_path.exists():
             return None
         try:
@@ -600,7 +602,7 @@ class SQLiteIndexStore:
                     SELECT s.node_id, s.rel_path, s.kind, s.name, s.line_start, s.line_end,
                            s.signature, s.interface_hash, s.body_hash, b.source_text
                     FROM symbols s
-                    JOIN source_blobs b ON b.rel_path = s.rel_path
+                    LEFT JOIN source_blobs b ON b.rel_path = s.rel_path
                     WHERE s.node_id = ? OR s.name = ?
                     ORDER BY CASE WHEN s.node_id = ? THEN 0 ELSE 1 END
                     LIMIT 1;
@@ -610,6 +612,11 @@ class SQLiteIndexStore:
                 if not row:
                     return None
                 nid, rel_path, kind, name, l_start, l_end, sig, if_h, b_h, src_txt = row
+                if src_txt is None:
+                    fpath = self.root / rel_path
+                    if not fpath.exists():
+                        return None
+                    src_txt = fpath.read_text(encoding="utf-8", errors="replace")
                 src_lines = str(src_txt).splitlines()
                 s_idx = max(int(l_start) - 1, 0)
                 e_idx = min(int(l_end), len(src_lines))
@@ -628,7 +635,130 @@ class SQLiteIndexStore:
                 }
             finally:
                 conn.close()
+        except (sqlite3.Error, OSError):
+            return None
+
+    def update_skipped_only(self, skipped: dict[str, str]) -> None:
+        """Update only the `skipped` table in SQLite without touching files or graph tables."""
+        if not self.db_path.exists():
+            return
+        conn = self._connect()
+        try:
+            with conn:
+                conn.execute("DELETE FROM skipped;")
+                if skipped:
+                    conn.executemany(
+                        "INSERT INTO skipped (rel_path, reason) VALUES (?, ?);",
+                        list(skipped.items()),
+                    )
         except sqlite3.Error:
+            pass
+        finally:
+            conn.close()
+
+    def is_compatible_meta(self, schema_version: int, parser_version: str, graph_version: str) -> bool:
+        """Fast <1ms check that `.projectbrain.db` matches current schema/parser/graph versions."""
+        if not self.db_path.exists():
+            return False
+        try:
+            conn = self._connect()
+            try:
+                rows = dict(conn.execute("SELECT key, value FROM meta;").fetchall())
+                if not rows:
+                    return False
+                return (
+                    json.loads(rows.get("schema_version", "0")) == schema_version
+                    and json.loads(rows.get("parser_version", '""')) == parser_version
+                    and json.loads(rows.get("graph_version", '""')) == graph_version
+                )
+            finally:
+                conn.close()
+        except Exception:
+            return False
+
+    def find_symbols_fast(self, sym_query: str, file_filter: str | None = None) -> list[dict]:
+        """Fast indexed SQLite lookup for `slice_symbols` without loading the entire repo graph."""
+        if not self.db_path.exists():
+            return []
+        q_low = sym_query.strip().lower()
+        base_name = q_low.split(".")[-1]
+        ff_low = file_filter.lower().replace("\\", "/") if file_filter else None
+        try:
+            conn = self._connect()
+            try:
+                if sym_query.startswith(("fn:", "cls:")):
+                    rows = conn.execute(
+                        """
+                        SELECT s.node_id, s.rel_path, s.kind, s.name, s.line_start, s.line_end, s.signature, f.mtime
+                        FROM symbols s
+                        LEFT JOIN files f ON f.rel_path = s.rel_path
+                        WHERE s.node_id = ?;
+                        """,
+                        (sym_query,),
+                    ).fetchall()
+                else:
+                    rows = conn.execute(
+                        """
+                        SELECT s.node_id, s.rel_path, s.kind, s.name, s.line_start, s.line_end, s.signature, f.mtime
+                        FROM symbols s
+                        LEFT JOIN files f ON f.rel_path = s.rel_path
+                        WHERE LOWER(s.name) = ? OR LOWER(s.node_id) LIKE ?;
+                        """,
+                        (base_name, f"%:{q_low}"),
+                    ).fetchall()
+                out: list[dict] = []
+                for nid, rel, kind, name, l_s, l_e, sig, mtime in rows:
+                    if ff_low and ff_low not in rel.lower():
+                        continue
+                    qname = nid.split(":", 2)[2] if nid.count(":") >= 2 else name
+                    if sym_query.startswith(("fn:", "cls:")) or q_low in (name.lower(), qname.lower()):
+                        out.append({
+                            "node_id": nid,
+                            "rel_path": rel,
+                            "kind": kind,
+                            "name": name,
+                            "qname": qname,
+                            "line_start": int(l_s),
+                            "line_end": int(l_e),
+                            "signature": sig,
+                            "mtime": mtime,
+                        })
+                return out
+            finally:
+                conn.close()
+        except sqlite3.Error:
+            return []
+
+    def get_file_fast(self, rel_or_suffix: str) -> dict | None:
+        """Fast <1ms single-file lookup in SQLite `files` table."""
+        if not self.db_path.exists():
+            return None
+        norm = rel_or_suffix.replace("\\", "/").strip("/")
+        norm_low = norm.lower()
+        try:
+            conn = self._connect()
+            try:
+                row = conn.execute(
+                    "SELECT rel_path, mtime, info_json FROM files WHERE rel_path = ?;",
+                    (norm,),
+                ).fetchone()
+                if not row:
+                    cands = conn.execute(
+                        "SELECT rel_path, mtime, info_json FROM files WHERE LOWER(rel_path) = ? OR LOWER(rel_path) LIKE ?;",
+                        (norm_low, f"%/{norm_low}"),
+                    ).fetchall()
+                    if cands:
+                        row = min(cands, key=lambda r: (len(r[0].split("/")), len(r[0])))
+                if not row:
+                    return None
+                return {
+                    "rel_path": row[0],
+                    "mtime": row[1],
+                    "info": json.loads(row[2]),
+                }
+            finally:
+                conn.close()
+        except (sqlite3.Error, json.JSONDecodeError):
             return None
 
     def load_all(self) -> dict | None:

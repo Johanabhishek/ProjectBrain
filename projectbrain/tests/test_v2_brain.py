@@ -322,3 +322,42 @@ def test_flask_methods_tuple_and_secret_key_state_slicing(tmp_path):
     assert "tests/test_basic.py" not in dossier_md
     assert "CONTRACT WARNING" not in dossier_md
 
+
+def test_skipped_minified_js_files_do_not_trigger_perpetual_rebuild_and_fast_cold_slice(tmp_path):
+    """Regression test for I-02 (Django 60 vendored .js files bug) and I-03 (fast cold-start SQLite slice)."""
+    (tmp_path / "django" / "db" / "models" / "sql").mkdir(parents=True)
+    (tmp_path / "django" / "contrib" / "admin" / "static").mkdir(parents=True)
+
+    query_py = tmp_path / "django" / "db" / "models" / "sql" / "query.py"
+    query_py.write_text(
+        "class Query:\n"
+        "    def build_filter(self, filter_expr, branch_negated=False):\n"
+        "        arg, value = filter_expr\n"
+        "        return (arg, value, branch_negated)\n",
+        encoding="utf-8",
+    )
+
+    # Create a vendored minified JS file (>500 chars on a single line) that _is_minified skips
+    vendored_js = tmp_path / "django" / "contrib" / "admin" / "static" / "jquery.js"
+    vendored_js.write_text("var a=1;" * 150 + "\n", encoding="utf-8")
+
+    b = ProjectBrain(tmp_path)
+    b.index()
+    assert "django/contrib/admin/static/jquery.js" in b._skipped
+
+    # I-02 check: is_stale() must be False, and incremental_index() must return 'up_to_date' with added=0
+    assert b.is_stale() is False
+    inc = b.incremental_index()
+    assert inc["status"] == "up_to_date"
+    assert inc["added"] == 0
+
+    # I-03 check: A cold ProjectBrain instance must slice `Query.build_filter` directly from SQLite
+    # without loading `_index` into memory!
+    b_cold = ProjectBrain(tmp_path)
+    assert not b_cold._index
+    res = b_cold.slice_symbols("Query.build_filter")
+    assert res["count"] == 1
+    assert "def build_filter" in res["slices"][0]["code"]
+    assert not b_cold._index, "Fast cold-start SQLite slice should not load the full repo _index into memory"
+
+

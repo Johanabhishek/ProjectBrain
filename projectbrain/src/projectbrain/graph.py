@@ -74,9 +74,12 @@ class CodeGraph:
         import_targets = import_targets or {}
         symbol_imports = symbol_imports or {}
         registry: dict[str, list[str]] = {}  # name → [node_id, ...]
+        by_file_name: dict[tuple[str, str], list[str]] = {}  # (rel_path, name) → [node_id, ...]
 
-        def _reg(name: str, node_id: str) -> None:
+        def _reg(name: str, node_id: str, rpath: str = "") -> None:
             registry.setdefault(name, []).append(node_id)
+            if rpath:
+                by_file_name.setdefault((rpath, name), []).append(node_id)
 
         # ── Pass 1: nodes ────────────────────────────────────────────────────
         for rel_path, info in index.items():
@@ -99,9 +102,9 @@ class CodeGraph:
                     "arity_spec": fn.get("arity_spec"),
                     "ast_hash": fn.get("ast_hash", ""),
                 }
-                _reg(fn["name"], nid)
+                _reg(fn["name"], nid, rel_path)
                 if parent:
-                    _reg(f"{parent}.{fn['name']}", nid)
+                    _reg(f"{parent}.{fn['name']}", nid, rel_path)
 
             for c in info.get("classes", []):
                 nid = cls_id(rel_path, c["name"])
@@ -116,7 +119,7 @@ class CodeGraph:
                     "interface_hash": c.get("interface_hash", ""),
                     "ast_hash": c.get("ast_hash", ""),
                 }
-                _reg(c["name"], nid)
+                _reg(c["name"], nid, rel_path)
 
             for r in info.get("routes", []):
                 nid = route_id(r["method"], r["path"])
@@ -209,57 +212,63 @@ class CodeGraph:
                             )
                             added_call_dsts.add(cand)
 
-                # 2. Resolve bare/remaining calls
+                # 2. Resolve bare/remaining calls in O(1) same-file + O(|imports|) cross-file time
                 call_sites_all = fn.get("call_sites_all", {})
                 for callee_name in fn.get("calls", []):
+                    all_cands = registry.get(callee_name)
+                    if not all_cands:
+                        continue
                     line = call_sites.get(callee_name)
                     all_lines = call_sites_all.get(callee_name)
-                    candidates = [c for c in registry.get(callee_name, []) if c != nid]
-                    if not candidates:
-                        continue
 
-                    same_file = [
-                        cand for cand in candidates
-                        if g.nodes.get(cand, {}).get("rel_path") == rel_path
-                    ]
-                    cross_file = [
-                        cand for cand in candidates
-                        if g.nodes.get(cand, {}).get("rel_path") != rel_path
-                    ]
-
-                    for cand in same_file:
-                        if cand not in added_call_dsts:
+                    for cand in by_file_name.get((rel_path, callee_name), ()):
+                        if cand != nid and cand not in added_call_dsts:
                             g._add_edge(nid, cand, "calls", "exact", "same-file function call", line=line, lines=all_lines)
                             added_call_dsts.add(cand)
 
-                    cross_file.sort(
-                        key=lambda c: (
-                            0
-                            if (
-                                g.nodes.get(c, {}).get("rel_path") in file_imports
-                                or file_sym_map.get(callee_name) == g.nodes.get(c, {}).get("rel_path")
-                            )
-                            else 1
-                        )
-                    )
-                    for cand in cross_file[:2]:
+                    imp_cands: list[str] = []
+                    sym_imp_rel = file_sym_map.get(callee_name)
+                    if sym_imp_rel and sym_imp_rel != rel_path:
+                        for c_imp in by_file_name.get((sym_imp_rel, callee_name), ()):
+                            if c_imp != nid and c_imp not in imp_cands:
+                                imp_cands.append(c_imp)
+                    for imp_rel in file_imports:
+                        if imp_rel != rel_path and imp_rel != sym_imp_rel:
+                            for c_imp in by_file_name.get((imp_rel, callee_name), ()):
+                                if c_imp != nid and c_imp not in imp_cands:
+                                    imp_cands.append(c_imp)
+
+                    cross_added = 0
+                    for cand in imp_cands[:2]:
                         if cand in added_call_dsts:
                             continue
                         cand_rel_path = g.nodes.get(cand, {}).get("rel_path")
-                        if cand_rel_path in file_imports or file_sym_map.get(callee_name) == cand_rel_path:
-                            g._add_edge(
-                                nid, cand, "calls", "import_resolved",
-                                f"'{callee_name}' resolved via import from {cand_rel_path}",
-                                line=line, lines=all_lines,
-                            )
-                        else:
+                        g._add_edge(
+                            nid, cand, "calls", "import_resolved",
+                            f"'{callee_name}' resolved via import from {cand_rel_path}",
+                            line=line, lines=all_lines,
+                        )
+                        added_call_dsts.add(cand)
+                        cross_added += 1
+
+                    if cross_added < 2 and len(all_cands) <= 12:
+                        num_other = sum(1 for c0 in all_cands if c0 != nid)
+                        for cand in all_cands:
+                            if cross_added >= 2:
+                                break
+                            if cand == nid or cand in added_call_dsts:
+                                continue
+                            cand_rel_path = g.nodes.get(cand, {}).get("rel_path")
+                            if cand_rel_path == rel_path:
+                                continue
                             g._add_edge(
                                 nid, cand, "calls", "candidate",
-                                f"'{callee_name}' matches {len(candidates)} symbol(s) by "
+                                f"'{callee_name}' matches {num_other} symbol(s) by "
                                 "name; target ambiguous without import resolution",
                                 line=line, lines=all_lines,
                             )
-                        added_call_dsts.add(cand)
+                            added_call_dsts.add(cand)
+                            cross_added += 1
                 # 3. Connect lexically nested helper/callback functions (e.g., on_file_headers inside upload_file)
                 fn_s = fn.get("line_start", 0)
                 fn_e = fn.get("line_end", 0)
@@ -431,7 +440,7 @@ class CodeGraph:
 
             q: deque[tuple[str, int, list[str]]] = deque([(nid, 0, [])])
             visited_callees: set[str] = {nid}
-            while q:
+            while q and len(visited_callees) <= 24:
                 curr_id, hop, chain = q.popleft()
                 if hop >= 3:
                     continue
@@ -450,20 +459,24 @@ class CodeGraph:
                     via_label = f"via {' -> '.join(nxt_chain)} ({nxt_hop} hop{'s' if nxt_hop > 1 else ''})"
 
                     for zw in callee_nd.get("local_z_write", []):
-                        if zw not in own_zw and zw not in trans_zw:
+                        if len(trans_zw) < 12 and zw not in own_zw and zw not in trans_zw:
                             trans_zw.append(zw)
-                            provenance[f"ΔZ:{zw}"] = via_label
-                            provenance[f"?Z:{zw}"] = via_label
+                            if len(provenance) < 24:
+                                provenance[f"ΔZ:{zw}"] = via_label
+                                provenance[f"?Z:{zw}"] = via_label
                     for eff in callee_nd.get("local_effects", []):
                         if eff not in trans_eff:
                             trans_eff.append(eff)
-                            provenance.setdefault(f"effect:{eff}", via_label)
+                            if len(provenance) < 16:
+                                provenance.setdefault(f"effect:{eff}", via_label)
                     for ex in callee_nd.get("exit_contracts", []):
-                        if ex.startswith(("throw:", "status:", "err:")) and ex not in own_exits and ex not in trans_exits:
+                        if len(trans_exits) < 12 and ex.startswith(("throw:", "status:", "err:")) and ex not in own_exits and ex not in trans_exits:
                             trans_exits.append(ex)
-                            provenance[ex] = via_label
+                            if len(provenance) < 16:
+                                provenance[ex] = via_label
 
-                    q.append((callee_id, nxt_hop, nxt_chain))
+                    if len(visited_callees) <= 24:
+                        q.append((callee_id, nxt_hop, nxt_chain))
 
             if trans_zw:
                 nd["transitive_z_write"] = trans_zw[:12]
@@ -489,9 +502,11 @@ class CodeGraph:
 
         added_multiplex_edges = 0
         seen_state_pairs: set[tuple[str, str, str]] = set()
+        max_w = 8 if len(self.nodes) > 800 else 18
+        max_r = 12 if len(self.nodes) > 800 else 25
         for k, writers in writers_by_key.items():
             readers = readers_by_key.get(k, [])
-            if not readers or len(writers) > 18 or len(readers) > 25:
+            if not readers or len(writers) > max_w or len(readers) > max_r:
                 continue
             for w_id in writers:
                 for r_id in readers:
@@ -923,8 +938,11 @@ class CodeGraph:
 
     # ── serialization ────────────────────────────────────────────────────────
 
+    def to_dict(self) -> dict:
+        return {"nodes": self.nodes, "edges": self.edges}
+
     def to_json(self) -> str:
-        return json.dumps({"nodes": self.nodes, "edges": self.edges}, indent=2)
+        return json.dumps({"nodes": self.nodes, "edges": self.edges}, separators=(",", ":"))
 
     @classmethod
     def from_json(cls, text: str | dict) -> "CodeGraph":

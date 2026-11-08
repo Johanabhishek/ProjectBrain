@@ -1,52 +1,66 @@
-# ProjectBrain (`projectbrain-mcp` v0.8.5)
+# ProjectBrain (`projectbrain-mcp` v0.8.6)
 
 [![PyPI](https://img.shields.io/pypi/v/projectbrain-mcp.svg)](https://pypi.org/project/projectbrain-mcp/)
 [![License: MIT](https://img.shields.io/badge/License: MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-**For a real bug or refactor, ProjectBrain gives your coding agent the exact symbols, callers, and dependencies it needs in 1 turn—with fewer wrong files and 77–89% fewer tokens.**
+**Local SQLite Code Graph, Program Slicer, and Syntax-Verified Symbol Patcher for AI Coding Agents.**
 
-Instead of forcing AI coding agents to explore repositories by running dozens of `rg`/`grep` searches and reading entire files line-by-line, ProjectBrain indexes your codebase locally into a **SQLite WAL Code Graph (`.projectbrain.db`)** using `tree-sitter` and structural parsers. No external database daemon, no Docker, no cloud vector embeddings, and no API keys required.
+ProjectBrain indexes a repository locally into `.projectbrain.db` (SQLite WAL + FTS5) using `tree-sitter` and language AST parsers. It gives CLI and MCP coding agents four concrete primitives in a single dependency-light package—with no external database server, no Docker, no cloud embeddings, and no API keys:
 
-### What It Actually Does
-
-1. **One-Turn Code Dossiers (`projectbrain dossier` / `brain_dossier`):**
-   - Given a bug report, stack trace, or feature prompt, ProjectBrain ranks relevant symbols using sub-identifier BM25 + call/import/state-flow graph traversal, automatically bridges passive schema/DTO and class/module config declarations (`ConfigAttribute`, `ImmutableDict`, `SCREAMING_SNAKE_CASE` constants) to their executable consumers, and returns exact code slices plus 1-hop caller/callee signatures in a single read.
-2. **Multi-Dimensional Program Slicing (`projectbrain slice` / `brain_slice`):**
-   - Slices exact functions, classes, methods, or line ranges (`file.py:ClassName.method` or `file.py:120-160`) across multiple files in a single call. When slicing large functions around a target variable or call, computes an AST/PDG slice across three orthogonal dimensions: **backward data-dependence (`def -> use`)**, **forward data-dependence (`def -> use`)**, and **upward control-dependence guards (`if`/`try`/`for`/`with`)**, collapsing unrelated filler lines while preserving governing logic.
-3. **AST Symbol-Anchored Patching (`projectbrain patch` / `brain_patch`):**
-   - Applies surgical edits (`@replace_body <Symbol>`, `@add_method <ClassName>`, `@replace <Symbol>`, `@sub L<n>`) validated against Tree-sitter + language syntax compilers and caller arity contracts before touching disk, with automatic rollback on syntax errors.
-4. **`.gitignore`-Compliant Polyglot Indexing (29 File Extensions):**
-   - Honors root and nested `.gitignore` / `.git/info/exclude` rules automatically.
-   - Supports **Python, TypeScript, JavaScript, JSX/TSX, Vue, Svelte, Go, Rust, Java, Kotlin, Scala, C, C++, C#, Ruby, PHP, Swift, SQL, GraphQL, Prisma, and Protobuf**.
-5. **Safe Output & Traceback Compression (`projectbrain run` / `brain_run`):**
-   - Folds passing test noise (`pytest`, `jest`/`vitest`, `go test`, `cargo test`), deduplicates repetitive log lines, and maps stack-trace `file:line` frames directly to enclosing functions and 1-hop callers. Direct shell execution over MCP is disabled by default unless explicitly opted in via `PROJECTBRAIN_ALLOW_EXEC=1`.
+1. **Program & Symbol Slicing (`projectbrain slice` / `brain_slice`):**
+   - Slices exact functions, classes, methods, or line ranges (`file.py:ClassName.method` or `file.py:120-160`) directly from SQLite in `< 20ms` without loading full files into the context window.
+   - For large functions sliced around a target variable or call, computes an AST/Program Dependence Graph (PDG) slice across three orthogonal dimensions: **backward data dependence (`def -> use`)**, **forward data dependence (`def -> use`)**, and **enclosing control-flow guards (`if`/`try`/`for`/`with`)**, collapsing unrelated lines while keeping governing logic intact.
+2. **One-Turn Code Dossiers (`projectbrain dossier` / `brain_dossier`):**
+   - Given a bug report, stack trace, or architectural question, ranks relevant symbols using sub-identifier BM25 + call/import/state-flow graph traversal and returns target code slices plus 1-hop caller/callee signatures in a single read.
+3. **Syntax-Verified Symbol Patching (`projectbrain patch` / `brain_patch`):**
+   - Applies symbol-anchored edits (`@replace_body <Symbol>`, `@add_method <ClassName>`, `@replace <Symbol>`, `@sub <Symbol>`) validated against Tree-sitter + language syntax compilers and caller arity contracts before touching disk, with automatic rollback on syntax errors and zero-change dry runs.
+4. **Closed-World Structural Verification (`projectbrain verify` / `projectbrain_verify_claim`):**
+   - Verifies structural claims (`calls`, `reaches`, `imports`, `handles`) with explicit evidence provenance (`exact`, `import_resolved`, `candidate`) and refuses to guess (`UNKNOWN`) when any traversed file has a syntax error.
 
 ---
 
-## Quick Start (60 Seconds)
+## Language-Support Tiers
 
-### Step 1: Install
+ProjectBrain indexes 29 file extensions across three explicit capability tiers:
+
+| Tier | Languages / Formats | Capabilities |
+| :--- | :--- | :--- |
+| **Tier 1: Deep AST + PDG + Contracts** | **Python** (`.py`), **TypeScript / JavaScript** (`.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`) | Full Tree-sitter + Python `ast` parsing; intra-function PDG data/control-dependence slicing (`def -> use` + enclosing guards); cross-file relative import & `tsconfig` path-alias resolution; class/module config & descriptor tracking (`ConfigAttribute`, `Field`, `Column`, constants); route extraction (Flask, FastAPI, Django, Next.js, Express, Hono); caller arity & SQL schema contract checks. |
+| **Tier 2: Tree-sitter Structural + Call Graph** | **Go** (`.go`), **Rust** (`.rs`), **Java** (`.java`), **Kotlin** (`.kt`), **C / C++** (`.c`, `.h`, `.cpp`, `.hpp`), **C#** (`.cs`), **Ruby** (`.rb`), **PHP** (`.php`) | Structural symbol extraction (functions, methods, structs, classes, interfaces, traits); intra-file and cross-file call/import graph edges; signature skeletons; symbol & line-range slicing; syntax-verified symbol patching. |
+| **Tier 3: Schema, Query & Component Indexing** | **SQL** (`.sql`), **GraphQL** (`.graphql`, `.gql`), **Prisma** (`.prisma`), **Protobuf** (`.proto`), **Vue / Svelte** (`.vue`, `.svelte`), **Scala** (`.scala`), **Swift** (`.swift`) | DDL table/column/constraint extraction (`CREATE TABLE`, `NOT NULL`), schema-to-code linking, component script extraction, and symbol/line slicing. |
+
+---
+
+## When to Use ProjectBrain vs. Plain `grep`
+
+- **When plain `rg` / `grep` is faster:** Looking up a single literal string or constant when you already know the exact identifier name and just want matching line numbers.
+- **When ProjectBrain wins:**
+  - **Multi-hop call and dispatch questions** (e.g., *"how are exceptions routed to error handlers"* or *"trace POST /checkout to database validation"*), where following imports, base classes, and helper methods across files takes 10–30 turns of manual search/read loops.
+  - **Reading specific methods inside large files** (`projectbrain slice django/db/models/sql/query.py:Query.build_filter`) without dumping a 2,500-line file into the prompt.
+  - **Safe symbol-anchored patching** (`projectbrain patch --apply`) where line numbers have drifted or where syntax errors must be rejected before writing to disk.
+
+---
+
+## Quick Start
+
+### 1. Install
 
 ```bash
-pip install projectbrain-mcp
+pip install "projectbrain-mcp>=0.8.6"
 ```
 
-*(Or `pipx install projectbrain-mcp` / `uv tool install projectbrain-mcp`.)*
-
-### Step 2: Initialize Your Repository (Non-Destructive)
+### 2. Initialize a Repository (Minimal & Non-Destructive)
 
 ```bash
-projectbrain --path /path/to/your/repo init --hooks
+projectbrain --path /path/to/your/repo init
 ```
 
-**What `projectbrain init` does safely (`--ide auto` by default):**
-1. **Builds the SQLite Code Graph Index:** Writes `.projectbrain.db` (WAL mode), honoring `.gitignore`.
-2. **Updates `.gitignore`:** Appends ephemeral `.projectbrain*` cache patterns if not already present.
-3. **Writes Minimal Root Config by Default (`--ide auto`):** Creates `.mcp.json` and `AGENTS.md` at the repo root, and only touches `.cursor/`, `.vscode/`, or `.claude/` if those IDE directories already exist in your repo (pass `--ide all` to generate configs for all IDEs).
-4. **Appends Agent Rules Non-Destructively:** Uses `<!-- projectbrain:start --> ... <!-- projectbrain:end -->` section markers in `AGENTS.md`, `CLAUDE.md`, `.cursor/rules/projectbrain.mdc`, and deep-merges `.claude/settings.local.json` `PreToolUse` hooks so existing team instructions and settings are never overwritten.
+- **Honors `.gitignore`:** Automatically respects root and nested `.gitignore` and `.git/info/exclude` rules.
+- **Minimal Default Setup (`--ide auto`):** Creates `.projectbrain.db` (SQLite WAL), updates `.gitignore`, and writes `.mcp.json` and `AGENTS.md` at the repo root using non-destructive `<!-- projectbrain:start --> ... <!-- projectbrain:end -->` markers. Only writes `.cursor/`, `.vscode/`, or `.claude/` configs if those directories already exist in your repository (or when `--ide all` / `--ide claude` is explicitly passed).
+- **Safe Execution Defaults:** Direct shell execution over MCP (`brain_run`) is disabled by default unless explicitly opted in via `PROJECTBRAIN_ALLOW_EXEC=1`.
 
-### Step 3: MCP Server Configuration
+### 3. MCP Server Configuration
 
 ```json
 {
@@ -59,18 +73,16 @@ projectbrain --path /path/to/your/repo init --hooks
 }
 ```
 
----
-
-## Core CLI Workflow
+### 4. Core CLI Commands
 
 ```bash
-# 1. Compile a 1-turn engineering dossier (target slices + callers + callees)
-projectbrain --path /path/to/repo dossier "recover from a panic in an HTTP handler and abort with 500"
+# 1. Slice exact symbols or line ranges (fast <20ms SQLite lookup on indexed repos)
+projectbrain --path /path/to/repo slice Query.build_filter src/flask/app.py:Flask.wsgi_app
 
-# 2. Slice multiple symbols or line ranges in one batch
-projectbrain --path /path/to/repo slice src/App.tsx:ProtectedRoute recovery.go:CustomRecoveryWithWriter
+# 2. Compile a 1-turn code dossier (target slices + callers + callees)
+projectbrain --path /path/to/repo dossier "how are exceptions routed to error handlers"
 
-# 3. Apply a syntax-verified, symbol-anchored patch
+# 3. Apply a syntax-verified, symbol-anchored patch (--apply to write, omit for dry-run diff)
 projectbrain --path /path/to/repo patch --apply --spec-file patch.spec
 
 # 4. Verify closed-world structural claims (calls, reaches, imports, handles)
@@ -79,72 +91,40 @@ projectbrain --path /path/to/repo verify "checkout" reaches "validate_coupon"
 
 ---
 
-## Reproducible Evaluation Suite (`eval/`)
+## Reproducible Evaluation & Scale Benchmarks (`eval/`)
 
-Every retrieval, multi-hop graph traversal, closed-world claim verification, and scale benchmark in this repository can be reproduced locally with two commands:
+All correctness, retrieval, claim-verification, and scale benchmarks in this repository can be run locally:
 
 ```bash
-# 1. Run retrieval precision/recall, multi-hop graph vs. grep baseline, claim verification, and zero-ID slicing
+# 1. Retrieval precision/recall, multi-hop graph vs. grep baseline, claim verification, and zero-ID slicing
 python eval/run_eval.py
 
-# 2. Run 200-file polyglot scale, incremental Salsa early-cutoff, FTS5, and recursive CTE latency benchmark
+# 2. 200-file polyglot scale, incremental Salsa early-cutoff, FTS5, and recursive CTE latency benchmark
 python eval/bench_scale.py
+
+# 3. Full unit, integration, security, and regression test suite (197 tests)
+pytest projectbrain/tests -q
 ```
 
-### 1. Built-In Reproducible Harness Results (`python eval/run_eval.py`)
+### Built-In Verification Suite Results (`python eval/run_eval.py`)
 
-| Benchmark Suite | Metric | Score | Notes |
+| Suite | Metric | Result | What It Tests |
 | :--- | :--- | :---: | :--- |
-| **File Localization (`eval/tasks.json`)** | Precision / Recall (10 tasks) | **`100%` Precision / `100%` Recall** | Returns exact 1-file answers for 1-file tasks and 3-file answers for 3-file flows |
-| **Multi-Hop Graph vs. Grep (`eval/relationship_tasks.json`)** | Pass Rate (8 tasks, incl. negative controls) | **`8 / 8 (100%)`** | Finds 2-hop call paths where naive `grep` misses the intermediate module |
-| **Closed-World Claim Verification (`eval/claim_tasks.json`)** | Exact Verdict Accuracy (22 tasks) | **`22 / 22 (100%)`** | `0` false supports, `0` false refutations; returns `UNKNOWN` on syntax-broken files |
-| **Self-Dogfooding Context Slicing** | Symbol Recall & Token Reduction | **`3 / 3 (100% Recall)`** | `96.6%–99.2%` token reduction vs. reading matched full files |
-| **Adversarial Zero-Identifier Slicing** | Symbol Recall (prompts with zero symbol names) | **`4 / 4 (100% Recall)`** | Outperforms `grep` + 120-line windows (`0%–50%` recall on 3 of 4 tasks) |
+| **File Localization (`eval/tasks.json`)** | Precision / Recall (10 tasks) | **`100%` Precision / `100%` Recall** | Regression guard on single-file and multi-file retrieval ranking |
+| **Multi-Hop Graph vs. Grep (`eval/relationship_tasks.json`)** | Pass Rate (8 tasks, incl. negative controls) | **`8 / 8 (100%)`** | 2-hop call paths where keyword `grep` misses the intermediate module |
+| **Closed-World Claim Verification (`eval/claim_tasks.json`)** | Exact Verdict Accuracy (22 tasks) | **`22 / 22 (100%)`** | `SUPPORTED` / `REFUTED` / `UNKNOWN` accuracy (`0` false supports, `0` false refutations; returns `UNKNOWN` on syntax-broken files) |
+| **Self-Dogfooding & Zero-ID Slicing** | Symbol Recall (7 tasks) | **`7 / 7 (100% Recall)`** | Natural-language prompts with zero function names leaked |
 
----
+### What Changed in `v0.8.5` – `v0.8.6` (From `pallets/flask` & `django/django` Sandbox Reviews)
 
-### 2. Blind Cold-Start Agent Benchmarks (Production Open-Source Repositories)
-
-Measured head-to-head by spawning two isolated subagents simultaneously on unmodified open-source repositories (**Naive Search Agent** using `rg`/`Select-String` + `read_file` vs. **ProjectBrain Agent** starting completely cold with no pre-built `.projectbrain.db` index and zero file/symbol hints in the prompt):
-
-#### A. `paperless-ngx/paperless-ngx` (4-Question Deep Architectural Audit — Cold Start)
-
-| Metric | Naive Search Agent | ProjectBrain Agent (Cold Start) | Measured Delta |
-| :--- | :---: | :---: | :--- |
-| **Wall-Clock Time** | `12m 00s` (`720.0s`) | **`6m 27s` (`387.0s`)** | **`5m 33s` faster (`-46.3%` / `1.86x` faster)** |
-| **Model Turns** | `53` turns | **`15` turns** | **`38` fewer turns (`-71.7%` / `3.53x` fewer)** |
-| **Tool Calls** | `51` calls | **`18` calls** (`1` dossier + `12` reads + `5` batched slices) | **`33` fewer calls (`-64.7%` / `2.83x` fewer)** |
-| **Uncached Input Tokens** | `274,363` tokens | **`216,603` tokens** | **`57,760` tokens saved (`-21.1%`)** |
-| **Cumulative Billed Input Tokens** | `6,506,996` tokens | **`1,499,886` tokens** | **`5,007,110` tokens saved (`-76.9%` / `4.34x` less)** |
-
-#### B. `Netflix/dispatch` (879-File Repository — 3-Question Cold-Start Trace)
-
-| Metric | Naive Search Agent | ProjectBrain Agent (Cold Start) | Measured Delta |
-| :--- | :---: | :---: | :--- |
-| **Wall-Clock Time** | `5m 52s` (`352.0s`) | **`3m 44s` (`224.0s`)** | **`2m 08s` faster (`-36.4%` / `1.57x` faster)** |
-| **Model Turns** | `16` turns | **`8` turns** | **`8` fewer turns (`-50.0%` / `2.0x` fewer)** |
-| **Tool Calls** | `41` calls (`14` shell + `27` reads) | **`5` calls** (`1` dossier + `1` read + `3` slices) | **`36` fewer calls (`-87.8%` / `8.2x` fewer)** |
-| **Cumulative Billed Input Tokens** | `2,139,562` tokens | **`224,407` tokens** | **`1,915,155` tokens saved (`-89.5%` / `9.53x` less)** |
-
----
-
-## Project Layout
-
-```text
-projectbrain/
-├── src/projectbrain/
-│   ├── brain.py        # Context Compiler, Dossier Engine, Slicer, Explorer & Contract Verifier
-│   ├── store.py        # SQLite WAL Property Graph (.projectbrain.db), FTS5, and Delta Overlay
-│   ├── slicer.py       # Statement/Symbol Slicer, Focus-Window Folding & Signature Skeletons
-│   ├── patcher.py      # AST Symbol-Anchored & Line-Anchored Patch Engine + Syntax Verification
-│   ├── parsers.py      # Tree-sitter & Structural Parsers (29 file extensions)
-│   ├── graph.py        # Cross-File Call/Import Graph & Personalized PageRank Push
-│   ├── ledger.py       # Session Token & ROI Telemetry Ledger
-│   ├── memory.py       # AST-Anchored Repository Notes (.projectbrain_memory.json)
-│   ├── resolve.py      # Cross-File Import & TypeScript Path Alias Resolution
-│   ├── frameworks.py   # Route Inference (Next.js, FastAPI, Flask, Express, Hono, Gin, Actix, Spring, ASP.NET)
-│   ├── cli.py          # CLI Entry Point (init, dossier, slice, patch, verify, run, stats)
-│   └── server.py       # FastMCP Server Entry Point (standard and --lean modes)
-├── tests/              # 194 Unit, Integration, Security, and Benchmark Threshold Tests
-└── eval/               # Reproducible Evaluation & Scale Benchmark Harnesses
-```
+1. **Fixed Perpetual Graph Rebuild on Skipped/Vendored Files (`I-02`):**
+   - Previously, files skipped as minified/vendored (e.g., 60 vendored `.js` files in Django) were recorded in `_skipped` but omitted from `is_stale()` and `incremental_index()` known-file sets, causing every warm query on Django to treat them as 60 newly added files and rebuild/re-serialize the entire graph. `is_stale()` and `incremental_index()` now track `_skipped` alongside `_index`, reducing unchanged warm `incremental_index()` checks to `0` added files (`up_to_date` in `< 100ms`).
+2. **Fast Cold-Start SQLite Slicing & Zero-Copy Graph Persistence (`I-03`):**
+   - `projectbrain slice <Symbol>` now queries the indexed `symbols` and `files` tables in `.projectbrain.db` directly before loading the full repository graph into memory, and `CodeGraph` persistence passes in-memory dictionaries directly to SQLite instead of round-tripping through `json.dumps(..., indent=2)` -> `json.loads()`.
+   - Capped 3-hop `effect_provenance` dictionaries and replaced $O(N_{\text{calls}} \times N_{\text{candidates}})$ candidate scans in `CodeGraph.build()` with $O(1)$ `(file, symbol)` + $O(|\text{imports}|)$ lookups.
+3. **AST/PDG Multi-Dimensional Program Slicing & Config/State Indexing (`I-05`):**
+   - Implemented [`compute_multidim_program_slice`](src/projectbrain/slicer.py) (tracing backward `def -> use`, forward `def -> use`, and upward control-flow guards) and indexed class/module-level config declarations (`ConfigAttribute`, `ImmutableDict`, constants) so queries like `"where is SECRET_KEY used"` and `"how are exceptions routed to error handlers"` on `pallets/flask` return the complete chain (`ConfigAttribute("SECRET_KEY")`, `get_signing_serializer`, `_get_exc_class_and_code`, `_find_error_handler`) with zero test/example noise.
+4. **Flask Tuple Route Methods & Scoped Contract Checks (`I-04`):**
+   - `_flask_methods` now parses `tuple` and `set` literals (`methods=("GET", "POST")`), and `.py` pytest `client.post(...)` calls are no longer mistaken for frontend HTTP calls.
+5. **Pinned `mcp>=1.2.0,<2.0.0`, Minimal `init --ide auto`, and Root `pyproject.toml` Fix (`I-01`, `I-06`, `I-07`):**
+   - Pinned `mcp>=1.2.0,<2.0.0` so `mcp.server.fastmcp` is always present, changed `projectbrain init` default to `--ide auto`, and pointed the root `pyproject.toml` at `projectbrain/src`.
