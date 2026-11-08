@@ -51,9 +51,199 @@ _PDG_NOISE_VARS = {
     "self", "cls", "this", "true", "false", "none", "null", "undefined",
     "err", "error", "e", "ex", "exc", "i", "j", "k", "x", "v", "fn",
     "str", "int", "float", "bool", "list", "dict", "set", "tuple", "len",
-    "range", " enumerate", "isinstance", "getattr", "setattr", "hasattr",
+    "range", "enumerate", "isinstance", "getattr", "setattr", "hasattr",
     "type", "super", "print", "return", "await", "async", "const", "let", "var",
 }
+_TS_CTRL_NODE_TYPES = {
+    "if_statement", "for_statement", "for_in_statement", "for_of_statement",
+    "while_statement", "do_statement", "switch_statement", "switch_case",
+    "switch_default", "try_statement", "catch_clause", "finally_clause",
+    "with_statement", "match_expression", "match_arm", "enhanced_for_statement",
+}
+_TS_FUNC_NODE_TYPES = {
+    "function_declaration", "function_expression", "arrow_function",
+    "method_definition", "generator_function_declaration", "function_item",
+    "method_declaration", "Constructor_declaration",
+}
+_TS_SINK_NODE_TYPES = {
+    "return_statement", "throw_statement", "yield_expression",
+}
+_TS_ID_NODE_TYPES = {
+    "identifier", "property_identifier", "shorthand_property_identifier",
+    "shorthand_property_identifier_pattern", "field_identifier",
+}
+
+
+def _analyze_treesitter_cst_pdg(
+    selected_lines: list[str],
+    ext: str,
+    docstring_lines: set[int],
+    defs: list[set[str]],
+    uses: list[set[str]],
+    control_parent: dict[int, int],
+    sig_lines: set[int],
+    sink_lines: set[int],
+    stmt_spans: dict[int, range],
+) -> bool:
+    """Populate `defs`, `uses`, `control_parent`, `sig_lines`, and `sink_lines` using Tree-sitter CST."""
+    parser = get_parser(ext)
+    if parser is None:
+        return False
+    n = len(selected_lines)
+    if n == 0:
+        return False
+    raw_src = "\n".join(selected_lines)
+    try:
+        tree = parser.parse(raw_src.encode("utf-8", errors="replace"))
+    except Exception:
+        return False
+    root = tree.root_node
+    if root is None:
+        return False
+
+    lhs_def_node_ids: set[int] = set()
+
+    def _collect_lhs_identifiers(lhs_node, span_lines: range) -> None:
+        if lhs_node is None:
+            return
+        stack = [lhs_node]
+        while stack:
+            cur = stack.pop()
+            ntype = cur.type
+            if ntype in ("object_assignment_pattern", "assignment_pattern", "required_parameter", "optional_parameter"):
+                left_ch = cur.child_by_field_name("left") or cur.child_by_field_name("pattern") or cur.child_by_field_name("name")
+                if left_ch is not None:
+                    stack.append(left_ch)
+                continue
+            if ntype == "pair_pattern":
+                val_ch = cur.child_by_field_name("value")
+                if val_ch is not None:
+                    stack.append(val_ch)
+                continue
+            if ntype in ("subscript_expression", "index_expression"):
+                obj_ch = cur.child_by_field_name("object")
+                if obj_ch is not None:
+                    stack.append(obj_ch)
+                continue
+            if ntype in _TS_ID_NODE_TYPES:
+                lhs_def_node_ids.add(cur.id)
+                nm = cur.text.decode("utf-8", errors="replace").strip().lower()
+                if len(nm) >= 2 and nm not in _PDG_NOISE_VARS:
+                    ln0 = cur.start_point[0]
+                    if 0 <= ln0 < n and ln0 not in docstring_lines:
+                        defs[ln0].add(nm)
+                    for sp_ln in span_lines:
+                        if 0 <= sp_ln < n and sp_ln not in docstring_lines:
+                            defs[sp_ln].add(nm)
+            for ch in cur.children:
+                stack.append(ch)
+
+    # First pass: walk CST for declarations, parameters, sinks, and control parents
+    stack = [root]
+    while stack:
+        nd = stack.pop()
+        ntype = nd.type
+        s_ln = nd.start_point[0]
+        e_ln = nd.end_point[0]
+
+        if ntype in _TS_FUNC_NODE_TYPES:
+            if s_ln <= 4 and 0 <= s_ln < n:
+                sig_lines.add(s_ln)
+            params_nd = nd.child_by_field_name("parameters") or nd.child_by_field_name("type_parameters")
+            if params_nd is not None:
+                p_start = max(0, params_nd.start_point[0])
+                p_end = min(n - 1, params_nd.end_point[0])
+                for p_ln in range(p_start, p_end + 1):
+                    if p_ln <= 8:
+                        sig_lines.add(p_ln)
+                _collect_lhs_identifiers(params_nd, range(p_start, p_start + 1))
+
+        elif ntype in ("formal_parameters", "parameters") and s_ln <= 6:
+            p_start = max(0, s_ln)
+            p_end = min(n - 1, e_ln)
+            for p_ln in range(p_start, p_end + 1):
+                if p_ln <= 8:
+                    sig_lines.add(p_ln)
+            _collect_lhs_identifiers(nd, range(p_start, p_start + 1))
+
+        elif ntype == "variable_declarator":
+            decl_parent = nd.parent
+            stmt_s = decl_parent.start_point[0] if decl_parent is not None else s_ln
+            stmt_e = decl_parent.end_point[0] if decl_parent is not None else e_ln
+            span = range(stmt_s, stmt_e + 1) if (0 <= stmt_e - stmt_s <= 6) else range(s_ln, s_ln + 1)
+            for sp_ln in span:
+                stmt_spans[sp_ln] = span
+            _collect_lhs_identifiers(nd.child_by_field_name("name"), span)
+
+        elif ntype in ("assignment_expression", "augmented_assignment_expression", "short_var_declaration", "assignment_statement"):
+            span = range(s_ln, e_ln + 1) if (0 <= e_ln - s_ln <= 6) else range(s_ln, s_ln + 1)
+            for sp_ln in span:
+                stmt_spans[sp_ln] = span
+            _collect_lhs_identifiers(nd.child_by_field_name("left"), span)
+
+        elif ntype == "let_declaration":
+            span = range(s_ln, e_ln + 1) if (0 <= e_ln - s_ln <= 6) else range(s_ln, s_ln + 1)
+            for sp_ln in span:
+                stmt_spans[sp_ln] = span
+            _collect_lhs_identifiers(nd.child_by_field_name("pattern"), span)
+
+        elif ntype in ("for_in_statement", "for_of_statement", "enhanced_for_statement"):
+            _collect_lhs_identifiers(nd.child_by_field_name("left") or nd.child_by_field_name("name"), range(s_ln, s_ln + 1))
+
+        elif ntype == "catch_clause":
+            _collect_lhs_identifiers(nd.child_by_field_name("parameter") or nd.child_by_field_name("body"), range(s_ln, s_ln + 1))
+
+        if ntype in _TS_SINK_NODE_TYPES:
+            for k_ln in range(max(0, s_ln), min(n, e_ln + 1)):
+                if k_ln not in docstring_lines:
+                    sink_lines.add(k_ln)
+
+        # Control parent mapping for every line inside a CST node
+        if 0 <= s_ln < n and s_ln not in control_parent and s_ln not in docstring_lines:
+            curr = nd.parent
+            while curr is not None:
+                if curr.type in _TS_CTRL_NODE_TYPES:
+                    c_ln = curr.start_point[0]
+                    if 0 <= c_ln < s_ln:
+                        control_parent[s_ln] = c_ln
+                        break
+                curr = curr.parent
+
+        for ch in reversed(nd.children):
+            stack.append(ch)
+
+    # Second pass: collect all identifier and string-literal uses, propagating multi-line declaration RHS uses
+    stack = [root]
+    while stack:
+        nd = stack.pop()
+        ntype = nd.type
+        ln0 = nd.start_point[0]
+        if 0 <= ln0 < n and ln0 not in docstring_lines:
+            if ntype in _TS_ID_NODE_TYPES and nd.id not in lhs_def_node_ids:
+                nm = nd.text.decode("utf-8", errors="replace").strip().lower()
+                if len(nm) >= 2 and nm not in _PDG_NOISE_VARS:
+                    uses[ln0].add(nm)
+                    # If inside a multi-line variable_declarator / assignment, also credit the declaration header lines
+                    curr_p = nd.parent
+                    while curr_p is not None:
+                        if curr_p.type in ("lexical_declaration", "variable_declaration", "variable_declarator", "assignment_expression", "short_var_declaration", "let_declaration"):
+                            ps = curr_p.start_point[0]
+                            pe = curr_p.end_point[0]
+                            if 0 <= pe - ps <= 6:
+                                for sp_ln in range(max(0, ps), min(n, pe + 1)):
+                                    if sp_ln not in docstring_lines and nm not in defs[sp_ln]:
+                                        uses[sp_ln].add(nm)
+                            break
+                        curr_p = curr_p.parent
+            elif ntype in ("string_fragment", "string_literal", "interpreted_string_literal"):
+                s_val = nd.text.decode("utf-8", errors="replace").strip("\"'` ")
+                if 3 <= len(s_val) <= 40 and re.match(r"^[A-Za-z_][A-Za-z0-9_.\-]*$", s_val):
+                    uses[ln0].add(s_val.lower())
+        for ch in reversed(nd.children):
+            stack.append(ch)
+
+    return any(defs) or any(uses)
+
 
 
 def _detect_leading_docstring(selected_lines: list[str]) -> tuple[int, int, int] | None:
@@ -238,7 +428,22 @@ def compute_multidim_program_slice(
         except SyntaxError:
             parsed_py_ast = False
 
-    if not parsed_py_ast:
+    stmt_spans: dict[int, range] = {}
+    parsed_cst = False
+    if not parsed_py_ast and ext.lower() != ".py":
+        parsed_cst = _analyze_treesitter_cst_pdg(
+            selected_lines,
+            ext.lower(),
+            docstring_lines,
+            defs,
+            uses,
+            control_parent,
+            sig_lines,
+            sink_lines,
+            stmt_spans,
+        )
+
+    if not parsed_py_ast and not parsed_cst:
         # Polyglot statement-level def/use & indentation/brace control-dependence analyzer
         ctrl_stack: list[tuple[int, int]] = []  # (indent_len, line_idx0)
         _CTRL_HEADER_PAT = re.compile(
@@ -319,9 +524,10 @@ def compute_multidim_program_slice(
             for v in uses[idx]:
                 for prev in range(idx - 1, -1, -1):
                     if v in defs[prev]:
-                        if prev not in seed_lines and prev not in backward_def_lines and prev not in sig_lines:
-                            backward_def_lines.add(prev)
-                            next_bwd.add(prev)
+                        for sp_ln in stmt_spans.get(prev, (prev,)):
+                            if sp_ln not in seed_lines and sp_ln not in backward_def_lines and sp_ln not in sig_lines:
+                                backward_def_lines.add(sp_ln)
+                                next_bwd.add(sp_ln)
                         if v not in traced_vars:
                             traced_vars.append(v)
                         break
@@ -338,9 +544,10 @@ def compute_multidim_program_slice(
                 hits_for_v = 0
                 for nxt in range(idx + 1, n):
                     if v in uses[nxt]:
-                        if nxt not in seed_lines and nxt not in forward_use_lines:
-                            forward_use_lines.add(nxt)
-                            next_fwd.add(nxt)
+                        for sp_ln in stmt_spans.get(nxt, (nxt,)):
+                            if sp_ln not in seed_lines and sp_ln not in forward_use_lines:
+                                forward_use_lines.add(sp_ln)
+                                next_fwd.add(sp_ln)
                         if v not in traced_vars:
                             traced_vars.append(v)
                         hits_for_v += 1

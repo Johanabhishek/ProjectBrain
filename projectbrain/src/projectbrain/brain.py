@@ -1301,7 +1301,7 @@ class ProjectBrain:
                     if task_cls_ref_counts.get(rp, 0) >= 2 or (rp in exp_by_file and len(exp_by_file[rp]) >= 1):
                         continue
                     info = self._index.get(rp, {})
-                    behaviors = self._behaviors.get(rp, {})
+                    behaviors = self._get_file_behaviors(rp)
                     scored: list[tuple[float, str, dict]] = []
                     for fn in info.get("functions", []):
                         sc = self._score_symbol_for_query(fn, t_kw, behaviors, info.get("routes", []), info.get("cells_4d", []))
@@ -1894,7 +1894,7 @@ class ProjectBrain:
                     if rp in step2_ranked_files:
                         continue
                     info = self._index.get(rp, {})
-                    behaviors = self._behaviors.get(rp, {})
+                    behaviors = self._get_file_behaviors(rp)
                     scored: list[tuple[float, str, dict]] = []
                     for fn in info.get("functions", []):
                         sc = self._score_symbol_for_query(fn, t_kw, behaviors, info.get("routes", []))
@@ -3174,7 +3174,7 @@ class ProjectBrain:
         routes = info.get("routes", [])
         imports = info.get("imports", [])
         exports = info.get("exports", [])
-        behaviors = self._behaviors.get(rel_path, {})
+        behaviors = self._get_file_behaviors(rel_path)
 
         def fn_priority(fn: dict) -> int:
             name = fn.get("name", "").lower()
@@ -3504,36 +3504,40 @@ class ProjectBrain:
             + cls_field_names
             + info.get("exports", [])
         )
-        tokenized = []
-        for name in symbol_names:
+        tokenized: list[str] = []
+        for name in set(symbol_names):
             tokenized.extend(_tokenize_symbol(name))
 
         z_write_toks: set[str] = set()
         z_read_toks: set[str] = set()
         cell_4d_toks: set[str] = set()
+        raw_zw: set[str] = set()
+        raw_zr: set[str] = set()
         for cell in info.get("cells_4d", []):
-            for zw in cell.get("Z_write", []):
-                zw_l = zw.lower()
-                z_write_toks.add(zw_l)
-                cell_4d_toks.add(zw_l)
-                for sub_t in _tokenize_symbol(zw):
-                    if len(sub_t) >= 4:
-                        cell_4d_toks.add(sub_t)
-            for zr in cell.get("Z_read", []):
-                zr_l = zr.lower()
-                z_read_toks.add(zr_l)
-                cell_4d_toks.add(zr_l)
-                for sub_t in _tokenize_symbol(zr):
-                    if len(sub_t) >= 4:
-                        cell_4d_toks.add(sub_t)
+            raw_zw.update(cell.get("Z_write", ()))
+            raw_zr.update(cell.get("Z_read", ()))
             x_sc = cell.get("X_scope", "")
             if x_sc.startswith(("useEffect", "useLayoutEffect", "useMemo", "useCallback", "case:")):
-                for x_id in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", x_sc):
+                for x_id in _IDENT_RE.findall(x_sc):
                     if x_id not in ("useEffect", "useLayoutEffect", "useMemo", "useCallback", "case"):
                         cell_4d_toks.add(x_id.lower())
                         for sub_t in _tokenize_symbol(x_id):
                             if len(sub_t) >= 4:
                                 cell_4d_toks.add(sub_t)
+        for zw in raw_zw:
+            zw_l = zw.lower()
+            z_write_toks.add(zw_l)
+            cell_4d_toks.add(zw_l)
+            for sub_t in _tokenize_symbol(zw):
+                if len(sub_t) >= 4:
+                    cell_4d_toks.add(sub_t)
+        for zr in raw_zr:
+            zr_l = zr.lower()
+            z_read_toks.add(zr_l)
+            cell_4d_toks.add(zr_l)
+            for sub_t in _tokenize_symbol(zr):
+                if len(sub_t) >= 4:
+                    cell_4d_toks.add(sub_t)
         self._z_write_sets[rel_path] = z_write_toks
         self._z_read_sets[rel_path] = z_read_toks
         self._cell_4d_tokens[rel_path] = cell_4d_toks
@@ -3555,7 +3559,7 @@ class ProjectBrain:
             *[r["path"] for r in info.get("routes", [])],
             *info.get("exports", []),
             *tokenized,
-            *sorted(cell_4d_toks),
+            *cell_4d_toks,
             *[f["docstring"] for f in info.get("functions", []) if f.get("docstring")],
             *[c["docstring"] for c in info.get("classes", []) if c.get("docstring")],
         ]
@@ -3563,32 +3567,34 @@ class ProjectBrain:
         imp_str = " ".join(info.get("imports", [])).lower()
         self._blobs[rel_path] = (own_blob_str + " " + imp_str).strip()
 
-        file_tokens = set(re.findall(r"[a-z0-9_]+", own_blob_str)) | set(tokenized) | cell_4d_toks
-        for p_seg in re.split(r"[/._\-]", rel_path.lower()):
+        file_tokens = set(_WORD_TOK_RE.findall(own_blob_str)) | set(tokenized) | cell_4d_toks
+        for p_seg in _SEG_SPLIT_RE.split(rel_path.lower()):
             if p_seg:
                 file_tokens.add(p_seg)
                 file_tokens.update(_tokenize_symbol(p_seg))
         self._token_sets[rel_path] = file_tokens
-        imp_toks: set[str] = set(re.findall(r"[a-z0-9_]+", imp_str))
+        imp_toks: set[str] = set(_WORD_TOK_RE.findall(imp_str))
         for raw_imp in info.get("imports", []):
-            for seg in re.split(r"[/._\-]", raw_imp):
+            for seg in _SEG_SPLIT_RE.split(raw_imp):
                 if seg:
                     imp_toks.update(_tokenize_symbol(seg))
         self._import_token_sets[rel_path] = imp_toks - file_tokens
         body_toks: set[str] = set()
+        raw_calls: set[str] = set()
         for f in info.get("functions", []):
             for bt in f.get("body_tokens", []):
                 body_toks.add(bt.lower())
-            for cl in f.get("calls", []):
-                body_toks.add(cl.lower())
-                body_toks.update(_tokenize_symbol(cl))
+            raw_calls.update(f.get("calls", ()))
+        for cl in raw_calls:
+            body_toks.add(cl.lower())
+            body_toks.update(_tokenize_symbol(cl))
         self._body_token_sets[rel_path] = body_toks
 
-        self._defn_sets[rel_path] = {
-            tok
-            for name in symbol_names
-            for tok in ([name.lower()] + _tokenize_symbol(name))
-        } | {r["path"].lower() for r in info.get("routes", [])}
+        self._defn_sets[rel_path] = (
+            {name.lower() for name in symbol_names}
+            | set(tokenized)
+            | {r["path"].lower() for r in info.get("routes", [])}
+        )
         return file_tokens
 
     def _build_blobs(self) -> None:
@@ -3636,14 +3642,19 @@ class ProjectBrain:
             rel_path: len(self._imported_by.get(rel_path, []))
             for rel_path in self._index
         }
-
-        _JSX_EXTS = {".tsx", ".jsx"}
         self._behaviors = {}
-        for rel_path, info in self._index.items():
-            ext = Path(rel_path).suffix.lower()
-            self._behaviors[rel_path] = classify_file_functions(
-                info, is_jsx=(ext in _JSX_EXTS),
-            )
+
+    def _get_file_behaviors(self, rel_path: str) -> dict[str, str]:
+        """Lazily compute and cache behavioral roles per file on demand."""
+        beh = self._behaviors.get(rel_path)
+        if beh is None:
+            info = self._index.get(rel_path)
+            if not info:
+                return {}
+            ext = os.path.splitext(rel_path)[1].lower()
+            beh = classify_file_functions(info, is_jsx=(ext in (".tsx", ".jsx")))
+            self._behaviors[rel_path] = beh
+        return beh
 
     def _update_blobs_incremental(self, changed_rels: set[str], deleted_rels: set[str], has_added_or_deleted: bool = False) -> None:
         """Incrementally update per-file blobs, IDF, imports, and behaviors in O(delta) time."""
@@ -4124,7 +4135,7 @@ class ProjectBrain:
             if matched_ents:
                 score *= 1.25
         elif intent_type == UNDERSTAND_FLOW:
-            behaviors = self._behaviors.get(rel_path, {})
+            behaviors = self._get_file_behaviors(rel_path)
             flow_roles = {"orchestrator", "handler"}
             if any(b in flow_roles for b in behaviors.values()):
                 score *= 1.3
@@ -4137,7 +4148,7 @@ class ProjectBrain:
         elif intent_type == ADD_FEATURE:
             if info.get("routes"):
                 score *= 1.2
-            behaviors = self._behaviors.get(rel_path, {})
+            behaviors = self._get_file_behaviors(rel_path)
             if any(b == "orchestrator" for b in behaviors.values()):
                 score *= 1.1
 
@@ -4183,7 +4194,7 @@ class ProjectBrain:
                 deduped.append(r)
 
         all_functions = info.get("functions", [])
-        behaviors = self._behaviors.get(rel_path, {})
+        behaviors = self._get_file_behaviors(rel_path)
         kw_set_low = {k.lower() for k in keywords}
         sorted_functions = sorted(
             all_functions,
@@ -4725,7 +4736,7 @@ class ProjectBrain:
                                     "confidence": edge.get("confidence", "candidate"),
                                 })
 
-            behaviors = self._behaviors.get(rel_path, {})
+            behaviors = self._get_file_behaviors(rel_path)
             behavior_summary = {}
             for name, behavior in behaviors.items():
                 if behavior != "unknown":
@@ -4832,7 +4843,7 @@ class ProjectBrain:
                         callee_name = callee_node.get("name", callee_edge["dst"])
                         behavior = ""
                         if callee_file:
-                            behaviors = self._behaviors.get(callee_file, {})
+                            behaviors = self._get_file_behaviors(callee_file)
                             behavior = behaviors.get(callee_name, "")
 
                         step_type = "service"
@@ -5037,7 +5048,7 @@ class ProjectBrain:
             "file_path": file_path,
             "rel_path": rel,
             **info,
-            "skeleton": build_file_skeleton(rel, info, behaviors=self._behaviors.get(rel, {})),
+            "skeleton": build_file_skeleton(rel, info, behaviors=self._get_file_behaviors(rel)),
             "imported_by": self._find_importers(rel, limit=999),
             "imports_resolved": self._resolve_imports(rel, limit=999),
         }
@@ -5411,8 +5422,7 @@ class ProjectBrain:
 
     @staticmethod
     def _matches_gitignore(rel_posix: str, is_dir: bool, rules: list[tuple[bool, bool, str, re.Pattern]]) -> bool:
-        ignored = False
-        for is_neg, dir_only, base_rel, rx in rules:
+        for is_neg, dir_only, base_rel, rx in reversed(rules):
             if dir_only and not is_dir:
                 continue
             if base_rel:
@@ -5422,8 +5432,8 @@ class ProjectBrain:
             else:
                 target = rel_posix
             if rx.search(target):
-                ignored = not is_neg
-        return ignored
+                return not is_neg
+        return False
 
     def _walk_entries(self) -> list[tuple[str, str, float]]:
         """Fast os.scandir traversal returning (rel_posix, abs_path_str, mtime)."""
@@ -5431,6 +5441,10 @@ class ProjectBrain:
             self, "_gi_rules_cache", {}
         )
         self._gi_rules_cache = gi_cache
+        union_cache: dict[tuple, tuple[re.Pattern | None, re.Pattern | None] | None] = getattr(
+            self, "_gi_union_cache", {}
+        )
+        self._gi_union_cache = union_cache
         eval_cache: dict[tuple[tuple, str, bool], bool] = getattr(self, "_gi_eval_cache", {})
         if len(eval_cache) > 100_000:
             eval_cache.clear()
@@ -5441,6 +5455,28 @@ class ProjectBrain:
             if key not in gi_cache:
                 gi_cache[key] = self._load_gitignore_rules(gi_path, base_rel)
             return gi_cache[key]
+
+        def _get_union_rxs(
+            rules_key: tuple,
+            active_rules: list[tuple[bool, bool, str, re.Pattern]],
+        ) -> tuple[re.Pattern | None, re.Pattern | None] | None:
+            if not active_rules:
+                return (None, None)
+            if rules_key in union_cache:
+                return union_cache[rules_key]
+            if any(r[0] or r[2] for r in active_rules):
+                union_cache[rules_key] = None
+                return None
+            dir_pats = [r[3].pattern for r in active_rules]
+            file_pats = [r[3].pattern for r in active_rules if not r[1]]
+            try:
+                d_rx = re.compile("|".join(f"(?:{p})" for p in dir_pats)) if dir_pats else None
+                f_rx = re.compile("|".join(f"(?:{p})" for p in file_pats)) if file_pats else None
+                res_u = (d_rx, f_rx)
+            except re.error:
+                res_u = None
+            union_cache[rules_key] = res_u
+            return res_u
 
         root_rules: list[tuple[bool, bool, str, re.Pattern]] = []
         root_key_parts: list[tuple[str, float]] = []
@@ -5500,6 +5536,7 @@ class ProjectBrain:
                     pass
 
             has_negations = any(r[0] for r in active_rules)
+            union_pair = _get_union_rxs(rules_key, active_rules)
             dir_entries.sort(key=lambda e: e.name)
             file_entries.sort(key=lambda e: e.name)
 
@@ -5517,7 +5554,11 @@ class ProjectBrain:
                     ckey = (rules_key, d_rel, True)
                     ignored = eval_cache.get(ckey)
                     if ignored is None:
-                        ignored = self._matches_gitignore(d_rel, True, active_rules)
+                        if union_pair is not None:
+                            d_rx = union_pair[0]
+                            ignored = bool(d_rx and d_rx.search(d_rel))
+                        else:
+                            ignored = self._matches_gitignore(d_rel, True, active_rules)
                         eval_cache[ckey] = ignored
                     if ignored:
                         continue
@@ -5535,7 +5576,11 @@ class ProjectBrain:
                     ckey = (rules_key, f_rel, False)
                     ignored = eval_cache.get(ckey)
                     if ignored is None:
-                        ignored = self._matches_gitignore(f_rel, False, active_rules)
+                        if union_pair is not None:
+                            f_rx = union_pair[1]
+                            ignored = bool(f_rx and f_rx.search(f_rel))
+                        else:
+                            ignored = self._matches_gitignore(f_rel, False, active_rules)
                         eval_cache[ckey] = ignored
                     if ignored:
                         continue
@@ -5647,13 +5692,34 @@ def _path_multiplier(rel_path: str, query_wants_tests: bool = False) -> float:
     return 1.0
 
 
+_CAMEL_SPLIT_RE = re.compile(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])")
+_SNAKE_SPLIT_RE = re.compile(r"[_\-.]")
+_SEG_SPLIT_RE = re.compile(r"[/._\-]")
+_WORD_TOK_RE = re.compile(r"[a-z0-9_]+")
+_IDENT_RE = re.compile(r"[a-zA-Z_][a-zA-Z0-9_]*")
+_TOKENIZE_CACHE: dict[str, list[str]] = {}
+
+
 def _tokenize_symbol(name: str) -> list[str]:
-    parts = re.split(r"[_\-]", name)
-    tokens = []
+    cached = _TOKENIZE_CACHE.get(name)
+    if cached is not None:
+        return cached
+    if len(_TOKENIZE_CACHE) > 100_000:
+        _TOKENIZE_CACHE.clear()
+    parts = _SNAKE_SPLIT_RE.split(name)
+    tokens: list[str] = []
     for part in parts:
-        sub = re.sub(r"(?<=[a-z])(?=[A-Z])|(?<=[A-Z])(?=[A-Z][a-z])", " ", part).split()
-        tokens.extend(sub)
-    return [t.lower() for t in tokens if len(t) > 1]
+        if not part:
+            continue
+        if part.islower() or part.isupper():
+            if len(part) > 1:
+                tokens.append(part.lower())
+        else:
+            for s in _CAMEL_SPLIT_RE.sub(" ", part).split():
+                if len(s) > 1:
+                    tokens.append(s.lower())
+    _TOKENIZE_CACHE[name] = tokens
+    return tokens
 
 
 _COMPOUND_SUFFIXES = (

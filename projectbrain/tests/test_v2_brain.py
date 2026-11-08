@@ -437,4 +437,49 @@ def test_errorhandlers_compound_routing_pdg_banner_and_docstring_folding(tmp_pat
     assert "docstring lines" in md
 
 
+def test_treesitter_cst_pdg_slice_typescript_multiline_destructuring():
+    """Verify Tree-sitter CST PDG slicing handles multi-line TS destructuring, try/catch, and control guards."""
+    from projectbrain.slicer import compute_multidim_program_slice
+
+    ts_lines = [
+        "export async function checkoutOrder(req: Request, discountOverride?: number) {",
+        "  const {",
+        "    cartItems,",
+        "    couponToken,",
+        "  } = await parseCheckoutPayload(req);",
+        "  const subtotal = computeSubtotal(cartItems);",
+        "  try {",
+        "    if (couponToken) {",
+        "      const verifiedDiscount = await verifyCouponCode(couponToken, discountOverride);",
+        "      const finalTotal = subtotal - verifiedDiscount;",
+        "      return { status: 200, total: finalTotal };",
+        "    }",
+        "  } catch (err) {",
+        "    logCheckoutError(err);",
+        "  }",
+        "  return { status: 200, total: subtotal };",
+        "}",
+    ]
+    pdg = compute_multidim_program_slice(
+        ts_lines,
+        line_start=1,
+        focus_terms=["verifycouponcode"],
+        ext=".ts",
+    )
+    # Seed line is line index 8 (`const verifiedDiscount = await verifyCouponCode(...)`)
+    assert 8 in pdg["seed_lines"]
+    # Backward defs must include multi-line destructuring lines (1..4) defining `couponToken`
+    assert 3 in pdg["backward_def_lines"]
+    assert 1 in pdg["backward_def_lines"]
+    # Forward uses must include `finalTotal = subtotal - verifiedDiscount` (line index 9) and `return` (line index 10)
+    assert 9 in pdg["forward_use_lines"]
+    assert 10 in pdg["forward_use_lines"]
+    # Enclosing control guards must include `if (couponToken)` (line index 7) and `try {` (line index 6)
+    assert 7 in pdg["control_guard_lines"]
+    assert 6 in pdg["control_guard_lines"]
+    assert "coupontoken" in pdg["traced_vars"]
+    assert "verifieddiscount" in pdg["traced_vars"]
+
+
+
 

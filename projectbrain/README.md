@@ -1,4 +1,4 @@
-# ProjectBrain (`projectbrain-mcp` v0.8.7)
+# ProjectBrain (`projectbrain-mcp` v0.8.8)
 
 [![PyPI](https://img.shields.io/pypi/v/projectbrain-mcp.svg)](https://pypi.org/project/projectbrain-mcp/)
 [![License: MIT](https://img.shields.io/badge/License: MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -47,7 +47,7 @@ ProjectBrain indexes 29 file extensions across three explicit capability tiers:
 ### 1. Install
 
 ```bash
-pip install "projectbrain-mcp>=0.8.7"
+pip install "projectbrain-mcp>=0.8.8"
 ```
 
 ### 2. Initialize a Repository (Minimal & Non-Destructive)
@@ -102,7 +102,10 @@ python eval/run_eval.py
 # 2. 200-file polyglot scale, incremental Salsa early-cutoff, FTS5, and recursive CTE latency benchmark
 python eval/bench_scale.py
 
-# 3. Full unit, integration, security, and regression test suite (198 tests)
+# 3. External repository benchmark on pallets/flask (6 dossiers + E2E bug-fix) and django/django (3,051 files)
+python projectbrain/eval/bench_external.py
+
+# 4. Full unit, integration, security, and regression test suite (199 tests)
 pytest projectbrain/tests -q
 ```
 
@@ -115,16 +118,24 @@ pytest projectbrain/tests -q
 | **Closed-World Claim Verification (`eval/claim_tasks.json`)** | Exact Verdict Accuracy (22 tasks) | **`22 / 22 (100%)`** | `SUPPORTED` / `REFUTED` / `UNKNOWN` accuracy (`0` false supports, `0` false refutations; returns `UNKNOWN` on syntax-broken files) |
 | **Self-Dogfooding & Zero-ID Slicing** | Symbol Recall (7 tasks) | **`7 / 7 (100% Recall)`** | Natural-language prompts with zero function names leaked |
 
-### External Repository Benchmarks (`pallets/flask` & `django/django`, `v0.8.7`)
+### External Repository Benchmarks (`python projectbrain/eval/bench_external.py`, `v0.8.8`)
 
-| Benchmark | `v0.8.4` | `v0.8.6` | `v0.8.7` |
+| Benchmark | `v0.8.4` | `v0.8.6` | `v0.8.8` |
 | :--- | :---: | :---: | :---: |
 | **`pallets/flask` (6 Architectural Questions) — Target Function Slice Recall** | `9 / 19` (`47.4%`) | `12 / 19` (`63.2%`) | **`19 / 19` (`100%`, `21 / 21` full set)** |
-| **`pallets/flask` (6 Architectural Questions) — Total Dossier Output** | `68.0 KB` | `113.0 KB` | **`57.3 KB` (`-49.3%` vs `v0.8.6`)** |
-| **`pallets/flask` (6 Architectural Questions) — Cost per Correct Hit** | `7.6 KB` | `9.4 KB` | **`2.73 KB` (`3.01 KB` on 19-fn subset)** |
-| **`django/django` (`3,051` files) — Single-File Edit `incremental_index()` Latency** | ~7,000 ms (global rebuild) | ~7,000 ms (global rebuild) | **`~500–970 ms` (`O(Δ)` graph + SQLite delta)** |
+| **`pallets/flask` (6 Architectural Questions) — Total Dossier Output** | `68.0 KB` | `113.0 KB` | **`56.8 KB` (`-49.7%` vs `v0.8.6`)** |
+| **`pallets/flask` (6 Architectural Questions) — Cost per Correct Hit** | `7.6 KB` | `9.4 KB` | **`2.70 KB` (`2.99 KB` on 19-fn subset)** |
+| **`pallets/flask` — End-to-End Bug-Fix (`dossier` -> `slice` -> `patch` -> `test`)** | — | — | **`PASS` (`red -> green` in `1.51 s`, `0` syntax/contract errors)** |
+| **`django/django` (`3,051` files) — Cold `brain.load()` / Cold Walk Latency** | ~8,300 ms / 820 ms | ~8,300 ms / 820 ms | **`~3,040 ms` (`-63%`) / `~220 ms` (`-73%`)** |
+| **`django/django` (`3,051` files) — Single-File Edit `incremental_index()` Latency** | ~7,000 ms (global rebuild) | ~7,000 ms (global rebuild) | **`540 ms` (`salsa_early_cutoff: True`, `O(Δ)` graph + SQLite delta)** |
 
-### What Changed in `v0.8.5` – `v0.8.7` (From `pallets/flask` & `django/django` Sandbox Reviews)
+### What Changed in `v0.8.5` – `v0.8.8` (From `pallets/flask` & `django/django` Sandbox Reviews)
+
+1. **Tree-sitter CST Program Dependence Graph (PDG) Slicing for JS/TS/Go/Rust/Java (`v0.8.8`):**
+   - Added [`_analyze_treesitter_cst_pdg`](src/projectbrain/slicer.py) so [`compute_multidim_program_slice`](src/projectbrain/slicer.py) uses real Tree-sitter Concrete Syntax Trees (multi-line destructuring, typed parameters, `try`/`catch`, `switch`/`case`, and statement span grouping) for `.ts`, `.tsx`, `.js`, `.jsx`, `.go`, `.rs`, and `.java` in addition to Python's `ast` module.
+2. **Fast Cold `brain.load()`, Union-Regex `.gitignore`, and Checked-In External Benchmarks (`v0.8.8`):**
+   - Deferred `classify_file_functions` to on-demand `_get_file_behaviors(rel)`, memoized `_tokenize_symbol` with pre-compiled regexes, and compiled non-negated `.gitignore` rules into union regexes, cutting cold `load()` on `django/django` (`3,051` files) from `8.32 s` to `3.04 s` and single-file incremental edits to **`540 ms`**.
+   - Checked in [`eval/bench_external.py`](eval/bench_external.py) reproducing the 6-question Flask dossier benchmark, end-to-end `red -> green` bug-fix workflow (`compile_dossier` -> `slice_symbols` -> `patch` -> functional test), and 3,051-file Django scale suite.
 
 1. **Dossier Token Budget, Docstring Folding, and Visible PDG Provenance (`v0.8.7`):**
    - Folded multi-line Python docstrings (`> 3` lines) in dossier slices before budgeting `max_lines`, replaced verbose Markdown 6D tables and file skeletons with compact 1-line summaries on secondary files, and wired [`compute_multidim_program_slice`](src/projectbrain/slicer.py) directly into `compile_dossier()` with explicit `# [PDG Slice: seeds=L.. | bwd_defs=L.. | fwd_uses=L.. | guards=L.. | vars=...]` headers.
