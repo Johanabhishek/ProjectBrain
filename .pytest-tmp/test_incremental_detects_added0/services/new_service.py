@@ -1,2 +1,0 @@
-def serve():
-    return "hello"

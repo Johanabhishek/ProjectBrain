@@ -16,3 +16,15 @@ dist/
 .projectbrain_ledger.json
 .projectbrain_dossier.md
 .projectbrain_patch.diff
+
+.pytest-tmp/
+.pytest-v2/
+projectbrain/.pytest-v2/
+*.projectbrain.db
+.projectbrain.db
+Dasari_Johan_Abhishek_Resume.md
+Brain notes 1.md
+FUTURE_ROADMAP.md
+projectbrain_recommendations.md
+projectbrain/AGENT_CONTEXT_RUNTIME.md
+.agents/
