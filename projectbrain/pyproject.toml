@@ -4,16 +4,32 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "projectbrain-mcp"
-version = "0.6.0"
-description = "Universal 6D Behavioral IR, Interprocedural Effect Bubbling, State-Channel Graph, Closed-World Dossier & Surgical Anchor Patch Engine for AI Coding Agents"
+version = "0.8.3"
+description = "Universal 6D Behavioral IR, Pure SQLite Graph-as-Storage (FTS5 + Recursive CTE + Delta Overlay), Polyglot AST Slicer (Py/TS/Go/Rust/Java/SQL), and Symbol-Anchored Patch Engine for AI Coding Agents"
 readme = "README.md"
 license = { text = "MIT" }
-requires-python = ">=3.9"
-keywords = ["ai", "agents", "mcp", "ast", "tree-sitter", "context-compression", "code-graph", "llm"]
+requires-python = ">=3.10"
+keywords = [
+    "ai",
+    "agents",
+    "mcp",
+    "ast",
+    "tree-sitter",
+    "context-compression",
+    "code-graph",
+    "sqlite",
+    "fts5",
+    "static-analysis",
+    "llm",
+]
 classifiers = [
-    "Development Status :: 4 - Beta",
+    "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Software Development :: Code Generators",
     "Topic :: Software Development :: Compilers",
 ]
@@ -23,6 +39,9 @@ dependencies = [
     "tree-sitter-python",
     "tree-sitter-javascript",
     "tree-sitter-typescript",
+    "tree-sitter-go",
+    "tree-sitter-rust",
+    "tree-sitter-java",
 ]
 
 [project.optional-dependencies]

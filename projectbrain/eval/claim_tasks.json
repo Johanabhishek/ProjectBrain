@@ -124,11 +124,11 @@
     "note": "ANTI-FALSE-REFUTATION: the file parsed partial, so absence from the captured set proves nothing. UNKNOWN, never REFUTED."
   },
   {
-    "id": "claims-go-unsupported-language",
+    "id": "claims-go-supported-language",
     "project": "sample_claims",
     "subject": "legacy/util.go", "relation": "defines", "object": "Helper",
-    "expected_verdict": "UNKNOWN",
-    "note": "HONESTY: Go has no grammar, so an empty symbol set means 'not looked at'. Never REFUTED."
+    "expected_verdict": "SUPPORTED",
+    "note": "Polyglot Go Tree-sitter CST codec parses legacy/util.go and extracts func Helper()."
   },
   {
     "id": "claims-ts-has-method",

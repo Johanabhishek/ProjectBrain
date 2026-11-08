@@ -97,3 +97,11 @@ def test_dogfood_context_compiler_token_savings_and_recall_floor():
     assert avg_recall >= 0.8, f"dogfood context compiler recall regressed: {avg_recall:.0%}"
     assert avg_saved >= 75.0, f"dogfood token savings regressed: {avg_saved:.1f}%"
 
+
+def test_adversarial_zero_identifier_recall_floor():
+    """Verify that ProjectBrain's zero-identifier adversarial benchmark achieves >= 80% average symbol recall."""
+    data = run()
+    adv = data.get("adversarial_dogfood", [])
+    assert adv
+    avg_recall = sum(a["symbol_recall"] for a in adv) / len(adv)
+    assert avg_recall >= 0.8, f"adversarial zero-identifier recall regressed: {avg_recall:.0%}"

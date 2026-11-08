@@ -1,14 +1,15 @@
 """Tree-sitter based parsers for Python and JS/TS/TSX.
 
 Extracts functions (with exact AST signatures, parameters, return types,
-calls, qualified_calls, and ast_hash), classes (with bases, methods,
-fields/schema, signature, and ast_hash), imports, import_bindings,
-exports, and routes.
+arity_spec, interface_hash, calls, qualified_calls, and ast_hash), classes
+(with bases, methods, fields/schema, signature, interface_hash, and ast_hash),
+imports, import_bindings, exports, and routes.
 """
 from __future__ import annotations
 
 import hashlib
 import re
+import threading
 from tree_sitter import Language, Parser, Query, QueryCursor
 
 import tree_sitter_python as _tspy
@@ -30,7 +31,164 @@ _LANG_MAP: dict[str, Language] = {
     ".tsx": _TSX,
 }
 
+try:
+    import tree_sitter_go as _tsgo
+    _GO = Language(_tsgo.language())
+    _LANG_MAP[".go"] = _GO
+except ImportError:
+    _GO = None
+
+try:
+    import tree_sitter_rust as _tsrs
+    _RS = Language(_tsrs.language())
+    _LANG_MAP[".rs"] = _RS
+except ImportError:
+    _RS = None
+
+try:
+    import tree_sitter_java as _tsjava
+    _JAVA = Language(_tsjava.language())
+    _LANG_MAP[".java"] = _JAVA
+except ImportError:
+    _JAVA = None
+
 _PARSERS: dict[str, Parser] = {ext: Parser(lang) for ext, lang in _LANG_MAP.items()}
+_THREAD_LOCAL = threading.local()
+
+
+def get_parser(ext: str) -> Parser | None:
+    """Return a thread-local Tree-sitter Parser for `ext` (or None if unsupported)."""
+    ext_l = ext.lower()
+    lang = _LANG_MAP.get(ext_l)
+    if lang is None:
+        return None
+    parsers_map: dict[str, Parser] | None = getattr(_THREAD_LOCAL, "parsers", None)
+    if parsers_map is None:
+        parsers_map = {}
+        _THREAD_LOCAL.parsers = parsers_map
+    parser = parsers_map.get(ext_l)
+    if parser is None:
+        parser = Parser(lang)
+        parsers_map[ext_l] = parser
+    return parser
+
+
+def _split_top_level_params(inner: str) -> list[str]:
+    parts: list[str] = []
+    cur: list[str] = []
+    depth = 0
+    in_str: str | None = None
+    for ch in inner:
+        if in_str:
+            cur.append(ch)
+            if ch == in_str:
+                in_str = None
+            continue
+        if ch in ("'", '"', "`"):
+            in_str = ch
+            cur.append(ch)
+        elif ch in "([{<":
+            depth += 1
+            cur.append(ch)
+        elif ch in ")]}>":
+            depth = max(0, depth - 1)
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        tail = "".join(cur).strip()
+        if tail:
+            parts.append(tail)
+    return parts
+
+
+def extract_arity_spec(params_str: str, is_method: bool = False, is_python: bool = True) -> dict:
+    """Compute formal parameter arity bounds (min_args, max_args, kwonly_required, has_varargs)."""
+    s = params_str.strip()
+    if s.startswith("(") and s.endswith(")"):
+        s = s[1:-1].strip()
+    if not s:
+        return {
+            "min_args": 0,
+            "max_args": 0,
+            "has_varargs": False,
+            "has_kwargs": False,
+            "kwonly_required": [],
+        }
+    raw_parts = _split_top_level_params(s)
+    min_pos = 0
+    max_pos = 0
+    has_varargs = False
+    has_kwargs = False
+    in_kwonly = False
+    kwonly_req: list[str] = []
+
+    for idx, p in enumerate(raw_parts):
+        if not p or p == "/":
+            continue
+        first_tok = p.split(":")[0].split("=")[0].strip()
+        if is_python and idx == 0 and (is_method or first_tok in ("self", "cls")):
+            if first_tok in ("self", "cls"):
+                continue
+        if not is_python and idx == 0 and first_tok == "this":
+            continue
+        if p == "*":
+            in_kwonly = True
+            continue
+        if p.startswith("**"):
+            has_kwargs = True
+            continue
+        if p.startswith("*") or p.startswith("..."):
+            has_varargs = True
+            if is_python:
+                in_kwonly = True
+            continue
+
+        top_eq = False
+        top_opt = False
+        d = 0
+        q_ch: str | None = None
+        for ch_i, ch in enumerate(p):
+            if q_ch:
+                if ch == q_ch:
+                    q_ch = None
+                continue
+            if ch in ("'", '"', "`"):
+                q_ch = ch
+            elif ch in "([{<":
+                d += 1
+            elif ch in ")]}>":
+                d = max(0, d - 1)
+            elif d == 0 and ch == "=" and (ch_i + 1 >= len(p) or p[ch_i + 1] != ">"):
+                top_eq = True
+                break
+            elif d == 0 and ch == ":" and ch_i > 0 and p[ch_i - 1] == "?":
+                top_opt = True
+        head = p.split(":", 1)[0].split("=", 1)[0].strip()
+        if head.endswith("?"):
+            top_opt = True
+            head = head[:-1].strip()
+
+        is_optional = top_eq or top_opt
+        if in_kwonly:
+            if not is_optional and re.match(r"^[A-Za-z_]\w*$", head):
+                kwonly_req.append(head)
+        else:
+            max_pos += 1
+            if not is_optional:
+                min_pos += 1
+
+    return {
+        "min_args": min_pos,
+        "max_args": None if has_varargs else max_pos,
+        "has_varargs": has_varargs,
+        "has_kwargs": has_kwargs,
+        "kwonly_required": kwonly_req,
+    }
+
 
 _HTTP = {"get", "post", "put", "delete", "patch", "all"}
 
@@ -50,11 +208,24 @@ def _is_express_route(receiver: str, path: str) -> bool:
 
 # ── shared helpers ──────────────────────────────────────────────────────────
 
+_QUERY_CACHE: dict[tuple[int, str], Query] = {}
+
+
+def _get_compiled_query(lang: Language, pattern: str) -> Query:
+    key = (id(lang), pattern)
+    q = _QUERY_CACHE.get(key)
+    if q is None:
+        q = Query(lang, pattern)
+        _QUERY_CACHE[key] = q
+    return q
+
+
 def _captures(lang: Language, pattern: str, root) -> dict:
-    return QueryCursor(Query(lang, pattern)).captures(root)
+    return QueryCursor(_get_compiled_query(lang, pattern)).captures(root)
+
 
 def _matches(lang: Language, pattern: str, root):
-    return QueryCursor(Query(lang, pattern)).matches(root)
+    return QueryCursor(_get_compiled_query(lang, pattern)).matches(root)
 
 def _text(node) -> str:
     return node.text.decode("utf-8", errors="replace")
@@ -66,7 +237,7 @@ def _end_line(node) -> int:
     return node.end_point[0] + 1
 
 def _ast_hash(text: str) -> str:
-    """Fast 8-byte hex blake2b hash of normalized AST node text for staleness detection."""
+    """Fast 6-byte hex blake2b hash of normalized AST node text for staleness detection."""
     normalized = re.sub(r"\s+", " ", text.strip())
     return hashlib.blake2b(normalized.encode("utf-8", errors="replace"), digest_size=6).hexdigest()
 
@@ -106,7 +277,7 @@ _PY_ROUTE = """
 (decorated_definition
   (decorator
     (call
-      function: (attribute attribute: (identifier) @method)
+      function: (attribute object: (_) @router_obj attribute: (identifier) @method)
       arguments: (argument_list (string (string_content) @path)) @args))
   definition: (function_definition name: (identifier) @handler))
 """
@@ -181,7 +352,6 @@ def _py_class_fields(body_node) -> list[str]:
                             else:
                                 fields.append(lhs)
                     elif not left and typ:
-                        # Pure type annotation inside assignment in tree-sitter-python: `x: int`
                         ann_text = _collapse_ws(_text(sub))
                         if len(ann_text) <= 80:
                             fields.append(ann_text)
@@ -248,12 +418,7 @@ def _py_direct_methods(body_node) -> list:
 
 
 def _py_extract_imports_and_bindings(root) -> tuple[list[str], dict[str, dict]]:
-    """Extract both backward-compatible `imports` list AND symbol-level `import_bindings`.
-
-    `import_bindings` maps local alias/symbol name -> {"module": mod, "symbol": orig_symbol}.
-    Also adds `module.symbol` candidates to `imports` when `from pkg import submodule` is used,
-    so `resolve.py` can resolve submodule imports accurately.
-    """
+    """Extract both backward-compatible `imports` list AND symbol-level `import_bindings`."""
     caps = _captures(_PY, _PY_IMPORT, root)
     imports_set: set[str] = set()
     bindings: dict[str, dict] = {}
@@ -279,7 +444,6 @@ def _py_extract_imports_and_bindings(root) -> tuple[list[str], dict[str, dict]]:
         else:
             imports_set.add(mod_text)
 
-    # Walk top-level and nested import statements for rich symbol bindings
     def _walk_imports(node):
         for child in node.children:
             if child.type == "import_statement":
@@ -332,7 +496,7 @@ _BODY_NOISE = {
 def _extract_body_tokens(func_node, const_map: dict[str, str] | None = None) -> list[str]:
     """Extract distinct domain words from a function's body/comments plus any
     same-file module-level constants it references (e.g. BLOCKED_PATTERNS)."""
-    raw_text = _text(func_node)[:4000]
+    raw_text = _text(func_node)[:6000]
     extra_texts = [raw_text]
     if const_map:
         referenced = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", raw_text))
@@ -340,16 +504,30 @@ def _extract_body_tokens(func_node, const_map: dict[str, str] | None = None) -> 
             if ref in const_map:
                 extra_texts.append(const_map[ref])
     combined = " ".join(extra_texts)
-    words = re.findall(r"[a-zA-Z]{3,}", combined)
     out: list[str] = []
     seen: set[str] = set()
+    # Pass 1: prioritize PascalCase / camelCase / snake_case code identifiers so docstrings don't crowd them out
+    for ident in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", raw_text):
+        if "_" in ident or any(c.isupper() for c in ident[1:]) or (ident[0].isupper() and any(c.islower() for c in ident[1:])):
+            clean_id = ident.replace("_", "").lower()
+            parts = [clean_id] + [p.lower() for p in re.sub(r"([a-z])([A-Z])", r"\1 \2", ident).replace("_", " ").split()]
+            for p in parts:
+                if len(p) >= 3 and p not in _BODY_NOISE and p not in seen:
+                    seen.add(p)
+                    out.append(p)
+                    if len(out) >= 90:
+                        break
+        if len(out) >= 90:
+            break
+    # Pass 2: general lexical words up to 140 total tokens
+    words = re.findall(r"[a-zA-Z]{3,}", combined)
     for w in words:
         parts = [w.lower()] + [p.lower() for p in re.sub(r"([a-z])([A-Z])", r"\1 \2", w).split()]
         for p in parts:
             if len(p) >= 3 and p not in _BODY_NOISE and p not in seen:
                 seen.add(p)
                 out.append(p)
-                if len(out) >= 60:
+                if len(out) >= 140:
                     return out
     return out
 
@@ -467,6 +645,7 @@ def _parse_python(root) -> dict:
             "bases": bases,
             "methods": method_names,
             "fields": fields,
+            "interface_hash": _ast_hash(f"{cls_sig}|{'|'.join(method_names)}|{'|'.join(fields)}"),
             "ast_hash": _ast_hash(_text(cls_node)),
         })
 
@@ -502,6 +681,8 @@ def _parse_python(root) -> dict:
                     if qual not in qualified_calls or line < qualified_calls[qual]:
                         qualified_calls[qual] = line
         sig, params, ret_type = _py_func_signature(func_node)
+        parent_cls = method_to_class.get(func_node.start_point)
+        is_meth = parent_cls is not None
         entry = {
             "name": _text(name_node),
             "line_start": _line(func_node),
@@ -509,51 +690,69 @@ def _parse_python(root) -> dict:
             "signature": sig,
             "params": params,
             "return_type": ret_type,
+            "arity_spec": extract_arity_spec(params, is_method=is_meth, is_python=True),
             "docstring": _py_docstring(func_node),
             "body_tokens": _extract_body_tokens(func_node, py_consts),
             "calls": calls,
             "call_sites": call_sites,
             "call_sites_all": call_sites_all,
             "qualified_calls": qualified_calls,
+            "interface_hash": _ast_hash(sig),
             "ast_hash": _ast_hash(_text(func_node)),
         }
-        parent_cls = method_to_class.get(func_node.start_point)
-        if parent_cls is not None:
+        if is_meth:
             entry["is_method"] = True
             entry["parent_class"] = parent_cls
         functions.append(entry)
 
     imports, import_bindings = _py_extract_imports_and_bindings(root)
-    m_pref = re.search(
-        r"\b(?:APIRouter|Blueprint)\s*\([^)]*?\b(?:url_)?prefix\s*=\s*['\"]([^'\"]+)['\"]",
-        _text(root),
-    )
-    router_prefix = m_pref.group(1).rstrip("/") if m_pref else ""
+    raw_root_text = _text(root)
+    router_prefixes: dict[str, str] = {}
+    default_router_prefix = ""
+    for m_rp in re.finditer(
+        r"(?:([A-Za-z_][A-Za-z0-9_]*)\s*=\s*)?\b(?:APIRouter|Blueprint)\s*\([^)]*?\b(?:url_)?prefix\s*=\s*['\"]([^'\"]+)['\"]",
+        raw_root_text,
+    ):
+        r_var, r_pref = m_rp.group(1), m_rp.group(2).rstrip("/")
+        if not default_router_prefix:
+            default_router_prefix = r_pref
+        if r_var:
+            router_prefixes[r_var] = r_pref
 
+    seen_routes: set[tuple[str, str, str]] = set()
     for _, mc in _matches(_PY, _PY_ROUTE, root):
         m_nodes = mc.get("method", [])
         p_nodes = mc.get("path", [])
         h_nodes = mc.get("handler", [])
         a_nodes = mc.get("args", [])
+        r_nodes = mc.get("router_obj", [])
         if not (m_nodes and p_nodes and h_nodes):
             continue
         method = _text(m_nodes[0])
         path = _text(p_nodes[0])
         handler = _text(h_nodes[0])
         line = _line(h_nodes[0])
-        full_path = (f"{router_prefix}/{path.lstrip('/')}".rstrip("/") or "/") if router_prefix else path
+        r_obj = _text(r_nodes[0]).strip() if r_nodes else ""
+        active_prefix = router_prefixes.get(r_obj, default_router_prefix if r_obj in ("router", "bp", "api") or not router_prefixes else "")
+        full_path = (f"{active_prefix}/{path.lstrip('/')}".rstrip("/") or "/") if active_prefix else path
 
         if method in _HTTP:
-            routes.append({
-                "method": method.upper(), "path": path, "full_path": full_path,
-                "handler": handler, "line": line, "framework": "fastapi",
-            })
+            rk = (method.upper(), full_path, handler)
+            if rk not in seen_routes:
+                seen_routes.add(rk)
+                routes.append({
+                    "method": method.upper(), "path": path, "full_path": full_path,
+                    "handler": handler, "line": line, "framework": "fastapi",
+                })
         elif method == "route" and a_nodes:
             for verb in _flask_methods(a_nodes[0]):
-                routes.append({
-                    "method": verb, "path": path, "full_path": full_path,
-                    "handler": handler, "line": line, "framework": "flask",
-                })
+                rk = (verb, full_path, handler)
+                if rk not in seen_routes:
+                    seen_routes.add(rk)
+                    routes.append({
+                        "method": verb, "path": path, "full_path": full_path,
+                        "handler": handler, "line": line, "framework": "flask",
+                    })
     for _, mc in _matches(_PY, _PY_DJANGO_ROUTE, root):
         f_nodes = mc.get("func", [])
         p_nodes = mc.get("path", [])
@@ -740,6 +939,7 @@ def _js_extract_ts_interfaces_and_types(root) -> list[dict]:
                     for prop in body_node.children:
                         if prop.type in ("property_signature", "method_signature"):
                             fields.append(_collapse_ws(_text(prop)).rstrip(";,").strip())
+                f_list = fields[:25]
                 schemas.append({
                     "name": name,
                     "line_start": _line(node),
@@ -747,8 +947,9 @@ def _js_extract_ts_interfaces_and_types(root) -> list[dict]:
                     "signature": f"interface {name}",
                     "bases": [],
                     "methods": [],
-                    "fields": fields[:25],
+                    "fields": f_list,
                     "is_interface": True,
+                    "interface_hash": _ast_hash(f"interface {name}|{'|'.join(f_list)}"),
                     "ast_hash": _ast_hash(_text(node)),
                 })
     return schemas
@@ -846,18 +1047,19 @@ def _parse_js(root, lang: Language) -> dict:
 
         fields = _js_class_fields(body_node)
         ext_str = f" extends {', '.join(bases)}" if bases else ""
+        cls_sig = f"class {cls_name}{ext_str}"
         classes.append({
             "name": cls_name,
             "line_start": _line(cls_node),
             "line_end": _end_line(cls_node),
-            "signature": f"class {cls_name}{ext_str}",
+            "signature": cls_sig,
             "bases": bases,
             "methods": method_names,
             "fields": fields,
+            "interface_hash": _ast_hash(f"{cls_sig}|{'|'.join(method_names)}|{'|'.join(fields)}"),
             "ast_hash": _ast_hash(_text(cls_node)),
         })
 
-    # Add TypeScript interfaces as schema-bearing classes if not colliding
     existing_cls_names = {c["name"] for c in classes}
     for iface in _js_extract_ts_interfaces_and_types(root):
         if iface["name"] not in existing_cls_names:
@@ -903,6 +1105,8 @@ def _parse_js(root, lang: Language) -> dict:
         sig, params, ret_type = _js_func_signature(func_node, fn_name)
         l_start = _line(func_node)
         doc = leading_docs.get(l_start)
+        parent_cls = method_to_class.get(func_node.start_point)
+        is_meth = parent_cls is not None
         entry = {
             "name": fn_name,
             "line_start": l_start,
@@ -910,16 +1114,17 @@ def _parse_js(root, lang: Language) -> dict:
             "signature": sig,
             "params": params,
             "return_type": ret_type,
+            "arity_spec": extract_arity_spec(params, is_method=is_meth, is_python=False),
             "docstring": doc,
             "body_tokens": _extract_body_tokens(func_node, js_consts),
             "calls": calls,
             "call_sites": call_sites,
             "call_sites_all": call_sites_all,
             "qualified_calls": qualified_calls,
+            "interface_hash": _ast_hash(sig),
             "ast_hash": _ast_hash(_text(func_node)),
         }
-        parent_cls = method_to_class.get(func_node.start_point)
-        if parent_cls is not None:
+        if is_meth:
             entry["is_method"] = True
             entry["parent_class"] = parent_cls
         functions.append(entry)
@@ -986,18 +1191,21 @@ def _parse_js(root, lang: Language) -> dict:
                         syn_name = f"route_{method.upper()}_{clean_p}"
                         handler_name = syn_name
                         rc_node = rc_nodes[0] if rc_nodes else last_arg
+                        syn_sig = f"{receiver}.{method}('{path}', (req, res) => ...)"
                         functions.append({
                             "name": syn_name,
                             "line_start": _line(rc_node),
                             "line_end": _end_line(rc_node),
-                            "signature": f"{receiver}.{method}('{path}', (req, res) => ...)",
+                            "signature": syn_sig,
                             "params": "(req, res)",
                             "return_type": "",
+                            "arity_spec": {"min_args": 0, "max_args": 3, "has_varargs": False, "has_kwargs": False, "kwonly_required": []},
                             "docstring": f"Express {method.upper()} {path} route handler",
                             "body_tokens": _extract_body_tokens(last_arg, js_consts),
                             "calls": r_calls,
                             "call_sites": r_sites,
                             "qualified_calls": r_qual,
+                            "interface_hash": _ast_hash(syn_sig),
                             "ast_hash": _ast_hash(_text(last_arg)),
                         })
 
@@ -1022,7 +1230,7 @@ def _parse_js(root, lang: Language) -> dict:
     }
 
 
-# ?? SQL schema & function parser ????????????????????????????????????????????
+# ── SQL schema & function parser ────────────────────────────────────────────
 
 def extract_sql_table_schemas(source: str) -> dict[str, dict]:
     """Extract CREATE TABLE definitions (columns, NOT NULL without DEFAULT) from SQL or inline strings."""
@@ -1231,6 +1439,7 @@ def _parse_sql(source: str) -> dict:
     classes: list[dict] = []
     functions: list[dict] = []
     for tbl_name, sc in schemas.items():
+        f_hash = _ast_hash(",".join(sc["fields"]))
         classes.append({
             "name": tbl_name,
             "line_start": sc["line_start"],
@@ -1242,7 +1451,8 @@ def _parse_sql(source: str) -> dict:
             "required_cols": sc["required_cols"],
             "defaulted_cols": sc["defaulted_cols"],
             "is_sql_table": True,
-            "ast_hash": _ast_hash(",".join(sc["fields"])),
+            "interface_hash": f_hash,
+            "ast_hash": f_hash,
         })
     for m_fn in re.finditer(
         r"\bCREATE\s+(?:OR\s+REPLACE\s+)?FUNCTION\s+(?:[a-zA-Z_]\w*\.)?([a-zA-Z_][a-zA-Z0-9_]*)\s*\(([^)]*)\)",
@@ -1257,21 +1467,24 @@ def _parse_sql(source: str) -> dict:
         l_end = source.count("\n", 0, end_pos) + 1
         body_slice = source[m_fn.start() : end_pos]
         ref_tables = [t for t in schemas if re.search(rf"\b{re.escape(t)}\b", body_slice, re.IGNORECASE)]
+        sig_sql = f"CREATE FUNCTION {fn_nm}({params})"
         functions.append({
             "name": fn_nm,
             "line_start": l_start,
             "line_end": l_end,
-            "signature": f"CREATE FUNCTION {fn_nm}({params})",
+            "signature": sig_sql,
             "params": f"({params})",
             "return_type": "",
+            "arity_spec": extract_arity_spec(f"({params})", is_method=False, is_python=False),
             "docstring": "SQL stored function",
             "body_tokens": [w.lower() for w in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]{2,}", body_slice)][:60],
             "calls": ref_tables,
             "call_sites": {},
             "qualified_calls": {},
+            "interface_hash": _ast_hash(sig_sql),
             "ast_hash": _ast_hash(body_slice),
         })
-    return {
+    res = {
         "functions": functions,
         "classes": classes,
         "imports": [],
@@ -1282,25 +1495,743 @@ def _parse_sql(source: str) -> dict:
         "sql_alters": alters,
         "parse_status": "ok",
     }
+    res["interface_hash"] = compute_file_interface_hash(res)
+    return res
 
 
-# ?? Public entry point ??????????????????????????????????????????????????????
+def compute_file_interface_hash(info: dict) -> str:
+    """Compute a Salsa-style interface hash over exported signatures, classes, imports, routes, and schemas.
 
-def parse(source: str, ext: str) -> dict:
-    """Parse source by file extension. Returns functions/classes/imports/routes/exports."""
-    if ext == ".sql":
-        return _parse_sql(source)
-    lang = _LANG_MAP.get(ext)
-    if lang is None:
+    When a file's body edits do not alter `interface_hash` (nor its outgoing cross-file calls/state channels),
+    incremental indexing can short-circuit global import and graph resolution.
+    """
+    parts: list[str] = []
+    for fn in info.get("functions", []):
+        parts.append(f"fn:{fn.get('parent_class', '')}.{fn.get('name', '')}:{fn.get('interface_hash', fn.get('signature', ''))}")
+    for cls in info.get("classes", []):
+        parts.append(f"cls:{cls.get('name', '')}:{cls.get('interface_hash', cls.get('signature', ''))}")
+    for imp in sorted(info.get("imports", [])):
+        parts.append(f"imp:{imp}")
+    for exp in sorted(info.get("exports", [])):
+        parts.append(f"exp:{exp}")
+    for rt in info.get("routes", []):
+        parts.append(f"rt:{rt.get('method', '')}:{rt.get('full_path', rt.get('path', ''))}:{rt.get('handler', '')}")
+    for tbl in sorted((info.get("sql_schemas") or {}).keys()):
+        sc = info["sql_schemas"][tbl]
+        parts.append(f"sql:{tbl}:{','.join(sc.get('required_cols', []))}:{','.join(sc.get('all_cols', []))}")
+    for alt_t in sorted((info.get("sql_alters") or {}).keys()):
+        parts.append(f"alt:{alt_t}:{len(info['sql_alters'][alt_t])}")
+    for ak in sorted((info.get("const_aliases") or {}).keys()):
+        parts.append(f"al:{ak}:{','.join(info['const_aliases'][ak])}")
+    return _ast_hash("\n".join(parts))
+
+
+
+# ── Polyglot Tree-sitter CST Codecs (Go, Rust, Java) ────────────────────────
+
+def _walk_cst(node):
+    """Iterative pre-order CST generator."""
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        yield cur
+        for ch in reversed(cur.children):
+            stack.append(ch)
+
+
+def _extract_polyglot_calls(body_node) -> tuple[list[str], dict[str, int], dict[str, list[int]], list[dict], list[str]]:
+    """Extract calls, call_sites, call_sites_all, qualified_calls, and body_tokens from a Go/Rust/Java body."""
+    calls_seen: list[str] = []
+    calls_set: set[str] = set()
+    call_sites: dict[str, int] = {}
+    call_sites_all: dict[str, list[int]] = {}
+    qualified_calls: dict[str, int] = {}
+    body_tokens: set[str] = set()
+
+    if body_node is None:
+        return [], {}, {}, {}, []
+
+    for nd in _walk_cst(body_node):
+        nt = nd.type
+        if nt in ("identifier", "field_identifier", "type_identifier", "property_identifier"):
+            tok = _text(nd).strip().lower()
+            if len(tok) >= 3 and tok.isidentifier():
+                body_tokens.add(tok)
+        elif nt in ("call_expression", "method_invocation", "macro_invocation"):
+            ln = _line(nd)
+            callee_txt = ""
+            if nt == "macro_invocation":
+                m_nd = nd.child_by_field_name("macro") or (nd.children[0] if nd.children else None)
+                callee_txt = _text(m_nd).strip() if m_nd else ""
+            elif nt == "method_invocation":
+                obj_nd = nd.child_by_field_name("object")
+                name_nd = nd.child_by_field_name("name")
+                if name_nd:
+                    m_name = _text(name_nd).strip()
+                    callee_txt = f"{_text(obj_nd).strip()}.{m_name}" if obj_nd else m_name
+            else:
+                fn_nd = nd.child_by_field_name("function") or (nd.children[0] if nd.children else None)
+                callee_txt = _text(fn_nd).strip() if fn_nd else ""
+
+            if not callee_txt:
+                continue
+            callee_clean = re.sub(r"::<.*>$", "", callee_txt).replace("::", ".")
+            parts = [p.strip() for p in callee_clean.split(".") if p.strip()]
+            if not parts:
+                continue
+            bare = parts[-1]
+            if not re.match(r"^[A-Za-z_]\w*$", bare):
+                continue
+            if bare not in calls_set:
+                calls_set.add(bare)
+                calls_seen.append(bare)
+            if bare not in call_sites or ln < call_sites[bare]:
+                call_sites[bare] = ln
+            call_sites_all.setdefault(bare, []).append(ln)
+            if len(parts) >= 2:
+                recv = parts[-2]
+                if re.match(r"^[A-Za-z_]\w*$", recv):
+                    q_key = f"{recv}.{bare}"
+                    if q_key not in qualified_calls or ln < qualified_calls[q_key]:
+                        qualified_calls[q_key] = ln
+
+    return calls_seen, call_sites, call_sites_all, qualified_calls, _extract_body_tokens(body_node)
+
+
+def _leading_comment_doc(lines: list[str], start_line: int) -> str | None:
+    """Extract GoDoc (`//`), RustDoc (`///`), or Javadoc (`/** ... */`) immediately preceding `start_line`."""
+    doc_lines: list[str] = []
+    idx = start_line - 2
+    in_block = False
+    while idx >= 0 and len(doc_lines) < 8:
+        s = lines[idx].strip()
+        if not s:
+            break
+        if s.startswith(("#[", "@")):
+            idx -= 1
+            continue
+        if s.endswith("*/"):
+            in_block = True
+            cleaned = s.removesuffix("*/").lstrip("/* \t").strip()
+            if cleaned:
+                doc_lines.append(cleaned)
+            if s.startswith("/*"):
+                in_block = False
+            idx -= 1
+            continue
+        if in_block:
+            if s.startswith("/*"):
+                in_block = False
+            cleaned = s.lstrip("/* \t").strip()
+            if cleaned:
+                doc_lines.append(cleaned)
+            idx -= 1
+            continue
+        if s.startswith("//"):
+            cleaned = s.lstrip("/ \t").strip()
+            if cleaned:
+                doc_lines.append(cleaned)
+            idx -= 1
+            continue
+        break
+    if not doc_lines:
+        return None
+    doc_lines.reverse()
+    return _collapse_ws(" ".join(doc_lines))[:240]
+
+
+def _parse_go(root, source: str) -> dict:
+    functions: list[dict] = []
+    classes: list[dict] = []
+    imports: list[str] = []
+    routes: list[dict] = []
+    methods_by_struct: dict[str, list[str]] = {}
+    lines = source.splitlines()
+    for nd in _walk_cst(root):
+        nt = nd.type
+        if nt == "import_spec":
+            p_nd = nd.child_by_field_name("path") or nd
+            imp_str = _text(p_nd).strip().strip('"').strip("`")
+            if imp_str and imp_str not in imports:
+                imports.append(imp_str)
+        elif nt == "type_spec":
+            name_nd = nd.child_by_field_name("name")
+            type_nd = nd.child_by_field_name("type")
+            if name_nd and type_nd and type_nd.type in ("struct_type", "interface_type"):
+                c_name = _text(name_nd).strip()
+                kind_lbl = "interface" if type_nd.type == "interface_type" else "struct"
+                sig = f"type {c_name} {kind_lbl}"
+                c_txt = _text(nd)
+                classes.append({
+                    "name": c_name,
+                    "bases": [],
+                    "methods": [],
+                    "fields": [],
+                    "signature": sig,
+                    "docstring": _leading_comment_doc(lines, _line(nd.parent) if nd.parent and nd.parent.type == "type_declaration" else _line(nd)),
+                    "line_start": _line(nd),
+                    "line_end": _end_line(nd),
+                    "ast_hash": _ast_hash(c_txt),
+                    "interface_hash": _ast_hash(sig),
+                })
+        elif nt in ("function_declaration", "method_declaration"):
+            name_nd = nd.child_by_field_name("name")
+            if not name_nd:
+                continue
+            fn_name = _text(name_nd).strip()
+            params_nd = nd.child_by_field_name("parameters")
+            res_nd = nd.child_by_field_name("result")
+            body_nd = nd.child_by_field_name("body")
+            params_str = _collapse_ws(_text(params_nd)) if params_nd else "()"
+            ret_str = _collapse_ws(_text(res_nd)) if res_nd else ""
+            parent_cls: str | None = None
+            if nt == "method_declaration":
+                recv_nd = nd.child_by_field_name("receiver")
+                if recv_nd:
+                    recv_txt = _text(recv_nd)
+                    m_recv = re.search(r"\*?\s*([A-Za-z_]\w*)\s*\)", recv_txt)
+                    if m_recv:
+                        parent_cls = m_recv.group(1)
+                        methods_by_struct.setdefault(parent_cls, []).append(fn_name)
+            sig = f"func ({parent_cls}) {fn_name}{params_str}" if parent_cls else f"func {fn_name}{params_str}"
+            if ret_str:
+                sig = f"{sig} {ret_str}"
+            calls, c_sites, c_sites_all, q_calls, b_toks = _extract_polyglot_calls(body_nd)
+            arity = extract_arity_spec(params_str, is_method=False, is_python=False)
+            functions.append({
+                "name": fn_name,
+                "parent_class": parent_cls,
+                "line_start": _line(nd),
+                "line_end": _end_line(nd),
+                "signature": sig,
+                "params": params_str,
+                "return_type": ret_str or None,
+                "decorators": [],
+                "docstring": _leading_comment_doc(lines, _line(nd)),
+                "calls": calls,
+                "call_sites": c_sites,
+                "call_sites_all": c_sites_all,
+                "qualified_calls": q_calls,
+                "body_tokens": b_toks,
+                "arity_spec": arity,
+                "ast_hash": _ast_hash(_text(nd)),
+                "interface_hash": _ast_hash(sig),
+            })
+
+    for cls in classes:
+        if cls["name"] in methods_by_struct:
+            cls["methods"] = methods_by_struct[cls["name"]]
+            cls["interface_hash"] = _ast_hash(f"{cls['signature']}|{','.join(sorted(cls['methods']))}")
+
+    # Extract Go Gin / Echo / Chi / Fiber / net/http routes
+    for idx, line in enumerate(source.splitlines(), start=1):
+        m_rt = re.search(
+            r'\b(?:GET|POST|PUT|DELETE|PATCH|HandleFunc|Get|Post|Put|Delete)\s*\(\s*"([^"]+)"\s*,\s*([A-Za-z_][\w.]*)',
+            line,
+        )
+        if m_rt:
+            verb_m = re.search(r"\.(GET|POST|PUT|DELETE|PATCH|Get|Post|Put|Delete|HandleFunc)\s*\(", line)
+            verb = verb_m.group(1).upper() if verb_m else "ANY"
+            if verb == "HANDLEFUNC":
+                verb = "ANY"
+            path_str = m_rt.group(1)
+            handler_str = m_rt.group(2).split(".")[-1]
+            routes.append({"method": verb, "path": path_str, "handler": handler_str, "line": idx})
+
+    return {
+        "functions": functions,
+        "classes": classes,
+        "imports": imports,
+        "import_bindings": {},
+        "exports": [f["name"] for f in functions if f["name"][:1].isupper()],
+        "routes": routes,
+    }
+
+
+def _parse_rust(root, source: str) -> dict:
+    functions: list[dict] = []
+    classes: list[dict] = []
+    imports: list[str] = []
+    routes: list[dict] = []
+    methods_by_type: dict[str, list[str]] = {}
+    lines = source.splitlines()
+
+    for nd in _walk_cst(root):
+        nt = nd.type
+        if nt == "use_declaration":
+            u_txt = _collapse_ws(_text(nd)).removeprefix("pub ").removeprefix("use ").rstrip(";").strip()
+            if u_txt and u_txt not in imports:
+                imports.append(u_txt)
+        elif nt in ("struct_item", "enum_item", "trait_item"):
+            name_nd = nd.child_by_field_name("name")
+            if not name_nd:
+                continue
+            c_name = _text(name_nd).strip()
+            kind_lbl = nt.split("_")[0]
+            sig = f"{kind_lbl} {c_name}"
+            classes.append({
+                "name": c_name,
+                "bases": [],
+                "methods": [],
+                "fields": [],
+                "signature": sig,
+                "docstring": _leading_comment_doc(lines, _line(nd)),
+                "line_start": _line(nd),
+                "line_end": _end_line(nd),
+                "ast_hash": _ast_hash(_text(nd)),
+                "interface_hash": _ast_hash(sig),
+            })
+        elif nt == "function_item":
+            name_nd = nd.child_by_field_name("name")
+            if not name_nd:
+                continue
+            fn_name = _text(name_nd).strip()
+            params_nd = nd.child_by_field_name("parameters")
+            ret_nd = nd.child_by_field_name("return_type")
+            body_nd = nd.child_by_field_name("body")
+            params_str = _collapse_ws(_text(params_nd)) if params_nd else "()"
+            ret_str = _collapse_ws(_text(ret_nd)).removeprefix("->").strip() if ret_nd else ""
+            parent_cls: str | None = None
+            p_cur = nd.parent
+            while p_cur is not None:
+                if p_cur.type == "impl_item":
+                    t_nd = p_cur.child_by_field_name("type")
+                    if t_nd:
+                        parent_cls = re.sub(r"<.*>$", "", _text(t_nd).strip())
+                        methods_by_type.setdefault(parent_cls, []).append(fn_name)
+                    break
+                p_cur = p_cur.parent
+            sig = f"fn {parent_cls}::{fn_name}{params_str}" if parent_cls else f"fn {fn_name}{params_str}"
+            if ret_str:
+                sig = f"{sig} -> {ret_str}"
+            calls, c_sites, c_sites_all, q_calls, b_toks = _extract_polyglot_calls(body_nd)
+            is_meth = bool(parent_cls and re.search(r"\bself\b", params_str))
+            arity = extract_arity_spec(params_str, is_method=is_meth, is_python=False)
+            l_start = _line(nd)
+            # Check preceding lines for Actix #[get("/path")] / #[post("/path")] attributes
+            for attr_ln in range(max(1, l_start - 3), l_start):
+                attr_txt = lines[attr_ln - 1].strip()
+                m_actix = re.match(r'^#\[(get|post|put|delete|patch)\(\s*"([^"]+)"', attr_txt, re.IGNORECASE)
+                if m_actix:
+                    routes.append({
+                        "method": m_actix.group(1).upper(),
+                        "path": m_actix.group(2),
+                        "handler": fn_name,
+                        "line": l_start,
+                    })
+            functions.append({
+                "name": fn_name,
+                "parent_class": parent_cls,
+                "line_start": l_start,
+                "line_end": _end_line(nd),
+                "signature": sig,
+                "params": params_str,
+                "return_type": ret_str or None,
+                "decorators": [],
+                "docstring": _leading_comment_doc(lines, l_start),
+                "calls": calls,
+                "call_sites": c_sites,
+                "call_sites_all": c_sites_all,
+                "qualified_calls": q_calls,
+                "body_tokens": b_toks,
+                "arity_spec": arity,
+                "ast_hash": _ast_hash(_text(nd)),
+                "interface_hash": _ast_hash(sig),
+            })
+
+    for cls in classes:
+        if cls["name"] in methods_by_type:
+            cls["methods"] = methods_by_type[cls["name"]]
+            cls["interface_hash"] = _ast_hash(f"{cls['signature']}|{','.join(sorted(cls['methods']))}")
+
+    # Check Axum `.route("/path", get(handler))`
+    for idx, line in enumerate(lines, start=1):
+        m_axum = re.search(
+            r'\.route\(\s*"([^"]+)"\s*,\s*(get|post|put|delete|patch)\(\s*([A-Za-z_][\w:]*)',
+            line,
+            re.IGNORECASE,
+        )
+        if m_axum:
+            routes.append({
+                "method": m_axum.group(2).upper(),
+                "path": m_axum.group(1),
+                "handler": m_axum.group(3).split("::")[-1],
+                "line": idx,
+            })
+
+    return {
+        "functions": functions,
+        "classes": classes,
+        "imports": imports,
+        "import_bindings": {},
+        "exports": [f["name"] for f in functions],
+        "routes": routes,
+    }
+
+
+def _parse_java(root, source: str) -> dict:
+    functions: list[dict] = []
+    classes: list[dict] = []
+    imports: list[str] = []
+    routes: list[dict] = []
+    methods_by_cls: dict[str, list[str]] = {}
+    cls_route_prefix: dict[str, str] = {}
+    lines = source.splitlines()
+    for nd in _walk_cst(root):
+        nt = nd.type
+        if nt == "import_declaration":
+            imp_txt = _collapse_ws(_text(nd)).removeprefix("import ").removeprefix("static ").rstrip(";").strip()
+            if imp_txt and imp_txt not in imports:
+                imports.append(imp_txt)
+        elif nt in ("class_declaration", "interface_declaration", "enum_declaration", "record_declaration"):
+            name_nd = nd.child_by_field_name("name")
+            if not name_nd:
+                continue
+            c_name = _text(name_nd).strip()
+            kind_lbl = nt.split("_")[0]
+            sig = f"{kind_lbl} {c_name}"
+            # Check class-level @RequestMapping("/prefix")
+            c_head = _text(nd).split("{", 1)[0]
+            m_pref = re.search(r'@RequestMapping\(\s*(?:value\s*=\s*|path\s*=\s*)?"([^"]+)"', c_head)
+            if m_pref:
+                cls_route_prefix[c_name] = m_pref.group(1).rstrip("/")
+            classes.append({
+                "name": c_name,
+                "bases": [],
+                "methods": [],
+                "fields": [],
+                "signature": sig,
+                "docstring": _leading_comment_doc(lines, _line(nd)),
+                "line_start": _line(nd),
+                "line_end": _end_line(nd),
+                "ast_hash": _ast_hash(_text(nd)),
+                "interface_hash": _ast_hash(sig),
+            })
+        elif nt in ("method_declaration", "constructor_declaration"):
+            name_nd = nd.child_by_field_name("name")
+            if not name_nd:
+                continue
+            fn_name = _text(name_nd).strip()
+            params_nd = nd.child_by_field_name("parameters")
+            type_nd = nd.child_by_field_name("type")
+            body_nd = nd.child_by_field_name("body")
+            params_str = _collapse_ws(_text(params_nd)) if params_nd else "()"
+            ret_str = _collapse_ws(_text(type_nd)) if type_nd else "void"
+            parent_cls: str | None = None
+            p_cur = nd.parent
+            while p_cur is not None:
+                if p_cur.type in ("class_declaration", "interface_declaration", "enum_declaration", "record_declaration"):
+                    cn_nd = p_cur.child_by_field_name("name")
+                    if cn_nd:
+                        parent_cls = _text(cn_nd).strip()
+                        methods_by_cls.setdefault(parent_cls, []).append(fn_name)
+                    break
+                p_cur = p_cur.parent
+            sig = f"{ret_str} {parent_cls}.{fn_name}{params_str}" if parent_cls else f"{ret_str} {fn_name}{params_str}"
+            calls, c_sites, c_sites_all, q_calls, b_toks = _extract_polyglot_calls(body_nd)
+            arity = extract_arity_spec(params_str, is_method=False, is_python=False)
+            l_start = _line(nd)
+            m_head = _text(nd).split("{", 1)[0]
+            m_spring = re.search(
+                r'@(Get|Post|Put|Delete|Patch|Request)Mapping(?:\(\s*(?:value\s*=\s*|path\s*=\s*)?"([^"]*)")?',
+                m_head,
+            )
+            if m_spring:
+                verb = m_spring.group(1).upper()
+                if verb == "REQUEST":
+                    verb = "ANY"
+                sub_path = m_spring.group(2) or ""
+                if sub_path and not sub_path.startswith("/"):
+                    sub_path = "/" + sub_path
+                pref = cls_route_prefix.get(parent_cls or "", "")
+                full_path = f"{pref}{sub_path}" or "/"
+                routes.append({
+                    "method": verb,
+                    "path": full_path,
+                    "handler": fn_name,
+                    "line": l_start,
+                })
+            functions.append({
+                "name": fn_name,
+                "parent_class": parent_cls,
+                "line_start": l_start,
+                "line_end": _end_line(nd),
+                "signature": sig,
+                "params": params_str,
+                "return_type": ret_str,
+                "decorators": [],
+                "docstring": _leading_comment_doc(lines, l_start),
+                "calls": calls,
+                "call_sites": c_sites,
+                "call_sites_all": c_sites_all,
+                "qualified_calls": q_calls,
+                "body_tokens": b_toks,
+                "arity_spec": arity,
+                "ast_hash": _ast_hash(_text(nd)),
+                "interface_hash": _ast_hash(sig),
+            })
+
+    for cls in classes:
+        if cls["name"] in methods_by_cls:
+            cls["methods"] = methods_by_cls[cls["name"]]
+            cls["interface_hash"] = _ast_hash(f"{cls['signature']}|{','.join(sorted(cls['methods']))}")
+
+    return {
+        "functions": functions,
+        "classes": classes,
+        "imports": imports,
+        "import_bindings": {},
+        "exports": [c["name"] for c in classes] + [f["name"] for f in functions],
+        "routes": routes,
+    }
+
+
+
+# ── Public entry points ─────────────────────────────────────────────────────
+
+_STRUCTURAL_POLYGLOT_EXTS = {
+    ".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh",
+    ".cs", ".kt", ".kts", ".scala", ".rb", ".php", ".swift",
+    ".graphql", ".gql", ".prisma", ".proto",
+}
+
+
+def _extract_sfc_script_preserving_lines(source: str) -> tuple[str, str]:
+    """Extract `<script>` block(s) from `.vue` / `.svelte` files while preserving 1-based line numbers."""
+    lines = source.splitlines()
+    out_lines = [""] * len(lines)
+    in_script = False
+    is_ts = False
+    for idx, line in enumerate(lines):
+        if not in_script:
+            m_open = re.search(r"<script\b([^>]*)>", line, re.IGNORECASE)
+            if m_open:
+                attrs = m_open.group(1) or ""
+                if re.search(r'\blang\s*=\s*["\']?(?:ts|typescript)\b', attrs, re.IGNORECASE):
+                    is_ts = True
+                after = line[m_open.end():]
+                m_close_same = re.search(r"</script\s*>", after, re.IGNORECASE)
+                if m_close_same:
+                    out_lines[idx] = after[:m_close_same.start()]
+                else:
+                    in_script = True
+                    out_lines[idx] = after
+        else:
+            m_close = re.search(r"</script\s*>", line, re.IGNORECASE)
+            if m_close:
+                out_lines[idx] = line[:m_close.start()]
+                in_script = False
+            else:
+                out_lines[idx] = line
+    return "\n".join(out_lines), (".ts" if is_ts else ".js")
+
+
+def _find_matching_brace_end(lines: list[str], start_idx: int, max_scan: int = 400) -> int:
+    """Return 1-based end line of a brace-delimited block starting near `start_idx` (0-based)."""
+    depth = 0
+    opened = False
+    limit = min(len(lines), start_idx + max_scan)
+    for i in range(start_idx, limit):
+        ln = lines[i]
+        for ch in ln:
+            if ch == "{":
+                depth += 1
+                opened = True
+            elif ch == "}":
+                depth -= 1
+                if opened and depth <= 0:
+                    return i + 1
+        if not opened and ln.rstrip().endswith(";"):
+            return i + 1
+    return min(len(lines), start_idx + 1)
+
+
+def _parse_polyglot_structural(source: str, ext: str) -> dict:
+    """Structural parser for C/C++, C#, Kotlin, Scala, Ruby, PHP, Swift, GraphQL, Prisma, and Protobuf."""
+    lines = source.splitlines()
+    functions: list[dict] = []
+    classes: list[dict] = []
+    imports: list[str] = []
+    routes: list[dict] = []
+    current_cls: str | None = None
+    cls_end_line = 0
+    methods_by_cls: dict[str, list[str]] = {}
+
+    for i, raw_line in enumerate(lines):
+        lno = i + 1
+        if current_cls and lno > cls_end_line:
+            current_cls = None
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith(("//", "#", "/*", "*")):
+            continue
+
+        m_imp = (
+            re.match(r'^#\s*include\s+[<"]([^>"]+)[>"]', stripped)
+            or re.match(r'^(?:using|import|package)\s+([A-Za-z0-9_.*:]+)', stripped)
+            or re.match(r'^(?:require|require_relative|include|use)\s+["\']?([A-Za-z0-9_./:\\-]+)', stripped)
+        )
+        if m_imp:
+            imp_val = m_imp.group(1).strip().rstrip(";")
+            if imp_val and imp_val not in imports:
+                imports.append(imp_val)
+            continue
+
+        m_rt = (
+            re.search(r'\[Http(Get|Post|Put|Delete|Patch)\(\s*"([^"]*)"\s*\)\]', stripped)
+            or re.search(r'\bRoute::(get|post|put|delete|patch)\(\s*["\']([^"\']+)["\']', stripped, re.IGNORECASE)
+            or re.search(r'^(get|post|put|delete|patch)\s+["\']([^"\']+)["\']', stripped)
+        )
+        if m_rt:
+            routes.append({
+                "method": m_rt.group(1).upper(),
+                "path": m_rt.group(2) or "/",
+                "handler": current_cls or "route_handler",
+                "line": lno,
+            })
+
+        m_cls = re.match(
+            r'^(?:(?:public|private|protected|internal|abstract|sealed|final|open|data|case|partial|static|export)\s+)*'
+            r'(class|struct|interface|trait|object|enum|protocol|extension|model|type|input|service|message)\s+'
+            r'([A-Za-z_][A-Za-z0-9_]*)(?:\s*(?:<[^>]+>)?\s*(?::|extends|implements|<)\s*([A-Za-z0-9_.,\s<>]+))?',
+            stripped,
+        )
+        if m_cls:
+            kind, cname, bases_raw = m_cls.group(1), m_cls.group(2), m_cls.group(3) or ""
+            end_l = (
+                _find_matching_brace_end(lines, i, max_scan=800)
+                if ext != ".rb"
+                else min(len(lines), lno + 60)
+            )
+            bases = [b.strip() for b in re.split(r"[,&\s]+", bases_raw) if b.strip() and b.strip()[0].isupper()][:4]
+            sig = f"{kind} {cname}" + (f"({', '.join(bases)})" if bases else "")
+            classes.append({
+                "name": cname,
+                "line_start": lno,
+                "line_end": end_l,
+                "bases": bases,
+                "methods": [],
+                "fields": [],
+                "signature": sig,
+                "docstring": _leading_comment_doc(lines, lno),
+                "ast_hash": _ast_hash("\n".join(lines[i:end_l])),
+                "interface_hash": _ast_hash(sig),
+            })
+            current_cls = cname
+            cls_end_line = end_l
+            continue
+
+        m_fn = (
+            re.match(r'^(?:(?:public|private|protected|static|async|virtual|override|suspend|inline|fun|func|function|def)\s+)+([A-Za-z_][A-Za-z0-9_?!]*)\s*(\([^)]*\))?', stripped)
+            or re.match(r'^rpc\s+([A-Za-z_][A-Za-z0-9_]*)\s*(\([^)]*\))', stripped)
+            or (
+                ext in (".c", ".h", ".cpp", ".cc", ".cxx", ".hpp", ".hh", ".cs", ".java", ".kt", ".scala")
+                and re.match(
+                    r'^(?:(?:public|private|protected|internal|static|virtual|override|inline|const|constexpr|async|extern)\s+)*'
+                    r'[A-Za-z_][A-Za-z0-9_:<>,*\s&]+\s+([A-Za-z_][A-Za-z0-9_]*)\s*(\([^;{}]*\))\s*(?:const\s*)?(?:\{|$)',
+                    stripped,
+                )
+            )
+        )
+        if m_fn:
+            fn_name = m_fn.group(1)
+            if fn_name in ("if", "for", "while", "switch", "catch", "return", "sizeof", "typeof", "new", "delete"):
+                continue
+            params_str = (m_fn.group(2) or "()").strip()
+            end_l = (
+                _find_matching_brace_end(lines, i, max_scan=300)
+                if ext != ".rb"
+                else min(len(lines), lno + 30)
+            )
+            body_text = "\n".join(lines[i:end_l])
+            raw_calls = [
+                m.group(1)
+                for m in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\(", body_text)
+                if m.group(1) not in (fn_name, "if", "for", "while", "switch", "catch", "return", "sizeof")
+            ]
+            seen_c: set[str] = set()
+            dedup_calls: list[str] = []
+            for c_nm in raw_calls:
+                if c_nm not in seen_c:
+                    seen_c.add(c_nm)
+                    dedup_calls.append(c_nm)
+            b_toks = [
+                w.lower()
+                for w in re.findall(r"[A-Za-z_][A-Za-z0-9_]{2,}", body_text)
+                if w.lower() not in _BODY_NOISE
+            ][:100]
+            sig = f"{current_cls}.{fn_name}{params_str}" if current_cls else f"{fn_name}{params_str}"
+            if current_cls:
+                methods_by_cls.setdefault(current_cls, []).append(fn_name)
+            functions.append({
+                "name": fn_name,
+                "parent_class": current_cls,
+                "line_start": lno,
+                "line_end": end_l,
+                "signature": sig,
+                "params": params_str,
+                "return_type": "",
+                "decorators": [],
+                "docstring": _leading_comment_doc(lines, lno),
+                "calls": dedup_calls[:40],
+                "call_sites": {},
+                "call_sites_all": {},
+                "qualified_calls": {},
+                "body_tokens": b_toks,
+                "arity_spec": extract_arity_spec(params_str, is_method=bool(current_cls), is_python=False),
+                "ast_hash": _ast_hash(body_text),
+                "interface_hash": _ast_hash(sig),
+            })
+
+    for cls in classes:
+        if cls["name"] in methods_by_cls:
+            cls["methods"] = methods_by_cls[cls["name"]]
+            cls["interface_hash"] = _ast_hash(f"{cls['signature']}|{','.join(sorted(cls['methods']))}")
+
+    res = {
+        "functions": functions,
+        "classes": classes,
+        "imports": imports,
+        "import_bindings": {},
+        "exports": [c["name"] for c in classes] + [f["name"] for f in functions],
+        "routes": routes,
+        "parse_status": "ok",
+    }
+    res["interface_hash"] = compute_file_interface_hash(res)
+    return res
+
+
+def parse_with_tree(source: str, ext: str) -> tuple[dict, object | None]:
+    """Parse source by file extension and return `(result_dict, tree_sitter_tree)` for single-pass reuse."""
+    ext_l = ext.lower()
+    if ext_l == ".sql":
+        return _parse_sql(source), None
+    if ext_l in (".vue", ".svelte"):
+        script_src, script_ext = _extract_sfc_script_preserving_lines(source)
+        return parse_with_tree(script_src, script_ext)
+    if ext_l in _STRUCTURAL_POLYGLOT_EXTS and ext_l not in _LANG_MAP:
+        return _parse_polyglot_structural(source, ext_l), None
+    parser = get_parser(ext_l)
+    lang = _LANG_MAP.get(ext_l)
+    if parser is None or lang is None:
         return {
             "functions": [], "classes": [], "imports": [], "routes": [],
             "parse_status": "unsupported",
-        }
+        }, None
 
-    tree = _PARSERS[ext].parse(source.encode("utf-8", errors="replace"))
+
+    tree = parser.parse(source.encode("utf-8", errors="replace"))
     root = tree.root_node
 
-    result = _parse_python(root) if ext == ".py" else _parse_js(root, lang)
+    if ext_l == ".py":
+        result = _parse_python(root)
+    elif ext_l == ".go":
+        result = _parse_go(root, source)
+    elif ext_l == ".rs":
+        result = _parse_rust(root, source)
+    elif ext_l == ".java":
+        result = _parse_java(root, source)
+    else:
+        result = _parse_js(root, lang)
     up_src = source.upper()
     if "CREATE TABLE" in up_src:
         sql_sc = extract_sql_table_schemas(source)
@@ -1315,7 +2246,15 @@ def parse(source: str, ext: str) -> dict:
                     if sc_k.lower() == tbl_k.lower():
                         apply_sql_alters_to_schema(sc_obj, ops)
     result["parse_status"] = "partial" if root.has_error else "ok"
-    return result
+    result["interface_hash"] = compute_file_interface_hash(result)
+    return result, tree
+
+
+def parse(source: str, ext: str) -> dict:
+    """Parse source by file extension. Returns functions/classes/imports/routes/exports."""
+    res, _ = parse_with_tree(source, ext)
+    return res
+
 
 # ── Legacy shims (brain.py calls these directly) ────────────────────────────
 

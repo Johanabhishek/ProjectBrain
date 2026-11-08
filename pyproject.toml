@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61.0,<77.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "projectbrain-mcp"
+version = "0.8.3"
+description = "Universal 6D Behavioral IR, Pure SQLite Graph-as-Storage (FTS5 + Recursive CTE + Delta Overlay), Polyglot AST Slicer (Py/TS/Go/Rust/Java/SQL), and Symbol-Anchored Patch Engine for AI Coding Agents"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+keywords = [
+    "ai",
+    "agents",
+    "mcp",
+    "ast",
+    "tree-sitter",
+    "context-compression",
+    "code-graph",
+    "sqlite",
+    "fts5",
+    "static-analysis",
+    "llm",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Code Generators",
+    "Topic :: Software Development :: Compilers",
+]
+dependencies = [
+    "mcp",
+    "tree-sitter>=0.23",
+    "tree-sitter-python",
+    "tree-sitter-javascript",
+    "tree-sitter-typescript",
+    "tree-sitter-go",
+    "tree-sitter-rust",
+    "tree-sitter-java",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=7", "build", "twine"]
+
+[project.scripts]
+projectbrain = "projectbrain.cli:main"
+projectbrain-mcp = "projectbrain.server:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

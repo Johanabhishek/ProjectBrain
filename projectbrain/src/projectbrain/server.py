@@ -19,6 +19,7 @@ for backward compatibility.
 """
 import os
 import sys
+import threading
 
 from mcp.server.fastmcp import FastMCP
 
@@ -35,15 +36,17 @@ mcp = FastMCP("projectbrain")
 _default_root = _resolve_root()
 _brain = ProjectBrain(_default_root)
 _brains_by_root: dict[str, ProjectBrain] = {os.path.abspath(_default_root): _brain}
+_brains_lock = threading.RLock()
 
 
 def _get_brain(repo_path: str | None = None) -> ProjectBrain:
     if not repo_path:
         return _brain
     key = os.path.abspath(repo_path)
-    if key not in _brains_by_root:
-        _brains_by_root[key] = ProjectBrain(key)
-    return _brains_by_root[key]
+    with _brains_lock:
+        if key not in _brains_by_root:
+            _brains_by_root[key] = ProjectBrain(key)
+        return _brains_by_root[key]
 
 
 # ── v2 Power Tools (Primary Agent Interface) ─────────────────────────────────
@@ -100,6 +103,8 @@ def brain_dossier(
     if include_markdown or zoom:
         return res
     return {k: v for k, v in res.items() if k != "markdown"}
+
+
 @mcp.tool()
 def brain_patch(
     spec: str,
@@ -115,6 +120,12 @@ def brain_patch(
       @sub L<line> `<old_expr>` -> `<new_expr>` (or `@sub ALL` / `@sub <symbol>`)
       @replace L<start>-L<end>
       <new lines only>
+      @end
+      @replace_body <symbol>
+      <new body lines>
+      @end
+      @add_method <ClassName>
+      <new method lines>
       @end
       @insert_after L<line>
       <new lines>
@@ -161,6 +172,7 @@ def brain_explore(
     edge_types: list[str] | None = None,
     depth: int = 2,
     include_co_changes: bool = False,
+    repo_path: str | None = None,
 ) -> dict:
     """Navigate the symbol graph: find callers/callees, trace shortest paths, or trace URL flows.
 
@@ -174,7 +186,7 @@ def brain_explore(
          Traverses `depth` hops outward from `target`, returning connected callers, callees,
          and imports (plus git `co_changes` if `include_co_changes=True`).
     """
-    return _brain.explore(
+    return _get_brain(repo_path).explore(
         target,
         target_b=target_b,
         edge_types=edge_types,
@@ -189,19 +201,20 @@ def brain_check(
     claims: list[list[str]] | None = None,
     plan_files: list[str] | None = None,
     task: str = "",
+    repo_path: str | None = None,
 ) -> dict:
     """Pre-flight verification gate: check structural claims, validate plans, or assess edit impact.
 
     Call this:
       - BEFORE editing (`plan_files=["..."]`, `task="..."`): Checks if your edit plan
-        misses any connected importers, models, or test files (`COMPLETE` / `INCOMPLETE`).
+         misses any connected importers, models, or test files (`COMPLETE` / `INCOMPLETE`).
       - AFTER editing (`files_modified=["..."]`): Computes blast radius — all direct
-        consumers, callers of functions in those files (with their signatures), and test files.
+         consumers, callers of functions in those files (with their signatures), and test files.
       - BEFORE asserting architectural facts (`claims=[["checkout", "reaches", "Coupon"]]`):
-        Fact-checks claims against the closed-world symbol graph (`SUPPORTED` / `REFUTED` / `UNKNOWN`).
+         Fact-checks claims against the closed-world symbol graph (`SUPPORTED` / `REFUTED` / `UNKNOWN`).
       - With no arguments: Returns index health and parse coverage.
     """
-    return _brain.check(
+    return _get_brain(repo_path).check(
         files_modified=files_modified,
         claims=claims,
         plan_files=plan_files,
@@ -214,6 +227,7 @@ def brain_remember(
     target: str,
     note: str,
     tags: list[str] | None = None,
+    repo_path: str | None = None,
 ) -> dict:
     """Save an architectural rule, invariant, or bug root-cause to `.projectbrain_memory.json`.
 
@@ -222,21 +236,21 @@ def brain_remember(
     will automatically surface this note — and flag it as stale if the underlying code
     is later modified.
     """
-    return _brain.remember(target, note, tags=tags)
+    return _get_brain(repo_path).remember(target, note, tags=tags)
 
 
 # ── Legacy / Granular Tools (Preserved for Backward Compatibility) ───────────
 
 @mcp.tool()
-def projectbrain_query(prompt: str, top_n: int = 5) -> dict:
+def projectbrain_query(prompt: str, top_n: int = 5, repo_path: str | None = None) -> dict:
     """Find which files are relevant to a coding task and return a typed symbol graph."""
-    return _brain.query_with_graph(prompt, top_n=top_n)
+    return _get_brain(repo_path).query_with_graph(prompt, top_n=top_n)
 
 
 @mcp.tool()
-def projectbrain_get_context(file_path: str) -> dict:
+def projectbrain_get_context(file_path: str, repo_path: str | None = None) -> dict:
     """Get one file's functions/classes/routes/imports/skeleton plus its 1-hop dependency chain."""
-    return _brain.get_context_for_file(file_path)
+    return _get_brain(repo_path).get_context_for_file(file_path)
 
 
 @mcp.tool()
@@ -244,37 +258,44 @@ def projectbrain_get_neighbors(
     node_id: str,
     edge_types: list[str] | None = None,
     depth: int = 1,
+    repo_path: str | None = None,
 ) -> dict:
     """Traverse the symbol graph outward from a known node ID."""
-    return _brain.get_neighbors(node_id, edge_types=edge_types, depth=depth)
+    return _get_brain(repo_path).get_neighbors(node_id, edge_types=edge_types, depth=depth)
 
 
 @mcp.tool()
-def projectbrain_find_relationship(name_a: str, name_b: str) -> dict:
+def projectbrain_find_relationship(name_a: str, name_b: str, repo_path: str | None = None) -> dict:
     """Find the shortest typed path between any two named symbols or files."""
-    return _brain.find_relationship(name_a, name_b)
+    return _get_brain(repo_path).find_relationship(name_a, name_b)
 
 
 @mcp.tool()
 def projectbrain_list_nodes(
     node_type: str | None = None,
     query: str | None = None,
+    repo_path: str | None = None,
 ) -> dict:
     """Enumerate and filter nodes in the symbol graph for discovery."""
-    return _brain.list_nodes(node_type=node_type, query=query)
+    return _get_brain(repo_path).list_nodes(node_type=node_type, query=query)
 
 
 @mcp.tool()
-def projectbrain_verify_claim(subject: str, relation: str, object: str) -> dict:
+def projectbrain_verify_claim(
+    subject: str,
+    relation: str,
+    object: str,
+    repo_path: str | None = None,
+) -> dict:
     """Fact-check a structural claim about the code against the symbol graph."""
-    return _brain.verify_claim(subject, relation, object)
+    return _get_brain(repo_path).verify_claim(subject, relation, object)
 
 
 @mcp.tool()
-def brain_verify_batch(claims: list[list[str]]) -> dict:
+def brain_verify_batch(claims: list[list[str]], repo_path: str | None = None) -> dict:
     """Verify multiple structural claims in a single call."""
     tuples = [(c[0], c[1], c[2]) for c in claims if len(c) >= 3]
-    return _brain.verify_batch(tuples)
+    return _get_brain(repo_path).verify_batch(tuples)
 
 
 @mcp.tool()
@@ -282,45 +303,51 @@ def brain_verify_plan(
     task: str,
     files_to_edit: list[str],
     files_to_create: list[str] | None = None,
+    repo_path: str | None = None,
 ) -> dict:
     """Validate an agent's plan BEFORE it starts editing files."""
-    return _brain.verify_plan(task, files_to_edit, files_to_create)
+    return _get_brain(repo_path).verify_plan(task, files_to_edit, files_to_create)
 
 
 @mcp.tool()
-def brain_impact(files_changed: list[str]) -> dict:
+def brain_impact(files_changed: list[str], repo_path: str | None = None) -> dict:
     """Analyze downstream impact of changing a set of files."""
-    return _brain.impact(files_changed)
+    return _get_brain(repo_path).impact(files_changed)
 
 
 @mcp.tool()
-def projectbrain_health() -> dict:
+def projectbrain_health(repo_path: str | None = None) -> dict:
     """Report what the index does and does NOT actually know — its blind spots."""
-    return _brain.health()
+    return _get_brain(repo_path).health()
 
 
 @mcp.tool()
-def brain_start_session(task: str) -> dict:
+def brain_start_session(task: str, repo_path: str | None = None) -> dict:
     """Start a guided exploration session for a coding task."""
-    return _brain.start_session(task)
+    return _get_brain(repo_path).start_session(task)
 
 
 @mcp.tool()
-def brain_mark_read(session_id: str, file_path: str) -> dict:
+def brain_mark_read(session_id: str, file_path: str, repo_path: str | None = None) -> dict:
     """Tell Brain you've read a file — it will route you to the next one."""
-    return _brain.session_mark_read(session_id, file_path)
+    return _get_brain(repo_path).session_mark_read(session_id, file_path)
 
 
 @mcp.tool()
-def brain_mark_modified(session_id: str, file_path: str, summary: str = "") -> dict:
+def brain_mark_modified(
+    session_id: str,
+    file_path: str,
+    summary: str = "",
+    repo_path: str | None = None,
+) -> dict:
     """Tell Brain you've modified a file — it surfaces downstream impact."""
-    return _brain.session_mark_modified(session_id, file_path, summary)
+    return _get_brain(repo_path).session_mark_modified(session_id, file_path, summary)
 
 
 @mcp.tool()
-def brain_next(session_id: str, count: int = 1) -> dict:
+def brain_next(session_id: str, count: int = 1, repo_path: str | None = None) -> dict:
     """Pop the next file(s) from the exploration frontier."""
-    return _brain.session_next(session_id, count)
+    return _get_brain(repo_path).session_next(session_id, count)
 
 
 @mcp.tool()
@@ -328,30 +355,75 @@ def brain_compress(
     file_paths: list[str],
     max_tokens: int = 4000,
     focus: str = "",
+    repo_path: str | None = None,
 ) -> dict:
     """Get a compressed structural summary and signature skeleton of files."""
-    return _brain.compress_context(file_paths, max_tokens=max_tokens, focus=focus)
+    return _get_brain(repo_path).compress_context(file_paths, max_tokens=max_tokens, focus=focus)
+
 
 
 @mcp.tool()
-def brain_status(session_id: str) -> dict:
+def brain_run(
+    raw_output: str = "",
+    command: str = "",
+    max_lines: int = 80,
+    timeout: int = 120,
+    repo_path: str | None = None,
+) -> dict:
+    """Compress raw terminal/test output (`raw_output`) with Code Graph traceback resolution.
+
+    Strips passing test noise (pytest, jest/vitest, go test, cargo test), folds repetitive log/JSON/CSV
+    lines, and cross-references any stack-trace `file:line` frames against the Code Graph to return
+    the exact failing symbols, signatures, roles, and 1-hop callers.
+    Note: Direct shell command execution over MCP is disabled by default for security unless
+    `PROJECTBRAIN_ALLOW_EXEC=1` (or `--allow-exec`) is explicitly configured by the user.
+    """
+    b = _get_brain(repo_path)
+    if command.strip():
+        allow_exec = ("--allow-exec" in sys.argv) or (os.environ.get("PROJECTBRAIN_ALLOW_EXEC") == "1")
+        if not allow_exec:
+            return {
+                "error": "Direct command execution over MCP is disabled by default for security. Pass `raw_output` to compress terminal/test logs, or set `PROJECTBRAIN_ALLOW_EXEC=1`.",
+                "exit_code": 126,
+            }
+        return b.run_command_compressed(command.strip(), timeout=timeout, max_lines=max_lines)
+    return b.compress_command_output(raw_output, max_lines=max_lines)
+@mcp.tool()
+def brain_status(session_id: str, repo_path: str | None = None) -> dict:
     """Check session progress: what's been read, what's left, estimated completeness."""
-    return _brain.session_status(session_id)
+    return _get_brain(repo_path).session_status(session_id)
 
 
 @mcp.tool()
-def brain_trace_flow(url_path: str, method: str = "GET") -> dict:
+def brain_trace_flow(url_path: str, method: str = "GET", repo_path: str | None = None) -> dict:
     """Trace a request flow across the frontend→backend boundary."""
-    return _brain.trace_flow(url_path, method=method)
+    return _get_brain(repo_path).trace_flow(url_path, method=method)
 
 
 @mcp.tool()
-def brain_co_changes(file_path: str, days: int = 90) -> dict:
+def brain_co_changes(file_path: str, days: int = 90, repo_path: str | None = None) -> dict:
     """Find files that historically change together with the given file."""
-    return _brain.co_change_analysis(file_path, days=days)
+    return _get_brain(repo_path).co_change_analysis(file_path, days=days)
+
+
+LEAN_CORE_TOOLS = {
+    "brain_dossier",
+    "brain_context",
+    "brain_slice",
+    "brain_patch",
+    "brain_check",
+    "brain_remember",
+}
 
 
 def main() -> None:
+    if "--lean" in sys.argv or os.environ.get("PROJECTBRAIN_LEAN_MCP") == "1":
+        tm = getattr(mcp, "_tool_manager", None)
+        tools_dict = getattr(tm, "_tools", None)
+        if isinstance(tools_dict, dict):
+            for t_name in list(tools_dict.keys()):
+                if t_name not in LEAN_CORE_TOOLS:
+                    tools_dict.pop(t_name, None)
     mcp.run(transport="stdio")
 
 

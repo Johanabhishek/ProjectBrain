@@ -95,6 +95,8 @@ class CodeGraph:
                     "line_end": fn.get("line_end"),
                     "is_method": fn.get("is_method", False),
                     "parent_class": parent,
+                    "interface_hash": fn.get("interface_hash", ""),
+                    "arity_spec": fn.get("arity_spec"),
                     "ast_hash": fn.get("ast_hash", ""),
                 }
                 _reg(fn["name"], nid)
@@ -111,6 +113,7 @@ class CodeGraph:
                     "line_start": c.get("line_start"),
                     "line_end": c.get("line_end"),
                     "fields": c.get("fields", []),
+                    "interface_hash": c.get("interface_hash", ""),
                     "ast_hash": c.get("ast_hash", ""),
                 }
                 _reg(c["name"], nid)
@@ -261,13 +264,18 @@ class CodeGraph:
                 fn_s = fn.get("line_start", 0)
                 fn_e = fn.get("line_end", 0)
                 if 0 < (fn_e - fn_s) <= 300:
+                    fn_calls_set = set(fn.get("calls", []))
                     for inner_fn in info.get("functions", []):
                         in_s = inner_fn.get("line_start", 0)
                         in_e = inner_fn.get("line_end", 0)
                         if fn_s < in_s and in_e <= fn_e:
                             in_nid = fn_id(rel_path, inner_fn["name"], inner_fn.get("parent_class"))
                             if in_nid != nid and in_nid in g.nodes and in_nid not in added_call_dsts:
-                                g._add_edge(nid, in_nid, "calls", "exact", "nested helper/callback in function", line=in_s)
+                                if inner_fn["name"] in fn_calls_set:
+                                    call_ln = fn.get("call_sites", {}).get(inner_fn["name"], in_s)
+                                    g._add_edge(nid, in_nid, "calls", "exact", "nested helper/callback called in function", line=call_ln)
+                                else:
+                                    g._add_edge(nid, in_nid, "defines_nested", "exact", "nested helper/callback defined in function", line=in_s)
                                 added_call_dsts.add(in_nid)
 
             for c in info.get("classes", []):
@@ -429,7 +437,7 @@ class CodeGraph:
                     continue
                 for ei in self._adj.get(curr_id, []):
                     e = self.edges[ei]
-                    if e["type"] != "calls" or e.get("confidence") not in ("exact", "import_resolved"):
+                    if e["type"] not in ("calls", "defines_nested") or e.get("confidence") not in ("exact", "import_resolved"):
                         continue
                     callee_id = e["dst"]
                     if callee_id in visited_callees:
@@ -444,6 +452,7 @@ class CodeGraph:
                     for zw in callee_nd.get("local_z_write", []):
                         if zw not in own_zw and zw not in trans_zw:
                             trans_zw.append(zw)
+                            provenance[f"ΔZ:{zw}"] = via_label
                             provenance[f"?Z:{zw}"] = via_label
                     for eff in callee_nd.get("local_effects", []):
                         if eff not in trans_eff:
@@ -493,7 +502,7 @@ class CodeGraph:
                             r_id,
                             "state_flow",
                             "exact",
-                            f"shared state channel '{k}' (?Z_write -> Z_read)",
+                            f"shared state channel '{k}' (ΔZ_write -> Z_read)",
                         )
                         added_multiplex_edges += 1
 
@@ -546,11 +555,15 @@ class CodeGraph:
         alpha: float = 0.30,
         iterations: int = 12,
         top_k: int = 12,
+        epsilon: float = 1e-4,
     ) -> list[tuple[str, float, str]]:
-        """Multiplex Personalized PageRank (Random Walk with Restart) across the 4-layer graph:
-          ?^(t+1) = (1 - ?) * P^T * ?^(t) + ? * v_0
-        Diffuses probability mass simultaneously over AST call edges, HTTP frontend->backend bridges,
-        and shared SQL/state-channel edges to locate cross-stack fault bottlenecks.
+        """Dyck-Constrained Sublinear Andersen-Chung-Lang (ACL) Multiplex Push with Ochiai Hub Damping:
+          - Enforces Horwitz-Reps-Binkley (HRB) two-phase realizability (`phase="UP"` vs `phase="DOWN"`):
+            once a walk steps DOWN into a shared callee via a forward `calls` edge, it cannot step UP via
+            `inverse_calls` into unrelated callers of that utility helper.
+          - Weights target transitions by Ochiai in-degree specificity `(1 + deg_in(v))^-0.6` so ubiquitous
+            utility hubs (`logger`, `len`, formatters) do not steal probability mass from domain callees.
+          - Uses an ACL residual push queue (`residual >= epsilon`) for sublinear O(1 / (alpha * epsilon)) runtime.
         """
         if not isinstance(seed_weights, dict):
             raw_seeds = {str(k): 1.0 for k in seed_weights}
@@ -573,48 +586,104 @@ class CodeGraph:
             return []
         total_s = sum(valid_seeds.values())
         v0 = {k: v / total_s for k, v in valid_seeds.items()}
-        pi = dict(v0)
 
-        _FWD_W = {"http_flow": 1.40, "state_flow": 1.20, "handles": 1.10, "calls": 1.00}
+        _FWD_W = {"http_flow": 1.45, "state_flow": 1.25, "handles": 1.15, "calls": 1.00, "defines_nested": 0.95}
         _BWD_W = {"http_flow": 0.85, "state_flow": 0.80, "handles": 0.70, "calls": 0.65}
+        _CONF_W = {"exact": 1.0, "qualified": 0.9, "import_resolved": 0.85}
+
+        # Precompute incoming call degree for Ochiai hub damping
+        call_in_deg: dict[str, int] = {}
+        for nid in self.nodes:
+            in_edges = self._radj.get(nid, [])
+            call_in_deg[nid] = sum(
+                1 for ei in in_edges
+                if self.edges[ei]["type"] == "calls" and self.edges[ei].get("confidence") in _CONF_W
+            )
+
+        def _hub_damp(target_nid: str) -> float:
+            deg = call_in_deg.get(target_nid, 0)
+            return 1.0 / ((1.0 + deg) ** 0.6)
+
+        # State is (node_id, phase) where phase=0 is UP/ENTRY and phase=1 is DOWN (inside callee)
+        reserve: dict[str, float] = {}
+        residual: dict[tuple[str, int], float] = {}
+        in_queue: set[tuple[str, int]] = set()
+        push_q: deque[tuple[str, int]] = deque()
         best_prov: dict[str, tuple[float, str]] = {}
 
-        for _ in range(iterations):
-            nxt_pi: dict[str, float] = {k: alpha * val for k, val in v0.items()}
-            for u, p_u in pi.items():
-                if p_u < 1e-5:
-                    continue
-                transitions: list[tuple[str, float, str]] = []
-                for ei in self._adj.get(u, []):
-                    e = self.edges[ei]
-                    et = e["type"]
-                    if et in _FWD_W and e.get("confidence") in ("exact", "import_resolved"):
-                        w = _FWD_W[et]
-                        u_nm = self.nodes.get(u, {}).get("name") or u.split(":")[-1]
-                        rsn = e.get("reason") or f"{et} from {u_nm}"
-                        transitions.append((e["dst"], w, f"PPR [{et}] via {u_nm}: {rsn}"))
-                for ei in self._radj.get(u, []):
-                    e = self.edges[ei]
-                    et = e["type"]
-                    if et in _BWD_W and e.get("confidence") in ("exact", "import_resolved"):
-                        w = _BWD_W[et]
-                        u_nm = self.nodes.get(u, {}).get("name") or u.split(":")[-1]
-                        transitions.append((e["src"], w, f"PPR [inverse_{et}] -> {u_nm}"))
-                if not transitions:
-                    for k, val in v0.items():
-                        nxt_pi[k] = nxt_pi.get(k, 0.0) + (1.0 - alpha) * p_u * val
-                    continue
-                w_sum = sum(t[1] for t in transitions)
-                for dst, w, prov_str in transitions:
-                    contrib = (1.0 - alpha) * p_u * (w / w_sum)
-                    nxt_pi[dst] = nxt_pi.get(dst, 0.0) + contrib
-                    prev_best = best_prov.get(dst, (0.0, ""))[0]
-                    if dst not in valid_seeds and contrib > prev_best:
-                        best_prov[dst] = (contrib, prov_str)
-            pi = nxt_pi
+        for k, val in v0.items():
+            st = (k, 0)
+            residual[st] = val
+            in_queue.add(st)
+            push_q.append(st)
+
+        max_pushes = max(500, iterations * 350)
+        pushes = 0
+        while push_q and pushes < max_pushes:
+            u, phase = push_q.popleft()
+            in_queue.discard((u, phase))
+            r_u = residual.get((u, phase), 0.0)
+            if r_u < epsilon:
+                continue
+            residual[(u, phase)] = 0.0
+            pushes += 1
+
+            reserve[u] = reserve.get(u, 0.0) + alpha * r_u
+            rem = (1.0 - alpha) * r_u
+
+            transitions: list[tuple[str, int, float, str]] = []
+            u_nm = self.nodes.get(u, {}).get("name") or u.split(":")[-1]
+
+            # Forward edges
+            for ei in self._adj.get(u, []):
+                e = self.edges[ei]
+                et = e["type"]
+                conf = e.get("confidence", "")
+                if et in _FWD_W and conf in _CONF_W:
+                    dst = e["dst"]
+                    w = _FWD_W[et] * _CONF_W[conf] * _hub_damp(dst)
+                    # Stepping down a `calls` edge enters DOWN phase (1); cross-stack bridges reset to ENTRY (0)
+                    nxt_phase = 1 if et in ("calls", "defines_nested") else 0
+                    rsn = e.get("reason") or f"{et} from {u_nm}"
+                    transitions.append((dst, nxt_phase, w, f"PPR [{et}] via {u_nm}: {rsn}"))
+
+            # Backward edges (subject to Dyck two-phase realizability)
+            for ei in self._radj.get(u, []):
+                e = self.edges[ei]
+                et = e["type"]
+                conf = e.get("confidence", "")
+                if et in _BWD_W and conf in _CONF_W:
+                    # HRB / Dyck law: if we arrived at `u` by stepping DOWN into a callee (phase == 1),
+                    # never step UP via `inverse_calls` into other callers of `u`!
+                    if phase == 1 and et == "calls":
+                        continue
+                    src = e["src"]
+                    w = _BWD_W[et] * _CONF_W[conf] * _hub_damp(src)
+                    transitions.append((src, 0, w, f"PPR [inverse_{et}] -> {u_nm}"))
+
+            if not transitions:
+                for k, val in v0.items():
+                    st0 = (k, 0)
+                    residual[st0] = residual.get(st0, 0.0) + rem * val
+                    if residual[st0] >= epsilon and st0 not in in_queue:
+                        in_queue.add(st0)
+                        push_q.append(st0)
+                continue
+
+            w_sum = sum(t[2] for t in transitions)
+            for dst, nxt_phase, w, prov_str in transitions:
+                contrib = rem * (w / w_sum)
+                dst_state = (dst, nxt_phase)
+                residual[dst_state] = residual.get(dst_state, 0.0) + contrib
+                if residual[dst_state] >= epsilon and dst_state not in in_queue:
+                    in_queue.add(dst_state)
+                    push_q.append(dst_state)
+                prev_best = best_prov.get(dst, (0.0, ""))[0]
+                if dst not in valid_seeds and contrib > prev_best:
+                    best_prov[dst] = (contrib, prov_str)
 
         ranked_out: list[tuple[str, float, str]] = []
-        for nid, prob in pi.items():
+        for nid, prob in reserve.items():
             if nid in valid_seeds:
                 continue
             nd = self.nodes.get(nid, {})
@@ -716,7 +785,7 @@ class CodeGraph:
                 continue
             for ei in self._adj.get(curr_id, []):
                 e = self.edges[ei]
-                if e["type"] in ("http_flow", "calls", "handles", "state_flow") and e.get("confidence") in ("exact", "import_resolved"):
+                if e["type"] in ("http_flow", "calls", "defines_nested", "handles", "state_flow") and e.get("confidence") in ("exact", "import_resolved"):
                     dst = e["dst"]
                     if dst not in visited_hops or visited_hops[dst] > hop + 1:
                         visited_hops[dst] = hop + 1
@@ -858,8 +927,8 @@ class CodeGraph:
         return json.dumps({"nodes": self.nodes, "edges": self.edges}, indent=2)
 
     @classmethod
-    def from_json(cls, text: str) -> "CodeGraph":
-        data = json.loads(text)
+    def from_json(cls, text: str | dict) -> "CodeGraph":
+        data = json.loads(text) if isinstance(text, str) else text
         g = cls()
         g.nodes = data["nodes"]
         g.edges = data["edges"]

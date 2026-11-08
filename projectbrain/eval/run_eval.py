@@ -27,9 +27,11 @@ from __future__ import annotations
 import argparse
 import json
 import re
+import sys
 import time
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 from projectbrain.brain import ProjectBrain
 
 EVAL_DIR = Path(__file__).parent
@@ -320,7 +322,10 @@ def score_self_dogfood_tasks() -> list[dict]:
     """
     repo_root = EVAL_DIR.parent
     brain = ProjectBrain(str(repo_root))
-    brain.index()
+    if not brain.load():
+        brain.index()
+    else:
+        brain.incremental_index()
     total_repo_tokens = sum(brain._sizes.values()) // 4
 
     dogfood_tasks = [
@@ -389,7 +394,10 @@ def score_adversarial_dogfood_tasks() -> list[dict]:
     """
     repo_root = EVAL_DIR.parent
     brain = ProjectBrain(str(repo_root))
-    brain.index()
+    if not brain.load():
+        brain.index()
+    else:
+        brain.incremental_index()
 
     adversarial_tasks = [
         {

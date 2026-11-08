@@ -1,82 +1,59 @@
-# ProjectBrain (`projectbrain-mcp`)
+# ProjectBrain (`projectbrain-mcp` v0.8.3)
 
 [![PyPI](https://img.shields.io/pypi/v/projectbrain-mcp.svg)](https://pypi.org/project/projectbrain-mcp/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License: MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-**Local-First 4D AST Coordinate Matrix, Surgical Engineering Dossier, and Anchor Patch Engine for AI Coding Agents.**
+**For a real bug or refactor, ProjectBrain gives your coding agent the exact symbols, callers, and dependencies it needs in 1 turn—with fewer wrong files and 77–89% fewer tokens.**
 
-Instead of forcing LLMs to search repositories as flat 1D text files (running `rg`/`grep` and reading dozens of overlapping `read_file` windows), ProjectBrain indexes your codebase into a **4D AST Coordinate Matrix** and typed symbol graph in `~90ms` using pre-compiled `tree-sitter` C wheels—no external database, no Docker, no vector embeddings, and no LLM required:
+Instead of forcing AI coding agents to explore repositories by running dozens of `rg`/`grep` searches and reading entire files line-by-line, ProjectBrain indexes your codebase locally into a **SQLite WAL Code Graph (`.projectbrain.db`)** using `tree-sitter` and structural parsers. No external database daemon, no Docker, no cloud vector embeddings, and no API keys required.
 
-- **4D AST Coordinate Matrix (`X × Y × Z × W`):** Decomposes monolith files and giant components (`>200` lines) into atomic sub-symbol cells indexed across four orthogonal axes:
-  - **`X` (Scope / Branch):** Outer function, `switch` case branch (`case 'flashcards'`), `if/elif` dispatch, or JSX conditional block.
-  - **`Y` (Execution Role):** `STATE` (`useState`/`useRef`/`self.x`), `EFFECT` (`useEffect[deps]`/`useMemo`/`useCallback`), `ACTION` (handlers/mutations), `IO` (`fetch`/API/storage), or `VIEW` (JSX render blocks).
-  - **`Z_write` / `Z_read` (State & Storage Dependency):** Directional dataflow tracking which state variables and storage keys each cell mutates vs. reads.
-  - **`W` (Component & Call Wiring):** Outgoing function calls and rendered sub-components per cell.
-- **Single-Read Surgical Dossier (`projectbrain dossier`):** Intersects all 4 axes at once to unfold only the exact matching sub-symbol cells, module constants, 1-line `Connected Call-Graph` and `Secondary Candidate` coordinate maps, and a **Closed-World Exhaustive Repo Scan** into `.projectbrain_dossier.md`—with automatic **Session Cache deduplication** across follow-up queries.
-- **Surgical Anchor Patch Engine (`projectbrain patch`):** Replaces verbatim `Target` + `Replacement` repetition (`edit_file`) with a compact Anchor Patch DSL (`@file`, `@sub`, `@replace`, `@insert_after`, `@delete`) validated by Tree-sitter in `<5ms`.
-- **Page-Accurate Token Savings Ledger (`projectbrain stats --summary`):** Tracks real delivered tokens against 800-line `read_file` page baselines and `edit_file` payloads in `.projectbrain_ledger.json`.
+### What It Actually Does
+
+1. **One-Turn Code Dossiers (`projectbrain dossier` / `brain_dossier`):**
+   - Given a bug report, stack trace, or feature prompt, ProjectBrain ranks relevant symbols using sub-identifier BM25 + call/import graph traversal, automatically bridges passive schema/DTO files to their executable consumers, and returns exact statement/function code slices plus 1-hop caller/callee signatures in a single read.
+2. **Surgical Symbol & Line Slicing (`projectbrain slice` / `brain_slice`):**
+   - Slices exact functions, classes, methods, or line ranges (`file.py:ClassName.method` or `file.py:120-160`) across multiple files in a single call, with fuzzy symbol/path suggestions when an agent guesses an incomplete name.
+3. **AST Symbol-Anchored Patching (`projectbrain patch` / `brain_patch`):**
+   - Applies surgical edits (`@replace_body <Symbol>`, `@add_method <ClassName>`, `@replace <Symbol>`, `@sub L<n>`) validated against Tree-sitter + language syntax compilers and caller arity contracts before touching disk, with automatic rollback on syntax errors.
+4. **`.gitignore`-Compliant Polyglot Indexing (29 File Extensions):**
+   - Honors root and nested `.gitignore` / `.git/info/exclude` rules automatically.
+   - Supports **Python, TypeScript, JavaScript, JSX/TSX, Vue, Svelte, Go, Rust, Java, Kotlin, Scala, C, C++, C#, Ruby, PHP, Swift, SQL, GraphQL, Prisma, and Protobuf**.
+5. **Safe Output & Traceback Compression (`projectbrain run` / `brain_run`):**
+   - Folds passing test noise (`pytest`, `jest`/`vitest`, `go test`, `cargo test`), deduplicates repetitive log lines, and maps stack-trace `file:line` frames directly to enclosing functions and 1-hop callers. Direct shell execution over MCP is disabled by default unless explicitly opted in via `PROJECTBRAIN_ALLOW_EXEC=1`.
+
 ---
 
-## Step-by-Step Setup Guide (60 Seconds)
+## Quick Start (60 Seconds)
 
-### Step 1: Install from PyPI
-
-Install `projectbrain-mcp` globally (or in your active Python environment):
+### Step 1: Install
 
 ```bash
 pip install projectbrain-mcp
 ```
 
-*(Alternatively, use `pipx install projectbrain-mcp` or `uv tool install projectbrain-mcp`.)*
+*(Or `pipx install projectbrain-mcp` / `uv tool install projectbrain-mcp`.)*
 
-Verify both the CLI and MCP server binaries are available:
-
-```bash
-projectbrain --help
-projectbrain-mcp --help
-```
-
----
-
-### Step 2: Initialize Your Repository (One Command)
-
-Run `projectbrain init` inside any repository (or pass `--path` and optional `--ide {all,antigravity,claude,cursor,vscode}`):
+### Step 2: Initialize Your Repository (Non-Destructive)
 
 ```bash
-projectbrain --path /path/to/your/repo init
+projectbrain --path /path/to/your/repo init --hooks
 ```
 
-**What `projectbrain init` does automatically across all IDEs:**
-1. **Builds the AST & Call-Graph Index:** Writes `.projectbrain.json` and `.projectbrain_graph.json` in `~90ms`.
-2. **Updates `.gitignore`:** Ensures ephemeral index/cache files stay out of Git.
-3. **Configures MCP Across IDEs:** Writes/merges `.mcp.json` (Claude Code / Antigravity), `.cursor/mcp.json` (Cursor), and `.vscode/mcp.json` (VS Code Agent Mode).
-4. **Installs Agent Rules Across IDEs:** Writes `AGENTS.md`, `.agents/rules/projectbrain.md` (Antigravity), `CLAUDE.md` (Claude Code), `.cursor/rules/projectbrain.mdc` (Cursor), and `.github/copilot-instructions.md` + `.clinerules` (VS Code Copilot / Cline / Roo Code).
----
+**What `projectbrain init --hooks` does safely:**
+1. **Builds the SQLite Code Graph Index:** Writes `.projectbrain.db` (WAL mode), honoring `.gitignore`.
+2. **Updates `.gitignore`:** Appends ephemeral `.projectbrain*` cache patterns if not already present.
+3. **Merges MCP Configs:** Safely merges `projectbrain` into `.mcp.json`, `.cursor/mcp.json`, and `.vscode/mcp.json` without overwriting other MCP servers.
+4. **Appends Agent Rules Non-Destructively:** Uses `<!-- projectbrain:start --> ... <!-- projectbrain:end -->` section markers in `AGENTS.md`, `CLAUDE.md`, `.cursor/rules/projectbrain.mdc`, and deep-merges `.claude/settings.local.json` `PreToolUse` hooks so existing team instructions and settings are never overwritten.
 
-### Step 3: Zero-Install MCP Server Configuration (Optional)
-
-If your IDE or agent loads MCP servers from a global config file (such as `.cursor/mcp.json`, `claude_desktop_config.json`, or Antigravity `mcp_config.json`), add:
+### Step 3: MCP Server Configuration
 
 ```json
 {
   "mcpServers": {
     "projectbrain": {
       "command": "projectbrain-mcp",
-      "args": ["/path/to/your/repo"]
-    }
-  }
-}
-```
-
-Or run directly with **`uvx`** (zero manual install required):
-
-```json
-{
-  "mcpServers": {
-    "projectbrain": {
-      "command": "uvx",
-      "args": ["projectbrain-mcp", "/path/to/your/repo"]
+      "args": ["--lean", "/path/to/your/repo"]
     }
   }
 }
@@ -84,176 +61,71 @@ Or run directly with **`uvx`** (zero manual install required):
 
 ---
 
-### Step 4: Parent / Monorepo Workspace Setup
+## Core CLI Workflow
 
-If you open a **parent directory** in your IDE that contains multiple sub-projects (e.g., `/workspace/my-app-frontend` and `/workspace/my-app-backend`), place an `AGENTS.md` (or `.agents/rules/projectbrain.md`) at the **workspace root** and pass `--path "<subfolder>"` so the agent targets the indexed sub-repository:
+```bash
+# 1. Compile a 1-turn engineering dossier (target slices + callers + callees)
+projectbrain --path /path/to/repo dossier "recover from a panic in an HTTP handler and abort with 500"
 
-```markdown
-# ProjectBrain Mandatory Codebase Investigation & Editing Rules
+# 2. Slice multiple symbols or line ranges in one batch
+projectbrain --path /path/to/repo slice src/App.tsx:ProtectedRoute recovery.go:CustomRecoveryWithWriter
 
-Whenever investigating, answering questions about, or modifying `<subfolder>`, ALWAYS use ProjectBrain FIRST before running shell searches (`rg`, `grep`) or multiple `read_file` calls:
+# 3. Apply a syntax-verified, symbol-anchored patch
+projectbrain --path /path/to/repo patch --apply --spec-file patch.spec
 
-1. **Compile a Single-Read Engineering Dossier (`projectbrain dossier`):**
-   - Run: `projectbrain --path "<subfolder>" dossier "<question_or_bug>"`
-   - Read `<subfolder>/.projectbrain_dossier.md` in one single `read_file` call (`StartLine=1, EndLine=800`).
-2. **Surgical Symbol Slicing (`projectbrain slice`):**
-   - Run: `projectbrain --path "<subfolder>" slice --summary <file:symbol_or_start-end>`
-3. **Surgical Anchor Patching (`projectbrain patch`):**
-   - Run: `projectbrain --path "<subfolder>" patch --spec "<Anchor Patch DSL>" --apply`
+# 4. Verify closed-world structural claims (calls, reaches, imports, handles)
+projectbrain --path /path/to/repo verify "checkout" reaches "validate_coupon"
 ```
 
 ---
 
-### Step 5: Keep Git Clean (`.gitignore`)
+## Reproducible Evaluation Suite (`eval/`)
 
-If you want all local ProjectBrain caches, dossiers, diffs, and local agent configs completely ignored by Git, add the following to your `.gitignore`:
+Every retrieval, multi-hop graph traversal, closed-world claim verification, and scale benchmark in this repository can be reproduced locally with two commands:
 
-```gitignore
-# ProjectBrain (local dev only)
-.projectbrain*
-*.projectbrain*
-**/.projectbrain*
-project_brain.py
-test_projectbrain.json
-.mcp.json
-.agents/
-AGENTS.md
-CLAUDE.md
-.claude/settings.json
+```bash
+# 1. Run retrieval precision/recall, multi-hop graph vs. grep baseline, claim verification, and zero-ID slicing
+python eval/run_eval.py
+
+# 2. Run 200-file polyglot scale, incremental Salsa early-cutoff, FTS5, and recursive CTE latency benchmark
+python eval/bench_scale.py
 ```
 
-*(Tip: If `AGENTS.md` is already tracked in your repo and you want to customize it locally without Git showing it as modified, run `git update-index --skip-worktree AGENTS.md`.)*
+### 1. Built-In Reproducible Harness Results (`python eval/run_eval.py`)
+
+| Benchmark Suite | Metric | Score | Notes |
+| :--- | :--- | :---: | :--- |
+| **File Localization (`eval/tasks.json`)** | Precision / Recall (10 tasks) | **`100%` Precision / `100%` Recall** | Returns exact 1-file answers for 1-file tasks and 3-file answers for 3-file flows |
+| **Multi-Hop Graph vs. Grep (`eval/relationship_tasks.json`)** | Pass Rate (8 tasks, incl. negative controls) | **`8 / 8 (100%)`** | Finds 2-hop call paths where naive `grep` misses the intermediate module |
+| **Closed-World Claim Verification (`eval/claim_tasks.json`)** | Exact Verdict Accuracy (22 tasks) | **`22 / 22 (100%)`** | `0` false supports, `0` false refutations; returns `UNKNOWN` on syntax-broken files |
+| **Self-Dogfooding Context Slicing** | Symbol Recall & Token Reduction | **`3 / 3 (100% Recall)`** | `96.6%–99.2%` token reduction vs. reading matched full files |
+| **Adversarial Zero-Identifier Slicing** | Symbol Recall (prompts with zero symbol names) | **`4 / 4 (100% Recall)`** | Outperforms `grep` + 120-line windows (`0%–50%` recall on 3 of 4 tasks) |
 
 ---
 
-## Daily CLI Workflow & Commands
+### 2. Blind Cold-Start Agent Benchmarks (Production Open-Source Repositories)
 
-### 1. Compile a Single-Read Engineering Dossier (`dossier` / `dossier --zoom`)
-Before investigating a question or bug, compile a self-contained `<800`-line dossier (`.projectbrain_dossier.md`) with module globals, 4D AST Coordinate Matrix cells, 1–3 hop call chains, and a Closed-World Exhaustive Repo Scan (or pass `--zoom` for ultra-compact pure 4D coordinate slices + 1-line pointer tables):
+Measured head-to-head by spawning two isolated subagents simultaneously on unmodified open-source repositories (**Naive Search Agent** using `rg`/`Select-String` + `read_file` vs. **ProjectBrain Agent** starting completely cold with no pre-built `.projectbrain.db` index and zero file/symbol hints in the prompt):
 
-```bash
-projectbrain --path /path/to/repo dossier "what role does questionnaire have in onboarding"
-projectbrain --path /path/to/repo dossier --zoom "how does credit card validation and countdown redirect work"
-```
-### 2. Surgically Slice Symbols or Line Ranges (`slice`)
-Fetch exact source lines (`start_line`–`end_line`) for 1–2 symbols without reading the entire file:
+#### A. `paperless-ngx/paperless-ngx` (4-Question Deep Architectural Audit — Cold Start)
 
-```bash
-projectbrain --path /path/to/repo slice --summary src/App.tsx:ProtectedRoute src/data/questionnaireData.ts:calculatePersona
-```
+| Metric | Naive Search Agent | ProjectBrain Agent (Cold Start) | Measured Delta |
+| :--- | :---: | :---: | :--- |
+| **Wall-Clock Time** | `12m 00s` (`720.0s`) | **`6m 27s` (`387.0s`)** | **`5m 33s` faster (`-46.3%` / `1.86x` faster)** |
+| **Model Turns** | `53` turns | **`15` turns** | **`38` fewer turns (`-71.7%` / `3.53x` fewer)** |
+| **Tool Calls** | `51` calls | **`18` calls** (`1` dossier + `12` reads + `5` batched slices) | **`33` fewer calls (`-64.7%` / `2.83x` fewer)** |
+| **Uncached Input Tokens** | `274,363` tokens | **`216,603` tokens** | **`57,760` tokens saved (`-21.1%`)** |
+| **Cumulative Billed Input Tokens** | `6,506,996` tokens | **`1,499,886` tokens** | **`5,007,110` tokens saved (`-76.9%` / `4.34x` less)** |
 
-### 3. Apply Surgical Anchor Patches (`patch`)
-Apply multi-file edits using the Anchor Patch DSL (`@file`, `@sub`, `@replace`, `@insert_after`, `@insert_before`, `@delete`), automatically syntax-checked by Tree-sitter:
-```bash
-# Dry-run (writes unified diff to .projectbrain_patch.diff)
-projectbrain --path /path/to/repo patch --spec "@file src/App.tsx
-@sub L84 \`!profileCompleted\` -> \`isHydrated && !profileCompleted\`"
+#### B. `Netflix/dispatch` (879-File Repository — 3-Question Cold-Start Trace)
 
-# Apply directly to disk
-projectbrain --path /path/to/repo patch --apply --spec "@file src/App.tsx
-@sub L84 \`!profileCompleted\` -> \`isHydrated && !profileCompleted\`"
-```
+| Metric | Naive Search Agent | ProjectBrain Agent (Cold Start) | Measured Delta |
+| :--- | :---: | :---: | :--- |
+| **Wall-Clock Time** | `5m 52s` (`352.0s`) | **`3m 44s` (`224.0s`)** | **`2m 08s` faster (`-36.4%` / `1.57x` faster)** |
+| **Model Turns** | `16` turns | **`8` turns** | **`8` fewer turns (`-50.0%` / `2.0x` fewer)** |
+| **Tool Calls** | `41` calls (`14` shell + `27` reads) | **`5` calls** (`1` dossier + `1` read + `3` slices) | **`36` fewer calls (`-87.8%` / `8.2x` fewer)** |
+| **Cumulative Billed Input Tokens** | `2,139,562` tokens | **`224,407` tokens** | **`1,915,155` tokens saved (`-89.5%` / `9.53x` less)** |
 
-### 4. View Live ROI & Token Savings Dashboard (`stats`)
-Check how many input/output tokens and tool calls ProjectBrain has saved across your sessions:
-
-```bash
-projectbrain --path /path/to/repo stats --summary
-```
-
-Example output:
-```text
-===============================================================
-  ProjectBrain Live ROI & Token Savings Ledger
-===============================================================
-  Repository         : /path/to/repo
-  Total Operations   : 4
-  Input Tokens Saved : 504,441 tok (16,156 delivered vs 520,597 baseline -> -96.9%)
-  Output Tokens Saved: 190 tok (85 spec vs 275 edit_file -> -69.1%)
-  Tool Calls Avoided : 22 file reads / multi-turn edits
-===============================================================
-```
-
-**Live auto-refreshing dashboard in terminal:**
-- **PowerShell (Windows):**
-  ```powershell
-  while ($true) { cls; projectbrain --path "/path/to/repo" stats --summary; Start-Sleep 2 }
-  ```
-- **Bash / Zsh (macOS / Linux):**
-  ```bash
-  watch -n 2 projectbrain --path /path/to/repo stats --summary
-  ```
-- **Reset the ledger:**
-  ```bash
-  projectbrain --path /path/to/repo stats --reset
-  ```
-
-### 5. Additional Granular CLI Tools
-
-```bash
-# Re-index repository manually (auto-updates via mtime on every command)
-projectbrain --path /path/to/repo index
-
-# Explore symbol neighborhood, route flows, or shortest path between A and B
-projectbrain --path /path/to/repo explore Questionnaire setItem
-
-# Compute blast radius (direct importers, callers, and affected tests)
-projectbrain --path /path/to/repo impact src/context/CloudStateContext.tsx
-
-# Pin an AST-anchored architectural invariant (auto-flags [STALE] if AST hash changes)
-projectbrain --path /path/to/repo remember calculatePersona "Thresholds: >=22 Advanced, >=16 Intermediate, <16 Beginner"
-
-# Fact-check a structural claim (SUPPORTED / REFUTED / UNKNOWN)
-projectbrain --path /path/to/repo verify Questionnaire calls calculatePersona
-
-# Check index coverage & parse health
-projectbrain --path /path/to/repo health
-```
-
----
-
-## MCP Tools Reference (`projectbrain-mcp`)
-
-| MCP Tool | Purpose |
-| :--- | :--- |
-| **`brain_dossier`** | **Primary entry point.** Compiles a `<800`-line `.projectbrain_dossier.md` containing module globals, smart-folded AST slices, 1–3 hop bidirectional call chains, and a Closed-World Exhaustive Repo Scan. |
-| **`brain_patch`** | Applies or dry-runs a Surgical Anchor Patch spec (`@file`, `@sub`, `@replace`, `@insert_after`, `@delete`) with instant Tree-sitter syntax validation. |
-| **`brain_slice`** | Fetches exact source code lines (`start_line`–`end_line`) for specific functions, classes, or `file:start-end` ranges without reading full files. |
-| **`brain_stats`** | Returns cumulative input/output token savings, tool calls avoided, and ROI metrics from `.projectbrain_ledger.json`. |
-| **`brain_context`** | Compiles a JSON surgical context packet (`target_slices` + `skeletons` + `memories` + session deduplication). |
-| **`brain_explore`** | Unified graph explorer (`mode="neighbors"`, `"path"`, `"flow"`, or `"impact"`) for call/dependency traversal and blast-radius analysis. |
-| **`brain_check`** | Unified 3-valued verification & safety checker (`mode="claim"`, `"batch"`, `"plan"`, or `"health"` returning `SUPPORTED` / `REFUTED` / `UNKNOWN`). |
-| **`brain_remember`** | Saves or lists persistent AST-anchored architectural notes in `.projectbrain_memory.json`. |
-
----
-
-## How the 4D Coordinate Matrix Works (1D Search vs. 4D Intersection)
-
-Traditional coding agents search in **1D**: they run `rg -n <keyword>` and call `read_file(StartLine, EndLine)` around every match. On large real-world files (e.g., a 3,000–6,000 line React view or Python service where 90%+ of the file lives inside one outer function), a single state variable or route identifier appears 20–50 times across declarations, effects, handlers, and JSX branches—forcing the agent to read thousands of lines of surrounding noise.
-
-ProjectBrain projects every large function/component into a **4D Coordinate Matrix** inside `.projectbrain_dossier.md`:
-
-```text
-# [4D Coordinate Matrix] StudyTable (L74-L5923, 86 sub-cells indexed)
-#   [L152-L162] Y:STATE  X:StudyTable.state        Z_w:flashcards,flashcardIdx  Z_r:-
-#   [L482-L547] Y:EFFECT X:StudyTable.useEffect[]  Z_w:savedCourseParams        Z_r:localStorage
-#   [L1736-L1854] Y:VIEW X:switch:case 'flashcards' Z_w:flashcardIdx            Z_r:flashcards  W:FlashcardDeck
-```
-
-When the agent queries a bug or feature, ProjectBrain computes the **coordinate intersection** across `(X, Y, Z, W)`, unfolds the exact matching cell lines verbatim, and leaves the rest of the monolith as a compact 1-line-per-cell coordinate map so the agent knows the exact `file:start-end` address of every other branch without reading the whole file.
-
-### Measured Real-World Subagent A/B Benchmark (v0.4.0)
-
-Evaluated across two production TypeScript/React + Python repositories (`142` files / `1,238` 4D cells and `162` files / `887` 4D cells) with a live head-to-head subagent A/B audit (`rg + read_file` vs. `projectbrain dossier --zoom` + `slice`):
-
-| Benchmark Metric | Baseline Agent (`rg` + `read_file`) | ProjectBrain 4D `--zoom` Agent | Measured Difference |
-| :--- | :---: | :---: | :---: |
-| **Ground-Truth Unfolded Code Recall (`20` spans across `12` tasks)** | `20/20` (`100%`) | **`20/20` (`100%`)** | Tied (`100%` recall) |
-| **Wall-Clock Investigation Time (3-Part Multi-File Audit)** | `152.0s` (`2m 32s`) | **`58.0s` (`0m 58s`)** | **`2.62x` faster (`-94.0s`)** |
-| **LLM Planner Turns** | `12` turns | **`5` turns** | **`2.40x` fewer turns (`-58.3%`)** |
-| **Total Tool Calls** | `17` calls | **`4` calls** | **`4.25x` fewer calls (`-76.5%`)** |
-| **Raw Tool Output Ingested** | `~24,759` tok (`99,037` chars) | **`~6,322` tok (`25,291` chars)** | **`3.92x` smaller (`-74.5%`)** |
-| **Cumulative Prompt Context Billed Across Turns** | `~198,796` tok (`795,187` chars) | **`~24,773` tok (`99,095` chars)** | **`8.02x` smaller (`-87.5%`)** |
 ---
 
 ## Project Layout
@@ -261,17 +133,18 @@ Evaluated across two production TypeScript/React + Python repositories (`142` fi
 ```text
 projectbrain/
 ├── src/projectbrain/
-│   ├── brain.py        # Primary API: compile_dossier, compile_context, slice_symbols, explore, check
-│   ├── slicer.py       # Surgical AST line extraction, smart folding & signature-only skeletons
-│   ├── patcher.py      # Surgical Anchor Patch DSL engine + Tree-sitter syntax verifier
-│   ├── ledger.py       # Live ROI & Token Savings Ledger (.projectbrain_ledger.json)
-│   ├── memory.py       # Persistent AST-anchored repo memory (.projectbrain_memory.json)
-│   ├── graph.py        # Typed symbol graph, qualified call resolution, BFS & shortest path
-│   ├── parsers.py      # Tree-sitter extraction (signatures, schemas, AST hashes, bindings)
-│   ├── resolve.py      # Python module/symbol import resolution & TS path alias resolution
-│   ├── frameworks.py   # Next.js App & Pages Router convention route inference
-│   ├── cli.py          # CLI entry point (init, dossier, patch, slice, stats, compile, explore, etc.)
-│   └── server.py       # FastMCP server entry point (brain_dossier, brain_patch, brain_stats, etc.)
-├── tests/              # Comprehensive pytest suite
-└── eval/               # Evaluation harness, fixtures, and self-dogfooding benchmark
+│   ├── brain.py        # Context Compiler, Dossier Engine, Slicer, Explorer & Contract Verifier
+│   ├── store.py        # SQLite WAL Property Graph (.projectbrain.db), FTS5, and Delta Overlay
+│   ├── slicer.py       # Statement/Symbol Slicer, Focus-Window Folding & Signature Skeletons
+│   ├── patcher.py      # AST Symbol-Anchored & Line-Anchored Patch Engine + Syntax Verification
+│   ├── parsers.py      # Tree-sitter & Structural Parsers (29 file extensions)
+│   ├── graph.py        # Cross-File Call/Import Graph & Personalized PageRank Push
+│   ├── ledger.py       # Session Token & ROI Telemetry Ledger
+│   ├── memory.py       # AST-Anchored Repository Notes (.projectbrain_memory.json)
+│   ├── resolve.py      # Cross-File Import & TypeScript Path Alias Resolution
+│   ├── frameworks.py   # Route Inference (Next.js, FastAPI, Flask, Express, Hono, Gin, Actix, Spring, ASP.NET)
+│   ├── cli.py          # CLI Entry Point (init, dossier, slice, patch, verify, run, stats)
+│   └── server.py       # FastMCP Server Entry Point (standard and --lean modes)
+├── tests/              # 194 Unit, Integration, Security, and Benchmark Threshold Tests
+└── eval/               # Reproducible Evaluation & Scale Benchmark Harnesses
 ```

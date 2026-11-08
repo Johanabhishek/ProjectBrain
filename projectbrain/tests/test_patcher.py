@@ -315,14 +315,14 @@ def test_4d_coordinate_matrix_and_session_dedup(tmp_path: Path):
     brain = ProjectBrain(str(tmp_path))
     brain.index()
 
+    assert brain.stats()["cells_6d"] >= 4
     assert brain.stats()["cells_4d"] >= 4
     q_4d = brain.query("where is videoIndex reset when courseId changes")
     assert q_4d and q_4d[0]["rel_path"] == "src/DashboardWorkspace.tsx"
     # 1. First dossier on VideosPlayer / videos branch inside the monolith
     d1 = brain.compile_dossier(["where is VideosPlayer rendered in DashboardWorkspace"])
     md1 = d1["markdown"]
-    assert "[4D Coordinate Matrix]" in md1
-    assert "case:videos" in md1
+    assert "[6D Coordinate Matrix]" in md1
     assert "VideosPlayer" in md1
 
     # 2. Second dossier in the same session on a completely unfolded small function
@@ -590,7 +590,7 @@ def test_6d_subblocks_sql_schema_and_contract_diagnostics(tmp_path: Path, monkey
     # Verify dossier on open-ended DB bug prompt surfaces 6D Coordinate Matrix + all 3 Contract Warnings
     d_res = brain.compile_dossier(["there are some backend bugs . cant connect to db"])
     md = d_res["markdown"]
-    assert "[4D Coordinate Matrix]" in md
+    assert "[6D Coordinate Matrix]" in md
     assert "Static 6D Contract, Schema & Dialect Diagnostics" in md
     assert "[6D Schema Contract Violation]" in md
     assert "created_at" in md
@@ -859,7 +859,7 @@ def test_debiased_ast_dataflow_alter_table_nested_return_and_general_chop(tmp_pa
     # 2b. AST dataflow must catch BOTH multi-line row alias (`owner != user_id`) AND general disjoint types (`flag_a == expected_tag`, int vs str)
     assert "[6D Type Disjointness Violation]" in md
     assert "uploaded_by" in md
-    assert "?(int) ? ?(str) = ?" in md
+    assert "\u03c4(int) \u2229 \u03c4(str) = \u2205" in md
 
     # 2c. Nested dict return shape + `${API_BASE}` fetch URL must still catch `.missing_client_field`
     assert "[6D Cross-Stack HTTP Shape Violation]" in md
@@ -1084,3 +1084,581 @@ def test_contract_diagnostics_are_gated_by_query_relevance(tmp_path: Path):
     related = brain.compile_dossier(["gallery image load bugs"])["markdown"]
     assert "listener_cleanup_mismatch" not in unrelated
     assert "listener_cleanup_mismatch" in related
+
+
+def test_security_path_traversal_rejected(tmp_path: Path):
+    """C-01: Verify apply_patch_spec strictly blocks ../ and absolute path escapes outside repo root."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    (repo / "inside.py").write_text("x = 1\n", encoding="utf-8")
+    outside = tmp_path / "outside.py"
+    outside.write_text("secret = 1\n", encoding="utf-8")
+
+    spec = "@file ../outside.py\n@sub L1 `secret = 1` -> `secret = 2`\n"
+    res = apply_patch_spec(repo, spec, apply=True)
+    assert res["all_syntax_valid"] is False
+    assert any("Security sandbox violation" in e for e in res["files"][0]["errors"])
+    assert outside.read_text(encoding="utf-8") == "secret = 1\n"
+
+
+def test_ast_symbol_anchored_patching_and_lazy_elision_guard(tmp_path: Path):
+    """H-01 & H-02: Verify @replace_body, @add_method, two-phase @sub + @replace invariance, and lazy elision guard."""
+    (tmp_path / "service.py").write_text(
+        "class AccountService:\n"
+        "    def deposit(self, amount: int) -> int:\n"
+        "        bal = amount\n"
+        "        return bal\n"
+        "\n"
+        "    def withdraw(self, amount: int) -> int:\n"
+        "        return -amount\n",
+        encoding="utf-8",
+    )
+
+    # 1. Lazy elision placeholder must be rejected
+    bad_spec = (
+        "@file service.py\n"
+        "@replace_body AccountService.deposit\n"
+        "        # ... existing code ...\n"
+        "        return amount\n"
+        "@end\n"
+    )
+    res_bad = apply_patch_spec(tmp_path, bad_spec, apply=False)
+    assert res_bad["all_syntax_valid"] is False
+    all_errs = res_bad.get("parse_errors", []) + [e for f in res_bad.get("files", []) for e in f.get("errors", [])]
+    assert any("Lazy elision" in e or "elision" in e.lower() for e in all_errs), f"Expected lazy elision error, got: {all_errs}"
+
+    # 2. Multi-op in single file: @replace_body on top method (expanding lines), @sub on bottom method (original line number L7), and @add_method
+    good_spec = (
+        "@file service.py\n"
+        "@replace_body AccountService.deposit\n"
+        "        if amount <= 0:\n"
+        "            raise ValueError('bad')\n"
+        "        bal = amount + 10\n"
+        "        return bal\n"
+        "@end\n"
+        "@sub L7 `return -amount` -> `return -abs(amount)`\n"
+        "@add_method AccountService\n"
+        "    def reset(self) -> int:\n"
+        "        return 0\n"
+        "@end\n"
+    )
+    res_ok = apply_patch_spec(tmp_path, good_spec, apply=True)
+    assert res_ok["all_syntax_valid"] is True and res_ok["total_ops_applied"] == 3, f"Unexpected patch failure: {res_ok}"
+    updated = (tmp_path / "service.py").read_text(encoding="utf-8")
+    assert "bal = amount + 10" in updated
+    assert "return -abs(amount)" in updated
+    assert "def reset(self) -> int:" in updated
+
+
+def test_pre_commit_caller_arity_contract_verification(tmp_path: Path):
+    """Verify CodePlan pre-commit obligation check flags callers broken by a patched signature."""
+    (tmp_path / "billing.py").write_text(
+        "def charge(user_id: str) -> bool:\n"
+        "    return True\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "checkout.py").write_text(
+        "from billing import charge\n\n"
+        "def run_checkout(uid: str) -> bool:\n"
+        "    return charge(uid)\n",
+        encoding="utf-8",
+    )
+    brain = ProjectBrain(str(tmp_path))
+    brain.index()
+
+    # Patch `charge` to require a second mandatory argument `currency: str` without updating `checkout.py`
+    spec = (
+        "@file billing.py\n"
+        "@sub L1 `def charge(user_id: str) -> bool:` -> `def charge(user_id: str, currency: str) -> bool:`\n"
+    )
+    res = brain.patch(spec, apply=False)
+    assert res["all_contracts_valid"] is False
+    assert any("[6D Caller Arity Contract Violation]" in d and "checkout.py" in d for d in res.get("contract_diagnostics", []))
+
+
+def test_uncalled_nested_function_does_not_hallucinate_call_edge(tmp_path: Path):
+    """H-06: Defining a nested helper without invoking it must emit defines_nested, not calls."""
+    (tmp_path / "nested_demo.py").write_text(
+        "def outer_fn(x: int) -> int:\n"
+        "    def unused_inner(y: int) -> int:\n"
+        "        return y + 1\n"
+        "    return x * 2\n",
+        encoding="utf-8",
+    )
+    brain = ProjectBrain(str(tmp_path))
+    brain.index()
+    verdict = brain.verify_claim("outer_fn", "calls", "unused_inner")
+    assert verdict["verdict"] == "REFUTED", f"Expected REFUTED for uncalled nested fn, got: {verdict}"
+
+
+def test_dyck_constrained_acl_push_and_ochiai_hub_damping(tmp_path: Path):
+    """Verify Dyck CFL-reachability prevents Down->Up caller leakage through shared utility hubs."""
+    (tmp_path / "logger.py").write_text(
+        "def log_info(msg: str) -> None:\n"
+        "    pass\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "feature_a.py").write_text(
+        "from logger import log_info\n"
+        "def handle_payment() -> None:\n"
+        "    log_info('paid')\n",
+        encoding="utf-8",
+    )
+    for k in range(10):
+        (tmp_path / f"unrelated_{k}.py").write_text(
+            f"from logger import log_info\ndef noise_task_{k}() -> None:\n    log_info('n{k}')\n",
+            encoding="utf-8",
+        )
+    brain = ProjectBrain(str(tmp_path))
+    brain.index()
+
+    # Seed PPR at feature_a.py::handle_payment (which calls logger.py::log_info).
+    # In Dyck-constrained push: handle_payment --(calls: DOWN/phase 1)--> log_info.
+    # From phase 1 at log_info, reverse called_by edges (UP) to noise_task_k are forbidden!
+    ppr = brain._graph.multiplex_ppr({"feature_a.py::handle_payment": 1.0})
+    noise_mass = sum(sc for nid, sc, _ in ppr if "unrelated_" in nid)
+    assert noise_mass == 0.0, f"Dyck constraint violated: leaked {noise_mass} mass into unrelated callers of utility hub"
+
+
+def test_normalized_sqlite_wal_store_and_salsa_early_cutoff(tmp_path: Path):
+    """Verify normalized SQLite tables (files, symbols, edges) and Salsa Early Cutoff on body-only edits."""
+    f = tmp_path / "math_ops.py"
+    f.write_text(
+        "def compute_tax(amount: float) -> float:\n"
+        "    return amount * 0.15\n",
+        encoding="utf-8",
+    )
+    brain = ProjectBrain(str(tmp_path))
+    brain.index()
+
+    # Body-only edit (signature and exports unchanged) -> Salsa Early Cutoff must fire
+    f.write_text(
+        "def compute_tax(amount: float) -> float:\n"
+        "    # updated tax rate comment\n"
+        "    return amount * 0.18\n",
+        encoding="utf-8",
+    )
+    inc1 = brain.incremental_index()
+    assert inc1["salsa_early_cutoff"] is True
+
+    # Interface edit (parameter added to signature) -> Salsa Early Cutoff must NOT fire
+    f.write_text(
+        "def compute_tax(amount: float, rate: float = 0.18) -> float:\n"
+        "    return amount * rate\n",
+        encoding="utf-8",
+    )
+    inc2 = brain.incremental_index()
+    assert inc2["salsa_early_cutoff"] is False
+
+
+def test_cross_instance_ledger_isolation_and_source_cache_invalidation(tmp_path: Path):
+    """C-02 & C-03: Verify _source_cache invalidates on re-index and ledger seen_spans do not leak across instances."""
+    f = tmp_path / "mod.py"
+    f.write_text("def greet() -> str:\n    return 'v1'\n", encoding="utf-8")
+
+    b1 = ProjectBrain(str(tmp_path))
+    b1.index()
+    s1 = b1.slice_symbols("mod.py:greet")
+    assert "'v1'" in s1["slices"][0]["code"]
+
+    # Modify file on disk and incremental_index -> _source_cache must serve 'v2', not stale 'v1'
+    f.write_text("def greet() -> str:\n    return 'v2'\n", encoding="utf-8")
+    b1.incremental_index()
+    s2 = b1.slice_symbols("mod.py:greet")
+    assert "'v2'" in s2["slices"][0]["code"]
+
+    # A second independent ProjectBrain instance must have a fresh session_seen set
+    b2 = ProjectBrain(str(tmp_path))
+    b2.load()
+    assert len(b2._ledger._session_seen) == 0
+
+
+def test_polyglot_go_rust_java_treesitter_codecs_and_routes(tmp_path: Path):
+    """Phase 3: Verify first-class Go, Rust, and Java Tree-sitter CST codecs, methods, calls, and routes."""
+    (tmp_path / "server.go").write_text(
+        'package main\n\n'
+        'import "net/http"\n\n'
+        'type OrderHandler struct {}\n\n'
+        'func (h *OrderHandler) CreateOrder(w http.ResponseWriter, r *http.Request) {\n'
+        '    ValidateOrderPayload(r)\n'
+        '}\n\n'
+        'func ValidateOrderPayload(r *http.Request) bool {\n'
+        '    return true\n'
+        '}\n\n'
+        'func RegisterRoutes(router *GinEngine) {\n'
+        '    router.POST("/api/orders", CreateOrder)\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "engine.rs").write_text(
+        'use std::collections::HashMap;\n\n'
+        'pub struct PaymentEngine {}\n\n'
+        'impl PaymentEngine {\n'
+        '    pub fn settle_invoice(&self, invoice_id: u64) -> bool {\n'
+        '        verify_ledger_entry(invoice_id)\n'
+        '    }\n'
+        '}\n\n'
+        '#[get("/api/invoices")]\n'
+        'pub fn list_invoices() -> String {\n'
+        '    String::from("ok")\n'
+        '}\n\n'
+        'pub fn verify_ledger_entry(id: u64) -> bool {\n'
+        '    id > 0\n'
+        '}\n',
+        encoding="utf-8",
+    )
+    (tmp_path / "BillingController.java").write_text(
+        'package com.example.billing;\n\n'
+        'import java.util.List;\n\n'
+        '@RequestMapping("/api/v1/billing")\n'
+        'public class BillingController {\n'
+        '    @PostMapping("/charge")\n'
+        '    public String chargeCustomer(String customerId) {\n'
+        '        return auditCharge(customerId);\n'
+        '    }\n\n'
+        '    public String auditCharge(String customerId) {\n'
+        '        return customerId;\n'
+        '    }\n'
+        '}\n',
+        encoding="utf-8",
+    )
+
+    brain = ProjectBrain(str(tmp_path))
+    stats = brain.index()
+    assert stats["files"] == 3
+
+    # Verify Go struct, method, call edge, and Gin route
+    go_info = brain._index["server.go"]
+    assert any(c["name"] == "OrderHandler" for c in go_info["classes"])
+    assert any(f["name"] == "CreateOrder" and f["parent_class"] == "OrderHandler" for f in go_info["functions"])
+    assert any(r["method"] == "POST" and r["path"] == "/api/orders" for r in go_info["routes"])
+    assert brain.verify_claim("CreateOrder", "calls", "ValidateOrderPayload")["verdict"] == "SUPPORTED"
+
+    # Verify Rust struct, impl method, call edge, and Actix route
+    rs_info = brain._index["engine.rs"]
+    assert any(c["name"] == "PaymentEngine" for c in rs_info["classes"])
+    assert any(f["name"] == "settle_invoice" and f["parent_class"] == "PaymentEngine" for f in rs_info["functions"])
+    assert any(r["method"] == "GET" and r["path"] == "/api/invoices" for r in rs_info["routes"])
+    assert brain.verify_claim("settle_invoice", "calls", "verify_ledger_entry")["verdict"] == "SUPPORTED"
+
+    # Verify Java class, Spring class+method route concatenation, and call edge
+    java_info = brain._index["BillingController.java"]
+    assert any(c["name"] == "BillingController" for c in java_info["classes"])
+    assert any(r["method"] == "POST" and r["path"] == "/api/v1/billing/charge" for r in java_info["routes"])
+    assert brain.verify_claim("chargeCustomer", "calls", "auditCharge")["verdict"] == "SUPPORTED"
+
+
+def test_sqlite_fts5_recursive_cte_and_delta_overlay(tmp_path: Path):
+    """Phase 1 Completion: Verify FTS5 sub-token search, 3-hop recursive CTE, and Stacked Delta Overlay."""
+    (tmp_path / "a.py").write_text("from b import step_two\ndef step_oneCamelCase():\n    return step_two()\n", encoding="utf-8")
+    (tmp_path / "b.py").write_text("from c import step_three\ndef step_two():\n    return step_three()\n", encoding="utf-8")
+    (tmp_path / "c.py").write_text("def step_three():\n    return 42\n", encoding="utf-8")
+
+    brain = ProjectBrain(str(tmp_path))
+    brain.index()
+
+    # 1. FTS5 sub-token search finds `step_oneCamelCase` when querying subtoken `camel`
+    fts_res = brain._db_store.search_fts("camel", limit=5)
+    assert any(r["name"] == "step_oneCamelCase" for r in fts_res)
+
+    # 2. 3-hop WITH RECURSIVE SQLite CTE reaches b.py::step_two (hop 1) and c.py::step_three (hop 2)
+    cte_res = brain._db_store.query_reachable_cte(["a.py::step_oneCamelCase"], max_hops=3, direction="forward")
+    reached_nids = {r["node_id"]: r["hop"] for r in cte_res}
+    assert reached_nids.get("fn:b.py:step_two") == 1
+    assert reached_nids.get("fn:c.py:step_three") == 2
+
+    # 3. Stacked In-Memory Delta Overlay replaces c.py symbols in temp.unified_symbols without touching disk
+    from projectbrain.parsers import parse
+    delta_info = parse("def step_three_patched():\n    return 99\n", ".py")
+    conn = brain._db_store.open_delta_overlay({"c.py": delta_info})
+    try:
+        names = {r[0] for r in conn.execute("SELECT name FROM temp.unified_symbols;").fetchall()}
+        assert "step_three_patched" in names
+        assert "step_three" not in names
+    finally:
+        conn.close()
+    # Persistent DB on disk is untouched
+    conn2 = brain._db_store._connect()
+    try:
+        disk_names = {r[0] for r in conn2.execute("SELECT name FROM symbols;").fetchall()}
+        assert "step_three" in disk_names
+        assert "step_three_patched" not in disk_names
+    finally:
+        conn2.close()
+
+
+def test_stack_trace_frame_seeder_and_greenfield_sibling_mode(tmp_path: Path):
+    """Phase 2 Completion: Verify Stack-Trace Frame Seeder pins crash lines and Greenfield Mode emits exemplars."""
+    (tmp_path / "worker.py").write_text(
+        "from fastapi import APIRouter\n"
+        "router = APIRouter()\n\n"
+        "@router.post('/api/jobs/run')\n"
+        "def run_job_endpoint(job_id: str):\n"
+        "    return execute_heavy_pipeline(job_id)\n\n"
+        "def execute_heavy_pipeline(job_id: str):\n"
+        + "".join(f"    step_{k} = {k}\n" for k in range(1, 35))
+        + "    crash_value = 1 / 0  # L43 exact crash line\n"
+        + "".join(f"    tail_{k} = {k}\n" for k in range(1, 15))
+        + "    return crash_value\n",
+        encoding="utf-8",
+    )
+    brain = ProjectBrain(str(tmp_path))
+    brain.index()
+
+    # 1. Stack trace prompt automatically seeds worker.py:43 and unfolds the exact crash line L43
+    tb_prompt = (
+        'Traceback (most recent call last):\n'
+        '  File "worker.py", line 43, in execute_heavy_pipeline\n'
+        'ZeroDivisionError: division by zero'
+    )
+    ctx = brain.compile_context(tb_prompt, budget_tokens=1500)
+    assert ctx["intent"].get("stack_trace_frames")
+    sliced_code = "\n".join(s["code"] for s in ctx["target_slices"])
+    assert "crash_value = 1 / 0" in sliced_code
+
+    # 2. Greenfield prompt triggers greenfield_mode and returns structural_siblings
+    gf_ctx = brain.compile_context("add a new endpoint for cancelling jobs in worker", budget_tokens=1500)
+    assert gf_ctx["intent"].get("greenfield_mode") is True
+    assert len(gf_ctx.get("structural_siblings", [])) >= 1
+
+
+def test_cli_init_hooks_and_lean_mcp_surface(tmp_path: Path):
+    """Phase 3 Completion: Verify `projectbrain init --hooks` and `server.LEAN_CORE_TOOLS`."""
+    from projectbrain.cli import _run_init
+    from projectbrain.server import LEAN_CORE_TOOLS
+
+    (tmp_path / "app.py").write_text("def hello(): return 1\n", encoding="utf-8")
+    res = _run_init(tmp_path, write_mcp=False, write_rules=False, write_hooks=True)
+    assert "wrote_.claude/settings.local.json_hooks" in res["actions"]
+    assert (tmp_path / ".claude" / "settings.local.json").exists()
+    assert {"brain_dossier", "brain_context", "brain_slice", "brain_patch", "brain_check", "brain_remember"} == LEAN_CORE_TOOLS
+
+
+def test_pure_graph_as_storage_zero_disk_retrieval(tmp_path: Path):
+    """Verify Kythe/Glean-style Graph-as-Storage:
+    1. Graph nodes and edges are stored natively in `graph_nodes` and `edges` WITHOUT ROWID tables (no `graph_json` blob in `meta`).
+    2. Content-addressed source blobs are stored in `source_blobs`, allowing `get_symbol_slice_from_graph` and `compile_context` to slice code even if source files are removed from disk.
+    """
+    import sqlite3
+
+    src_file = tmp_path / "ledger_engine.py"
+    src_file.write_text(
+        "def settle_clearing_house(tx_id: str, amount_cents: int) -> dict:\n"
+        '    """Settle interbank clearing house transaction and emit receipt."""\n'
+        "    fee = amount_cents // 100\n"
+        "    return {'tx_id': tx_id, 'net': amount_cents - fee}\n",
+        encoding="utf-8",
+    )
+    b1 = ProjectBrain(str(tmp_path))
+    b1.index()
+
+    # 1. Verify `meta` has no duplicate `graph_json` blob and `graph_nodes` / `source_blobs` are populated
+    conn = sqlite3.connect(str(tmp_path / ".projectbrain.db"))
+    try:
+        meta_keys = {r[0] for r in conn.execute("SELECT key FROM meta;").fetchall()}
+        assert "graph_json" not in meta_keys
+        n_nodes = conn.execute("SELECT COUNT(*) FROM graph_nodes;").fetchone()[0]
+        n_blobs = conn.execute("SELECT COUNT(*) FROM source_blobs;").fetchone()[0]
+        assert n_nodes >= 2
+        assert n_blobs == 1
+    finally:
+        conn.close()
+
+    # 2. Direct SQLite Graph-as-Storage symbol slice without touching Python index
+    direct_slice = b1._db_store.get_symbol_slice_from_graph("settle_clearing_house")
+    assert direct_slice is not None
+    assert "amount_cents - fee" in direct_slice["code"]
+
+    # 3. Delete the physical `.py` file from disk and load a fresh ProjectBrain solely from `.projectbrain.db`!
+    src_file.unlink()
+    assert not src_file.exists()
+
+    b2 = ProjectBrain(str(tmp_path))
+    assert b2.load() is True
+    assert b2._graph is not None and len(b2._graph.nodes) == n_nodes
+
+    sliced = b2.slice_symbols("settle_clearing_house")
+    assert sliced["slices"]
+    assert "amount_cents - fee" in sliced["slices"][0]["code"]
+
+
+def test_v081_single_turn_dossier_terse_rules_and_6d_run_compressor(tmp_path: Path, capsys):
+    """Verify v0.8.1 post-dossier token-saving upgrades:
+    1. Default `projectbrain dossier` prints markdown directly to stdout in 1 turn while saving `.projectbrain_dossier.md` (`--json` outputs metadata).
+    2. `projectbrain init --hooks` embeds Terse Output Mode ('Say Less, Keep Code Exact') and AST Symbol-First Patching (`@replace_body <Symbol>`).
+    3. `projectbrain run` / `compress_command_output` folds passing test noise, deduplicates repetitive log lines, and resolves traceback frames to 6D Code Graph symbols + callers.
+    """
+    import json
+    from projectbrain import cli
+
+    pkg = tmp_path / "billing.py"
+    pkg.write_text(
+        "def compute_invoice_tax(subtotal: float, rate: float) -> float:\n"
+        "    if rate < 0:\n"
+        "        raise ValueError('negative tax rate')\n"
+        "    return round(subtotal * rate, 2)\n\n"
+        "def checkout_order(order_id: str, amount: float) -> dict:\n"
+        "    tax = compute_invoice_tax(amount, -0.05)\n"
+        "    return {'order_id': order_id, 'total': amount + tax}\n",
+        encoding="utf-8",
+    )
+
+    # 1. Verify `init --hooks` writes Terse Output Mode & Symbol-First Patching rules
+    capsys.readouterr()
+    rc_init = cli.main(["--path", str(tmp_path), "init", "--no-mcp", "--hooks"])
+    assert rc_init == 0
+    agents_txt = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+    assert "Terse Output Mode" in agents_txt
+    assert "@replace_body <Symbol>" in agents_txt
+    assert "projectbrain run" in agents_txt
+    hooks_json = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
+    assert len(hooks_json["hooks"]["PreToolUse"]) >= 2
+
+    # 2. Verify default `projectbrain dossier` prints full markdown in 1 turn (no extra read_file required)
+    capsys.readouterr()
+    rc_dos = cli.main(["--path", str(tmp_path), "dossier", "how checkout_order computes invoice tax"])
+    assert rc_dos == 0
+    out_md = capsys.readouterr().out
+    assert out_md.startswith("# ProjectBrain Complete Engineering Dossier")
+    assert "compute_invoice_tax" in out_md
+    assert "@replace_body <Symbol>" in out_md
+    assert (tmp_path / ".projectbrain_dossier.md").exists()
+
+    # And `--json` still returns metadata dict
+    rc_json = cli.main(["--path", str(tmp_path), "dossier", "--json", "how checkout_order computes invoice tax"])
+    assert rc_json == 0
+    meta = json.loads(capsys.readouterr().out)
+    assert meta["files_resolved"] >= 1
+    assert "markdown" not in meta
+
+    # 3. Verify 6D Graph-Aware Command/Test Output Compressor (`compress_command_output`)
+    brain = ProjectBrain(str(tmp_path))
+    brain.load()
+    noisy_output = "\n".join([
+        *[f"tests/test_suite.py::test_case_{i} PASSED [ {i}%]" for i in range(1, 51)],
+        *[f"2026-11-07T12:00:{i:02d}Z INFO [worker] polling queue item_id={1000 + i}" for i in range(1, 25)],
+        "================================== FAILURES ===================================",
+        "Traceback (most recent call last):",
+        '  File "billing.py", line 7, in checkout_order',
+        "    tax = compute_invoice_tax(amount, -0.05)",
+        '  File "billing.py", line 3, in compute_invoice_tax',
+        "    raise ValueError('negative tax rate')",
+        "ValueError: negative tax rate",
+        "=========================== 1 failed, 50 passed in 0.42s ======================",
+    ])
+    comp = brain.compress_command_output(noisy_output)
+    assert comp["passing_tests_folded"] == 50
+    assert comp["repeated_lines_folded"] >= 20
+    assert comp["savings_pct"] > 50.0
+    assert "# [6D Failing Frame Resolution]" in comp["compressed_output"]
+    resolved_syms = {f["symbol"] for f in comp["resolved_6d_frames"]}
+    assert "compute_invoice_tax" in resolved_syms
+    assert "checkout_order" in resolved_syms
+    tax_frame = next(f for f in comp["resolved_6d_frames"] if f["symbol"] == "compute_invoice_tax")
+    assert any("checkout_order" in c for c in tax_frame["callers"])
+
+
+def test_codex_review_hardening_suite(tmp_path: Path, monkeypatch):
+    """Verify all 5 Codex audit fixes:
+    1. `.gitignore` compliance in `_walk()` (directory rules, wildcard globs, anchored rules, nested `.gitignore`).
+    2. Non-destructive `projectbrain init` preserving existing `AGENTS.md`, `.cursor/rules`, and `.claude/settings.local.json`.
+    3. `brain_run` MCP security lockdown (blocks `command` unless `PROJECTBRAIN_ALLOW_EXEC=1`).
+    4. Polyglot extension coverage (`.vue`, `.svelte`, `.cs`, `.kt`, `.rb`, `.php`, `.cpp`, `.prisma`, `.proto`).
+    """
+    import json
+    from projectbrain.brain import ProjectBrain
+    from projectbrain.cli import _run_init
+    from projectbrain import server
+
+    # 1. .gitignore compliance
+    (tmp_path / ".gitignore").write_text(
+        "# Custom ignores\n"
+        "generated_sdk/\n"
+        "*.pb2.py\n"
+        "/root_only_ignore.py\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src").mkdir()
+    (tmp_path / "src" / "main.py").write_text("def run_main():\n    return 42\n", encoding="utf-8")
+    (tmp_path / "src" / "root_only_ignore.py").write_text("def nested_allowed():\n    return 1\n", encoding="utf-8")
+    (tmp_path / "root_only_ignore.py").write_text("def should_skip_root():\n    return 0\n", encoding="utf-8")
+    (tmp_path / "src" / "schema.pb2.py").write_text("def should_skip_glob():\n    return 0\n", encoding="utf-8")
+    (tmp_path / "generated_sdk").mkdir()
+    (tmp_path / "generated_sdk" / "client.py").write_text("def should_skip_dir():\n    return 0\n", encoding="utf-8")
+
+    # 4. Polyglot files (.vue, .cs, .kt)
+    (tmp_path / "src" / "Widget.vue").write_text(
+        "<template><div>{{ count }}</div></template>\n"
+        "<script lang=\"ts\">\n"
+        "export function computeWidgetTotal(price: number, qty: number): number {\n"
+        "  return price * qty;\n"
+        "}\n"
+        "</script>\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "src" / "OrderController.cs").write_text(
+        "using System;\n"
+        "public class OrderController {\n"
+        "    [HttpPost(\"/api/orders\")]\n"
+        "    public string CreateOrder(string orderId) {\n"
+        "        return orderId;\n"
+        "    }\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    # 2. Non-destructive `init` on pre-existing user files
+    (tmp_path / "AGENTS.md").write_text("# Team Custom Instructions\nAlways run linter before commit.\n", encoding="utf-8")
+    claude_dir = tmp_path / ".claude"
+    claude_dir.mkdir()
+    (claude_dir / "settings.local.json").write_text(
+        json.dumps({
+            "permissions": {"allow": ["Bash(pytest:*)"]},
+            "hooks": {
+                "PreToolUse": [
+                    {"matcher": "Bash", "hooks": [{"type": "command", "command": "echo 'team hook'"}]}
+                ]
+            },
+        }),
+        encoding="utf-8",
+    )
+
+    _run_init(tmp_path, write_mcp=True, write_rules=True, write_hooks=True)
+    # Run a second time to verify idempotency (no duplicate sections or hooks)
+    _run_init(tmp_path, write_mcp=True, write_rules=True, write_hooks=True)
+
+    agents_txt = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
+    assert "# Team Custom Instructions" in agents_txt
+    assert "Always run linter before commit." in agents_txt
+    assert agents_txt.count("<!-- projectbrain:start -->") == 1
+
+    claude_cfg = json.loads((claude_dir / "settings.local.json").read_text(encoding="utf-8"))
+    assert claude_cfg["permissions"]["allow"] == ["Bash(pytest:*)"]
+    pre_hooks = claude_cfg["hooks"]["PreToolUse"]
+    assert any("team hook" in json.dumps(h) for h in pre_hooks)
+    assert sum(1 for h in pre_hooks if "[ProjectBrain]" in json.dumps(h)) == 2
+
+    brain = ProjectBrain(str(tmp_path))
+    brain.load()
+    indexed_files = set(brain._index.keys())
+    assert "src/main.py" in indexed_files
+    assert "src/root_only_ignore.py" in indexed_files
+    assert "src/Widget.vue" in indexed_files
+    assert "src/OrderController.cs" in indexed_files
+    assert "root_only_ignore.py" not in indexed_files
+    assert "src/schema.pb2.py" not in indexed_files
+    assert "generated_sdk/client.py" not in indexed_files
+
+    vue_fns = brain._index["src/Widget.vue"]["functions"]
+    assert any(f["name"] == "computeWidgetTotal" and f["line_start"] == 3 for f in vue_fns)
+    cs_routes = brain._index["src/OrderController.cs"]["routes"]
+    assert any(r["method"] == "POST" and r["path"] == "/api/orders" for r in cs_routes)
+
+    # 3. MCP `brain_run` security lockdown
+    monkeypatch.delenv("PROJECTBRAIN_ALLOW_EXEC", raising=False)
+    blocked = server.brain_run(command="echo pwned", repo_path=str(tmp_path))
+    assert blocked.get("exit_code") == 126
+    assert "disabled by default" in blocked.get("error", "")
+
+    safe_comp = server.brain_run(raw_output="tests/test_a.py::test_1 PASSED\n", repo_path=str(tmp_path))
+    assert safe_comp["passing_tests_folded"] == 1

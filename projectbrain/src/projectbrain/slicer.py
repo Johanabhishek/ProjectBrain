@@ -15,13 +15,13 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
-from .parsers import _PARSERS
+from .parsers import _PARSERS, get_parser
 
 _IMPORTANT_CODE_PAT = re.compile(
-    r"\b(setInterval|setTimeout|clearTimeout|clearInterval|addEventListener|fetch|Promise\.race|AbortController|AbortSignal|"
+    r"\b(setInterval|setTimeout|clearTimeout|clearInterval|addEventListener|removeEventListener|fetch|axios|Promise\.race|AbortController|AbortSignal|"
     r"catch|throw|finally|document\.cookie|localStorage|sessionStorage|"
-    r"setDoc|updateDoc|getDoc|getDocs|addDoc|deleteDoc|writeBatch|runTransaction|onSnapshot|hydrate|flush|"
-    r"[a-zA-Z0-9_$]+(Cooldowns|Storage|Kv|Ref\.current|Payload|State|Data)\.(get|set|has|add|delete)|"
+    r"(?:set|update|get|add|delete|write|run|on)[A-Z][a-zA-Z0-9_]*|hydrate|flush|persist|dispatch|commit|execute|"
+    r"[a-zA-Z0-9_$]+(?:\.current)?\.(?:get|set|has|add|delete|put|write|save|update|upsert|setItem|getItem)|"
     r"[A-Z][A-Z0-9]*_[A-Z0-9_]+)\b"
 )
 _UPPER_CONST_PAT = re.compile(r"\b[A-Z][A-Z0-9]*_[A-Z0-9_]+\b")
@@ -69,8 +69,14 @@ def slice_lines(
     try:
         lines = full_path.read_text(encoding="utf-8", errors="replace").splitlines()
     except OSError:
-        return ""
-
+        from .store import SQLiteIndexStore
+        blob_txt = SQLiteIndexStore(root / ".projectbrain.db").get_source_blob(rel_path)
+        if not blob_txt:
+            return ""
+        lines = blob_txt.splitlines()
+        if not blob_txt:
+            return ""
+        lines = blob_txt.splitlines()
     start_idx = max(line_start - 1, 0)
     end_idx = min(line_end, len(lines))
     selected = lines[start_idx:end_idx]
@@ -216,22 +222,25 @@ def slice_lines(
                 i += 1
             gap_lines = i - gap_start
             landmarks: list[str] = []
-            if gap_lines >= 8:
+            if gap_lines >= 12:
                 for k in range(gap_start, i):
                     st = selected[k].strip()
                     if len(st) > 6 and (
                         "onClick=" in st
                         or "className=" in st
                         or "&& (" in st
-                        or st.startswith(("/* ", "{/*", "case ", "if (", "return ("))
+                        or st.startswith(("/* ", "{/*", "case "))
                     ):
-                        snippet = re.sub(r"\s+", " ", st)[:42]
+                        snippet = re.sub(r"\s+", " ", st)[:38]
                         landmarks.append(f"L{start_idx + k + 1}:{snippet}")
-                        if len(landmarks) >= 4:
+                        if len(landmarks) >= 3:
                             break
             lm_suffix = f" | landmarks: {', '.join(landmarks)}" if landmarks else ""
+            f_s = start_idx + gap_start + 1
+            f_e = start_idx + i
+            exp_suffix = f" -> expand: brain_slice {rel_path}:{f_s}-{f_e}" if gap_lines >= 15 else ""
             formatted.append(
-                f" ... | [folded {gap_lines} lines L{start_idx + gap_start + 1}-L{start_idx + i}{lm_suffix}]"
+                f" ... | [folded {gap_lines} lines L{f_s}-L{f_e}{lm_suffix}{exp_suffix}]"
             )
     return "\n".join(formatted)
 
@@ -1339,6 +1348,7 @@ def extract_4d_coordinate_matrix(
     line_start: int = 1,
     line_end: int | None = None,
     ext: str = ".tsx",
+    tree: object | None = None,
 ) -> list[dict]:
     """Decompose a file or giant function into a 4D Coordinate Matrix of atomic sub-blocks:
       - X_scope: structural scope / branch guard (case '...', if (...), useEffect[deps], fn:name, jsx[cond])
@@ -1361,11 +1371,12 @@ def extract_4d_coordinate_matrix(
         if ext.lower() in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
         else []
     )
-    parser = _PARSERS.get(ext.lower()) or _PARSERS.get(".tsx")
-    if parser and n > 0:
+    parser = get_parser(ext.lower())
+    if (tree is not None or parser is not None) and n > 0:
         try:
-            src_bytes = "\n".join(lines).encode("utf-8", errors="replace")
-            tree = parser.parse(src_bytes)
+            if tree is None and parser is not None:
+                src_bytes = "\n".join(lines).encode("utf-8", errors="replace")
+                tree = parser.parse(src_bytes)
             stack = [tree.root_node]
             _SPAN_NODE_TYPES = {
                 "function_declaration", "arrow_function", "function_definition",
@@ -1554,7 +1565,7 @@ def extract_4d_coordinate_matrix(
                 if span <= 200:
                     body_txt = "\n".join(lines[i : end_i + 1])
                     if re.search(
-                        r"\b(?:fetch|axios|setItem|getItem|memoryKv|setDoc|updateDoc|execute|commit|prisma|supabase|dispatch|requests\.|httpx\.|aiohttp\.|redis\.|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|SELECT\s+)\b",
+                        r"\b(?:fetch|axios|setItem|getItem|[a-z]+Doc|execute|commit|prisma|supabase|dispatch|requests\.|httpx\.|aiohttp\.|redis\.|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|SELECT\s+|\w+\.(?:set|put|write|save|update|upsert)\s*\()\b",
                         body_txt,
                         re.IGNORECASE,
                     ):
@@ -1706,7 +1717,7 @@ def extract_4d_coordinate_matrix(
                 z_read.append(tbl)
         # Key-Value Storage, Dict/Session/Cache/Env State, and Event Channels (Python & JS/TS)
         for m_kv in re.finditer(
-            r"(?:getItem|setItem|removeItem|memoryKv\.(?:get|set)|(?:state|store|session|cache|db|ledger|context|os\.environ)\.(?:get|set|put|write|update|delete)|os\.getenv)\(\s*['\"]([^'\"]{2,40})['\"]",
+            r"(?:getItem|setItem|removeItem|[a-zA-Z_]\w*\.(?:get|set|put|write|update|delete|setItem|getItem)|os\.getenv)\(\s*['\"]([a-zA-Z0-9_.\-:]{2,40})['\"]",
             chunk,
         ):
             k_name = m_kv.group(1)
@@ -1787,21 +1798,21 @@ def extract_4d_coordinate_matrix(
             }
         )
         sql_inserts: list[dict] = []
-        for m_ins in re.finditer(
-            r"\bINSERT\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]{2,})\s*\(([^)]+)\)\s*(?:VALUES|SELECT)\b",
-            chunk,
-            re.IGNORECASE,
-        ):
-            ins_tbl = m_ins.group(1)
-            ins_cols = [
-                c.strip().strip('"`')
-                for c in m_ins.group(2).split(",")
-                if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", c.strip().strip('"`'))
-            ]
-            if ins_cols:
-                ins_line = s + chunk.count("\n", 0, m_ins.start())
-                sql_inserts.append({"table": ins_tbl, "cols": ins_cols, "line": ins_line})
-
+        if "INSERT" in chunk or "insert" in chunk:
+            for m_ins in re.finditer(
+                r"\bINSERT\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]{2,})\s*\(([^)]+)\)\s*(?:VALUES|SELECT)\b",
+                chunk,
+                re.IGNORECASE,
+            ):
+                ins_tbl = m_ins.group(1)
+                ins_cols = [
+                    c.strip().strip('"`')
+                    for c in m_ins.group(2).split(",")
+                    if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", c.strip().strip('"`'))
+                ]
+                if ins_cols:
+                    ins_line = s + chunk.count("\n", 0, m_ins.start())
+                    sql_inserts.append({"table": ins_tbl, "cols": ins_cols, "line": ins_line})
         sql_dialects: list[str] = []
         if re.search(r"\binterval\s+'[^']+'", chunk, re.IGNORECASE):
             sql_dialects.append("interval_literal")
@@ -1809,6 +1820,10 @@ def extract_4d_coordinate_matrix(
             sql_dialects.append("make_interval")
         if re.search(r"=\s*ANY\s*\(\s*(?:%s|\$|\?)", chunk, re.IGNORECASE):
             sql_dialects.append("any_array")
+        if re.search(r"\bILIKE\b", chunk):
+            sql_dialects.append("ilike_operator")
+        if re.search(r"::(?:uuid|jsonb|timestamptz|inet|text\[\]|int\[\])\b", chunk, re.IGNORECASE):
+            sql_dialects.append("postgres_typecast")
 
         # Cross-stack HTTP client calls (fetch / axios / client.<verb>)
         # Cross-stack HTTP client calls (fetch / axios / client.<verb>) + expected response shape
@@ -1866,10 +1881,14 @@ def extract_4d_coordinate_matrix(
             if ext.lower() == ".py" and s in py_ast_contracts:
                 type_comparisons.extend(py_ast_contracts[s].get("type_comparisons", []))
                 return_dict_keys.extend(py_ast_contracts[s].get("return_dict_keys", []))
-            for m_sel in re.finditer(
-                r"\b([a-zA-Z_]\w*)\s*=\s*[\w.]+\.execute\(\s*(?:f?['\"]{1,3})\s*SELECT\s+([\s\S]+?)\s+FROM\s+([a-zA-Z_]\w*)\b[\s\S]*?\)\.fetchone\(\)",
-                chunk,
-                re.IGNORECASE,
+            for m_sel in (
+                re.finditer(
+                    r"\b([a-zA-Z_]\w*)\s*=\s*[\w.]+\.execute\(\s*(?:f?['\"]{1,3})\s*SELECT\s+([\s\S]+?)\s+FROM\s+([a-zA-Z_]\w*)\b[\s\S]*?\)\.fetchone\(\)",
+                    chunk,
+                    re.IGNORECASE,
+                )
+                if "fetchone" in chunk
+                else ()
             ):
                 r_var = m_sel.group(1)
                 raw_c_str = m_sel.group(2)
@@ -2116,7 +2135,7 @@ def query_4d_coordinate_matrix(
     display_cells.sort(key=lambda c: c["line_start"])
 
     table_lines = [
-        "# [4D Coordinate Matrix] Lstart-Lend | Y_Role | X_Scope | ?Z_Write -> W_Calls"
+        "# [6D Coordinate Matrix] Lstart-Lend | Y_Role | X_Scope | ?Z_Write -> W_Calls | E_Exit | T_Mode"
     ]
     for c in display_cells:
         zw = f" ?Z:[{','.join(c['Z_write'][:3])}]" if c["Z_write"] else ""
@@ -2127,3 +2146,7 @@ def query_4d_coordinate_matrix(
             f"#   L{c['line_start']:4d}-L{c['line_end']:4d} | {c['Y_role']:6s} | {c['X_scope'][:34]:34s} |{zw}{wc}{ex}{tm}"
         )
     return top_cells, "\n".join(table_lines)
+
+
+extract_6d_coordinate_matrix = extract_4d_coordinate_matrix
+query_6d_coordinate_matrix = query_4d_coordinate_matrix

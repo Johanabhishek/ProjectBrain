@@ -1,85 +1,238 @@
-"""Epistemic Working Memory & Structural Resolution Ledger for ProjectBrain.
+"""Resolution & Coverage Telemetry Ledger for ProjectBrain (`.projectbrain_ledger.json`).
 
-Tracks session read-intervals (Zero-Waste Guard) and structural resolution
-telemetry (AST slices compiled, 4D coordinate cells resolved, closed-world
-verifications, and AST-verified anchor patches) across `dossier`, `compile`,
-`slice`, and `patch` operations.
+Tracks verifiable static analysis metrics (files resolved, AST slices compiled,
+4D coordinate cells matched, closed-world scan guarantees, and surgical patch
+operations) plus an instance-scoped Session Zero-Waste Guard (`seen_spans`) that
+prevents re-emitting identical source lines within the same `ProjectBrain` session
+without leaking stale suppression across separate CLI processes.
 """
-
 from __future__ import annotations
 
 import json
-from datetime import datetime, timezone
+import time
 from pathlib import Path
-from typing import Any
 
-LEDGER_FILENAME = ".projectbrain_ledger.json"
+
+def _merge_intervals(intervals: list[tuple[int, int]]) -> list[tuple[int, int]]:
+    """Merge overlapping or adjacent 1-based inclusive [start, end] line intervals."""
+    if not intervals:
+        return []
+    sorted_ivs = sorted((min(a, b), max(a, b)) for a, b in intervals)
+    merged: list[tuple[int, int]] = [sorted_ivs[0]]
+    for s, e in sorted_ivs[1:]:
+        prev_s, prev_e = merged[-1]
+        if s <= prev_e + 1:
+            merged[-1] = (prev_s, max(prev_e, e))
+        else:
+            merged.append((s, e))
+    return merged
+
+
+def _subtract_intervals(
+    req_start: int, req_end: int, seen: list[tuple[int, int]]
+) -> tuple[list[tuple[int, int]], list[tuple[int, int]]]:
+    """Subtract `seen` intervals from `[req_start, req_end]`.
+    Returns `(unseen_intervals, skipped_overlap_intervals)`.
+    """
+    s, e = min(req_start, req_end), max(req_start, req_end)
+    if not seen:
+        return [(s, e)], []
+
+    unseen: list[tuple[int, int]] = []
+    skipped: list[tuple[int, int]] = []
+    cur = s
+    for seen_s, seen_e in _merge_intervals(seen):
+        if seen_e < cur:
+            continue
+        if seen_s > e:
+            break
+        if seen_s > cur:
+            unseen.append((cur, min(e, seen_s - 1)))
+        ov_s = max(cur, seen_s)
+        ov_e = min(e, seen_e)
+        if ov_s <= ov_e:
+            skipped.append((ov_s, ov_e))
+        cur = max(cur, seen_e + 1)
+        if cur > e:
+            break
+    if cur <= e:
+        unseen.append((cur, e))
+    return unseen, skipped
 
 
 class SavingsLedger:
-    def __init__(self, root: Path) -> None:
-        self.root = root
-        self.ledger_path = root / LEDGER_FILENAME
+    """Persists cumulative resolution telemetry to `<repo>/.projectbrain_ledger.json`
+    while scoping `seen_spans` deduplication to the live `ProjectBrain` session.
+    """
 
-    def _load(self) -> dict[str, Any]:
-        if self.ledger_path.exists():
-            try:
-                data = json.loads(self.ledger_path.read_text(encoding="utf-8"))
-                if isinstance(data, dict) and "events" in data:
-                    return data
-            except Exception:
-                pass
+    def __init__(self, root: Path):
+        self.root = Path(root).resolve()
+        self.path = self.root / ".projectbrain_ledger.json"
+        self._session_seen: dict[str, dict] = {}
+
+    def _default_state(self) -> dict:
         return {
-            "repo": str(self.root.resolve()),
-            "created_at": datetime.now(timezone.utc).isoformat(),
-            "events": [],
+            "version": 2,
+            "started_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            "total_ops": 0,
+            "ops_by_type": {
+                "dossier": 0,
+                "compile": 0,
+                "slice": 0,
+                "patch": 0,
+            },
+            "resolution": {
+                "files_resolved_total": 0,
+                "ast_slices_compiled": 0,
+                "cells_4d_resolved": 0,
+                "closed_world_scans_verified": 0,
+                "patch_ops_applied": 0,
+                "files_patched": 0,
+                "syntax_verified_patches": 0,
+            },
+            "session_seen": {},
+            "recent_events": [],
         }
 
-    def _save(self, data: dict[str, Any]) -> None:
+    def _load(self) -> dict:
+        if not self.path.exists():
+            return self._default_state()
         try:
-            self.ledger_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+            data = json.loads(self.path.read_text(encoding="utf-8"))
+            if not isinstance(data, dict) or data.get("version") != 2 or "resolution" not in data:
+                return self._default_state()
+            return data
+        except (OSError, json.JSONDecodeError):
+            return self._default_state()
+
+    def _save(self, data: dict) -> None:
+        try:
+            data["session_seen"] = self._session_seen
+            self.path.write_text(json.dumps(data, indent=2), encoding="utf-8")
         except OSError:
             pass
+
+    def invalidate_file(self, rel_path: str | None = None) -> None:
+        """Clear cached seen_spans for `rel_path` (or all files if None)."""
+        if rel_path is None:
+            self._session_seen.clear()
+        else:
+            norm = rel_path.replace("\\", "/")
+            self._session_seen.pop(norm, None)
+
+    def plan_slice_intervals(
+        self,
+        rel_path: str,
+        req_start: int,
+        req_end: int,
+        total_file_lines: int = 0,
+        commit: bool = True,
+    ) -> dict:
+        """Session Zero-Waste Guard & Small-File Remainder Guard.
+
+        1. Checks file `mtime` on disk against `self._session_seen[rel_path]`.
+           If the file was modified since last read, resets its seen intervals.
+        2. Subtracts already-seen intervals from `[req_start, req_end]` so overlapping
+           `slice` or `dossier` calls within the SAME `ProjectBrain` session never emit duplicate lines.
+        3. Small-File Remainder Guard: If `total_file_lines <= 220` and a prior slice
+           was already read on this file, automatically expands to cover all remaining
+           unread lines of the file in one pass.
+        """
+        norm_rel = rel_path.replace("\\", "/")
+        abs_path = self.root / norm_rel
+        try:
+            cur_mtime = abs_path.stat().st_mtime if abs_path.exists() else 0.0
+        except OSError:
+            cur_mtime = 0.0
+
+        entry = self._session_seen.get(norm_rel)
+        if not entry or abs(entry.get("mtime", 0.0) - cur_mtime) > 1e-6:
+            entry = {"mtime": cur_mtime, "intervals": []}
+
+        seen_ivs: list[tuple[int, int]] = [tuple(iv) for iv in entry.get("intervals", [])]  # type: ignore[misc]
+        s, e = max(1, min(req_start, req_end)), max(req_start, req_end)
+
+        auto_completed_file = False
+        if seen_ivs and 0 < total_file_lines <= 220 and (e - s + 1) < total_file_lines:
+            s, e = 1, total_file_lines
+            auto_completed_file = True
+
+        unseen, skipped = _subtract_intervals(s, e, seen_ivs)
+        if commit and unseen:
+            new_seen = _merge_intervals(seen_ivs + unseen)
+            self._session_seen[norm_rel] = {
+                "mtime": cur_mtime,
+                "intervals": [[a, b] for a, b in new_seen],
+            }
+
+        return {
+            "unseen_intervals": unseen,
+            "skipped_intervals": skipped,
+            "auto_completed_file": auto_completed_file,
+        }
+
+    def commit_slice_intervals(self, rel_path: str, emitted_intervals: list[tuple[int, int]]) -> None:
+        """Record actually emitted (unfolded) line intervals for `rel_path` in the session cache."""
+        if not emitted_intervals:
+            return
+        norm_rel = rel_path.replace("\\", "/")
+        abs_path = self.root / norm_rel
+        try:
+            cur_mtime = abs_path.stat().st_mtime if abs_path.exists() else 0.0
+        except OSError:
+            cur_mtime = 0.0
+
+        entry = self._session_seen.get(norm_rel)
+        if not entry or abs(entry.get("mtime", 0.0) - cur_mtime) > 1e-6:
+            seen_ivs: list[tuple[int, int]] = []
+        else:
+            seen_ivs = [tuple(iv) for iv in entry.get("intervals", [])]  # type: ignore[misc]
+
+        merged = _merge_intervals(seen_ivs + emitted_intervals)
+        self._session_seen[norm_rel] = {
+            "mtime": cur_mtime,
+            "intervals": [[a, b] for a, b in merged],
+        }
 
     def record_input_op(
         self,
         op: str,
         query: str,
         files_covered: int = 0,
-        touched_files: list[str] | set[str] | None = None,
+        touched_files: set[str] | list[str] | None = None,
         slices_included: int = 0,
         cells_4d_resolved: int = 0,
         closed_world_verified: bool = False,
-        **_: Any,
-    ) -> dict[str, Any]:
+        naive_bytes: int = 0,
+        emitted_chars: int = 0,
+    ) -> dict:
+        """Record a verifiable context compilation / dossier / slice event."""
         data = self._load()
-        events = data.get("events", [])
-        now_dt = datetime.now(timezone.utc)
-        seen_files: set[str] = set(data.get("seen_files", []))
-        if events:
-            try:
-                last_dt = datetime.fromisoformat(events[-1].get("timestamp", ""))
-                if (now_dt - last_dt).total_seconds() > 1200:
-                    seen_files.clear()
-            except Exception:
-                pass
+        data["total_ops"] = data.get("total_ops", 0) + 1
+        ops_map = data.setdefault("ops_by_type", {})
+        ops_map[op] = ops_map.get(op, 0) + 1
 
-        touched_list: list[str] = sorted(touched_files) if touched_files is not None else []
-        for f in touched_list:
-            seen_files.add(f)
-        data["seen_files"] = sorted(seen_files)
+        res = data.setdefault("resolution", {})
+        res["files_resolved_total"] = res.get("files_resolved_total", 0) + int(files_covered)
+        res["ast_slices_compiled"] = res.get("ast_slices_compiled", 0) + int(slices_included)
+        res["cells_4d_resolved"] = res.get("cells_4d_resolved", 0) + int(cells_4d_resolved)
+        if closed_world_verified:
+            res["closed_world_scans_verified"] = res.get("closed_world_scans_verified", 0) + 1
 
         event = {
-            "timestamp": now_dt.isoformat(),
+            "ts": time.strftime("%H:%M:%S", time.gmtime()),
             "op": op,
-            "query": query[:140],
-            "touched_files": touched_list,
-            "files_covered": files_covered or len(touched_list),
-            "slices_included": slices_included,
-            "cells_4d_resolved": cells_4d_resolved,
-            "closed_world_verified": closed_world_verified,
+            "query": query[:90],
+            "files_resolved": int(files_covered),
+            "slices_included": int(slices_included),
+            "cells_4d_resolved": int(cells_4d_resolved),
+            "closed_world_verified": bool(closed_world_verified),
         }
-        data["events"].append(event)
+        recent = data.setdefault("recent_events", [])
+        recent.append(event)
+        if len(recent) > 25:
+            data["recent_events"] = recent[-25:]
+
         self._save(data)
         return event
 
@@ -87,177 +240,63 @@ class SavingsLedger:
         self,
         files_patched: int,
         ops_applied: int,
-        mode: str = "dry_run",
-        all_syntax_valid: bool = True,
-        **_: Any,
-    ) -> dict[str, Any]:
-        event = {
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-            "op": f"patch ({mode})",
-            "query": f"{ops_applied} surgical ops across {files_patched} files",
-            "files_patched": files_patched,
-            "ops_applied": ops_applied,
-            "all_syntax_valid": all_syntax_valid,
-        }
+        mode: str,
+        all_syntax_valid: bool,
+        orig_total_bytes: int = 0,
+        spec_chars: int = 0,
+        diff_chars: int = 0,
+    ) -> dict:
+        """Record a Surgical Anchor Patch (`projectbrain patch`) execution."""
         data = self._load()
-        data["events"].append(event)
+        data["total_ops"] = data.get("total_ops", 0) + 1
+        ops_map = data.setdefault("ops_by_type", {})
+        ops_map["patch"] = ops_map.get("patch", 0) + 1
+
+        res = data.setdefault("resolution", {})
+        res["patch_ops_applied"] = res.get("patch_ops_applied", 0) + int(ops_applied)
+        res["files_patched"] = res.get("files_patched", 0) + int(files_patched)
+        if all_syntax_valid:
+            res["syntax_verified_patches"] = res.get("syntax_verified_patches", 0) + 1
+
+        event = {
+            "ts": time.strftime("%H:%M:%S", time.gmtime()),
+            "op": f"patch:{mode}",
+            "files_patched": int(files_patched),
+            "ops_applied": int(ops_applied),
+            "syntax_valid": bool(all_syntax_valid),
+        }
+        recent = data.setdefault("recent_events", [])
+        recent.append(event)
+        if len(recent) > 25:
+            data["recent_events"] = recent[-25:]
+
         self._save(data)
         return event
 
-    def get_stats(self) -> dict[str, Any]:
+    def get_stats(self) -> dict:
+        """Return formatted resolution and structural coverage statistics."""
         data = self._load()
-        events = data.get("events", [])
-        seen_spans = data.get("seen_spans", {})
-        tot_slices = sum(int(e.get("slices_included", 0)) for e in events)
-        tot_cells_4d = sum(int(e.get("cells_4d_resolved", 0)) for e in events)
-        tot_closed_world = sum(1 for e in events if e.get("closed_world_verified"))
-        tot_patch_ops = sum(int(e.get("ops_applied", 0)) for e in events)
+        res = data.get("resolution", {})
         return {
-            "repo": data.get("repo", str(self.root.resolve())),
-            "total_operations": len(events),
+            "ledger_path": str(self.path),
+            "started_at": data.get("started_at"),
+            "total_operations": data.get("total_ops", 0),
+            "operations_by_type": data.get("ops_by_type", {}),
             "resolution": {
-                "ast_slices_compiled": tot_slices,
-                "cells_4d_resolved": tot_cells_4d,
-                "closed_world_verifications": tot_closed_world,
-                "patch_ops_applied": tot_patch_ops,
-                "files_in_working_memory": len(seen_spans) if isinstance(seen_spans, dict) else 0,
+                "files_resolved_total": res.get("files_resolved_total", 0),
+                "ast_slices_compiled": res.get("ast_slices_compiled", 0),
+                "cells_4d_resolved": res.get("cells_4d_resolved", 0),
+                "closed_world_scans_verified": res.get("closed_world_scans_verified", 0),
+                "patch_ops_applied": res.get("patch_ops_applied", 0),
+                "files_patched": res.get("files_patched", 0),
+                "syntax_verified_patches": res.get("syntax_verified_patches", 0),
+                "files_in_working_memory": len(self._session_seen),
             },
-            "recent_events": events[-10:],
+            "recent_events": data.get("recent_events", [])[-10:],
         }
 
-    def plan_slice_intervals(
-        self,
-        rel_path: str,
-        req_start: int,
-        req_end: int,
-        total_lines: int = 99999,
-        commit: bool = True,
-    ) -> dict[str, Any]:
-        """Deduplicate requested line range [req_start, req_end] against already-delivered
-        session spans for `rel_path` (invalidated automatically if file mtime changed),
-        and apply the Small-File Whole-Remainder Guard when appropriate.
-        """
-        data = self._load()
-        events = data.get("events", [])
-        now_dt = datetime.now(timezone.utc)
-        seen_spans: dict[str, Any] = dict(data.get("seen_spans", {}))
-        if events:
-            try:
-                last_dt = datetime.fromisoformat(events[-1].get("timestamp", ""))
-                if (now_dt - last_dt).total_seconds() > 2700:
-                    seen_spans.clear()
-            except Exception:
-                pass
-
-        norm_path = rel_path.replace("\\", "/")
-        try:
-            mtime = round((self.root / norm_path).stat().st_mtime, 2)
-        except OSError:
-            mtime = 0.0
-
-        entry = seen_spans.get(norm_path, {})
-        if not isinstance(entry, dict) or abs(float(entry.get("mtime", -1.0)) - mtime) > 0.05:
-            existing: list[tuple[int, int]] = []
-        else:
-            existing = [(int(iv[0]), int(iv[1])) for iv in entry.get("intervals", []) if len(iv) == 2]
-
-        s = max(1, min(total_lines, req_start))
-        e = max(s, min(total_lines, req_end))
-
-        # Compute unseen and skipped sub-intervals within [s, e]
-        unseen: list[tuple[int, int]] = [(s, e)]
-        skipped: list[tuple[int, int]] = []
-        for ex_s, ex_e in existing:
-            next_unseen: list[tuple[int, int]] = []
-            for u_s, u_e in unseen:
-                if ex_e < u_s or ex_s > u_e:
-                    next_unseen.append((u_s, u_e))
-                else:
-                    ov_s = max(u_s, ex_s)
-                    ov_e = min(u_e, ex_e)
-                    skipped.append((ov_s, ov_e))
-                    if u_s < ov_s:
-                        next_unseen.append((u_s, ov_s - 1))
-                    if ov_e < u_e:
-                        next_unseen.append((ov_e + 1, u_e))
-            unseen = next_unseen
-
-        # Small-File Whole-Remainder Guard: if file <= 350 lines and either:
-        # (a) this is the 2nd+ slice and cumulative coverage >= 55% of the file, or
-        # (b) a single slice asks for >= 72% of the file
-        already_covered = sum(ex_e - ex_s + 1 for ex_s, ex_e in existing)
-        new_lines = sum(u_e - u_s + 1 for u_s, u_e in unseen)
-        auto_completed = False
-        if (
-            total_lines <= 350
-            and unseen
-            and (
-                (existing and (already_covered + new_lines) >= int(total_lines * 0.55))
-                or (new_lines >= int(total_lines * 0.72))
-            )
-        ):
-            # Emit all remaining unread intervals of [1, total_lines] so file is 100% done in one pass
-            full_unseen: list[tuple[int, int]] = [(1, total_lines)]
-            for ex_s, ex_e in existing:
-                nxt: list[tuple[int, int]] = []
-                for u_s, u_e in full_unseen:
-                    if ex_e < u_s or ex_s > u_e:
-                        nxt.append((u_s, u_e))
-                    else:
-                        if u_s < ex_s:
-                            nxt.append((u_s, ex_s - 1))
-                        if ex_e < u_e:
-                            nxt.append((ex_e + 1, u_e))
-                full_unseen = nxt
-            unseen = full_unseen
-            auto_completed = True
-
-        if commit and unseen:
-            self.commit_slice_intervals(norm_path, unseen)
-
-        return {
-            "unseen_intervals": unseen,
-            "skipped_intervals": skipped,
-            "auto_completed_file": auto_completed,
-        }
-
-    def commit_slice_intervals(
-        self,
-        rel_path: str,
-        new_intervals: list[tuple[int, int]],
-    ) -> None:
-        """Persist only the actually-emitted (unfolded) line intervals for `rel_path`."""
-        if not new_intervals:
-            return
-        data = self._load()
-        seen_spans: dict[str, Any] = dict(data.get("seen_spans", {}))
-        norm_path = rel_path.replace("\\", "/")
-        try:
-            mtime = round((self.root / norm_path).stat().st_mtime, 2)
-        except OSError:
-            mtime = 0.0
-
-        entry = seen_spans.get(norm_path, {})
-        if not isinstance(entry, dict) or abs(float(entry.get("mtime", -1.0)) - mtime) > 0.05:
-            existing: list[tuple[int, int]] = []
-        else:
-            existing = [(int(iv[0]), int(iv[1])) for iv in entry.get("intervals", []) if len(iv) == 2]
-
-        merged = sorted(existing + [(int(s), int(e)) for s, e in new_intervals], key=lambda x: (x[0], x[1]))
-        compacted: list[list[int]] = []
-        for iv_s, iv_e in merged:
-            if compacted and iv_s <= compacted[-1][1] + 1:
-                compacted[-1][1] = max(compacted[-1][1], iv_e)
-            else:
-                compacted.append([iv_s, iv_e])
-
-        seen_spans[norm_path] = {"mtime": mtime, "intervals": compacted}
-        data["seen_spans"] = seen_spans
-        self._save(data)
-    def reset(self) -> dict[str, Any]:
-        if self.ledger_path.exists():
-            try:
-                self.ledger_path.unlink()
-            except OSError:
-                pass
-        return {"status": "reset", "repo": str(self.root.resolve())}
+    def reset(self) -> dict:
+        self._session_seen.clear()
+        fresh = self._default_state()
+        self._save(fresh)
+        return self.get_stats()

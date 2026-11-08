@@ -1,275 +1,371 @@
-"""Surgical Anchor Patch Engine for Output Token Reduction.
+"""Surgical Anchor Patch Engine for ProjectBrain (`projectbrain patch`).
 
-Eliminates the 2x-5x output token tax of standard `edit_file` / search-and-replace tools
-(which force the LLM to emit verbatim multi-line `Target` blocks plus full `Replacement` blocks)
-and eliminates verbose before/after code block repetition in patch proposals.
+Eliminates output token waste during multi-file code editing by allowing agents
+to emit ultra-compact line/symbol anchor specifications instead of repeating
+large `old_string` / `new_string` context blocks, and verifies syntax via
+Tree-sitter before or after applying to disk.
 
-Supported Anchor Patch DSL operations:
-  @file <relative_path>
-  @sub <anchor> `<old_expr>` -> `<new_expr>`
-      where <anchor> can be:
-        - `L84` or `L84-L90` (1-based line or range, with ±fuzzy_window tolerance)
-        - `*` (auto-locate match anywhere in file — no line number needed!)
-        - `ALL` (replace all occurrences in file in 1 directive!)
-        - `<symbol_name>` (locate inside named function/class, e.g. `ProtectedRoute`)
-  @replace L<start>[-L<end>]
-  <new lines only — zero Target repetition>
+Supported DSL Directives:
+  @file <rel_path>
+  @sub L<line> `<old_ inline>` -> `<new_inline>`
+  @sub L<start>-L<end> `<old_inline>` -> `<new_inline>`
+  @sub ALL `<old_inline>` -> `<new_inline>`
+  @sub <symbol> `<old_inline>` -> `<new_inline>`
+  @replace L<start>-L<end>
+  <new lines...>
+  @end
+  @replace <symbol>
+  <new lines...>
+  @end
+  @replace_body <symbol>
+  <new body lines...>
+  @end
+  @add_method <ClassName>
+  <new method lines...>
   @end
   @insert_after L<line>
-  <new lines>
+  <new lines...>
   @end
   @insert_before L<line>
-  <new lines>
+  <new lines...>
   @end
-  @delete L<start>[-L<end>]
+  @delete L<start>-L<end>
 """
-
 from __future__ import annotations
 
-import ast
 import difflib
-import json
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+
+from . import parsers
 
 
 @dataclass
 class PatchOp:
-    kind: str  # "sub", "replace", "insert_after", "insert_before", "delete"
+    kind: str  # "sub" | "replace" | "replace_body" | "add_method" | "insert_after" | "insert_before" | "delete"
     line_start: int
     line_end: int
-    anchor_mode: str = "line"  # "line", "first", "all", "symbol"
+    old_frag: str = ""
+    new_frag: str = ""
+    block_lines: list[str] = field(default_factory=list)
+    raw_header: str = ""
+    anchor_mode: str = "line"  # "line" | "all" | "symbol"
     symbol_anchor: str = ""
-    old_expr: str = ""
-    new_expr: str = ""
-    body_lines: list[str] = field(default_factory=list)
-    raw_spec_chars: int = 0
 
 
-def _parse_anchor(token: str) -> tuple[str, int, int, str]:
-    """Parse anchor token into (anchor_mode, line_start, line_end, symbol_name)."""
-    t = token.strip()
-    if t == "*":
-        return ("first", 1, 999999, "")
-    if t.upper() == "ALL":
-        return ("all", 1, 999999, "")
-    m = re.match(r"^[Ll]?(\d+)(?:\s*[-:]\s*[Ll]?(\d+))?$", t)
-    if m:
-        start = int(m.group(1))
-        end = int(m.group(2)) if m.group(2) else start
-        if end < start:
-            start, end = end, start
-        return ("line", max(1, start), max(1, end), "")
-    # Treat identifier as a symbol anchor (e.g., `ProtectedRoute` or `fn:ProtectedRoute`)
-    sym = t[3:] if t.startswith("fn:") or t.startswith("cls:") else t
-    return ("symbol", 1, 999999, sym)
+@dataclass
+class FilePatchPlan:
+    rel_path: str
+    ops: list[PatchOp] = field(default_factory=list)
 
 
-def _parse_line_range(token: str) -> tuple[int, int]:
-    """Parse 'L84', 'L84-L90', '84-90', or '84' into 1-based (start, end)."""
-    mode, s, e, _ = _parse_anchor(token)
-    if mode != "line":
-        raise ValueError(f"Invalid line anchor: {token!r} (expected L<num> or L<start>-L<end>)")
-    return s, e
+_FILE_RE = re.compile(r"^@file\s+(.+?)\s*$")
+_SUB_RE = re.compile(
+    r"^@sub\s+(?:L?(\d+)(?:\s*-\s*L?(\d+))?|(ALL|\*)|([A-Za-z_][A-Za-z0-9_.]*))\s+`(.+?)`\s*->\s*`(.*?)`\s*$"
+)
+_REPLACE_RE = re.compile(r"^@replace\s+(?:L?(\d+)(?:\s*-\s*L?(\d+))?|([A-Za-z_][A-Za-z0-9_.]*))\s*$")
+_REPLACE_BODY_RE = re.compile(r"^@replace_body\s+([A-Za-z_][A-Za-z0-9_.]*)\s*$")
+_ADD_METHOD_RE = re.compile(r"^@add_method\s+([A-Za-z_][A-Za-z0-9_.]*)\s*$")
+_INSERT_AFTER_RE = re.compile(r"^@insert_after\s+L?(\d+)\s*$")
+_INSERT_BEFORE_RE = re.compile(r"^@insert_before\s+L?(\d+)\s*$")
+_DELETE_RE = re.compile(r"^@delete\s+L?(\d+)(?:\s*-\s*L?(\d+))?\s*$")
+
+_LAZY_ELISION_RE = re.compile(
+    r"^\s*(?:#|//|/\*+)\s*\.\.\.\s*(?:existing|rest of|unchanged|previous|omitted|remaining|keep|same)\b",
+    re.IGNORECASE,
+)
 
 
-def _parse_sub_expr(rest: str) -> tuple[str, str]:
-    """Parse `<old>` -> `<new>` supporting backticks, triple backticks, or double/single quotes."""
-    patterns = [
-        r"^```(.*?)```\s*->\s*```(.*?)```$",
-        r"^`([^`]+)`\s*->\s*`([^`]*)`$",
-        r'^"((?:[^"\\]|\\.)+)"\s*->\s*"((?:[^"\\]|\\.)*)"$',
-        r"^'((?:[^'\\]|\\.)+)'\s*->\s*'((?:[^'\\]|\\.)*)'$",
-        r"^(.*?)\s*->\s*(.*)$",
-    ]
-    text = rest.strip()
-    for pat in patterns:
-        m = re.match(pat, text, flags=re.DOTALL)
-        if m:
-            return m.group(1), m.group(2)
-    raise ValueError(f"Invalid @sub syntax: {rest!r} (expected `<old>` -> `<new>`)")
+def _has_lazy_elision(block_lines: list[str]) -> str | None:
+    """Detect LLM lazy placeholder comments like `# ... existing code ...` inside replacement blocks."""
+    for ln in block_lines:
+        if _LAZY_ELISION_RE.search(ln):
+            return ln.strip()
+    return None
 
 
-def parse_patch_spec(spec_text: str) -> dict[str, list[PatchOp]]:
-    """Parse an Anchor Patch DSL string (or JSON array) into per-file PatchOp lists."""
-    stripped = spec_text.strip()
-    if stripped.startswith("[") or stripped.startswith("{"):
-        return _parse_json_patch_spec(stripped)
+def parse_patch_spec(spec_text: str) -> tuple[list[FilePatchPlan], list[str]]:
+    """Parse a Surgical Anchor Patch DSL string into per-file patch plans."""
+    plans: list[FilePatchPlan] = []
+    errors: list[str] = []
+    current_plan: FilePatchPlan | None = None
 
-    # Support single-line CLI invocation in Windows cmd.exe where \n is passed literally
-    if "\n" not in spec_text and "\\n" in spec_text:
-        spec_text = spec_text.replace("\\n", "\n")
-    ops_by_file: dict[str, list[PatchOp]] = {}
-    current_file: str | None = None
-    lines = spec_text.splitlines()
+    lines = spec_text.lstrip("\ufeff").splitlines()
     i = 0
     n = len(lines)
 
     while i < n:
         line = lines[i]
-        s = line.strip()
-        if not s or s.startswith("#") or s.startswith("//"):
+        stripped = line.strip()
+
+        if not stripped or stripped.startswith("#"):
             i += 1
             continue
 
-        if s.startswith("@file "):
-            current_file = s[6:].strip().strip("`'\"")
-            current_file = current_file.replace("\\", "/")
-            ops_by_file.setdefault(current_file, [])
+        m_file = _FILE_RE.match(stripped)
+        if m_file:
+            rel = m_file.group(1).strip().strip("\"'").replace("\\", "/")
+            current_plan = FilePatchPlan(rel_path=rel)
+            plans.append(current_plan)
             i += 1
             continue
 
-        if s.startswith("@sub "):
-            if not current_file:
-                raise ValueError(f"Line {i + 1}: @sub encountered before @file declaration")
-            rest = s[5:].strip()
-            # If rest starts with backtick/quote directly without anchor, default anchor to '*'
-            if rest.startswith(("`", '"', "'")):
-                a_mode, l_start, l_end, sym_a = ("first", 1, 999999, "")
-                expr_part = rest
-            else:
-                parts = rest.split(None, 1)
-                if len(parts) < 2:
-                    raise ValueError(f"Line {i + 1}: @sub requires anchor and `<old>` -> `<new>`")
-                a_mode, l_start, l_end, sym_a = _parse_anchor(parts[0])
-                expr_part = parts[1]
-            old_e, new_e = _parse_sub_expr(expr_part)
-            ops_by_file[current_file].append(
-                PatchOp(
-                    kind="sub",
-                    line_start=l_start,
-                    line_end=l_end,
-                    anchor_mode=a_mode,
-                    symbol_anchor=sym_a,
-                    old_expr=old_e,
-                    new_expr=new_e,
-                    raw_spec_chars=len(line) + 1,
-                )
-            )
+        if current_plan is None:
+            errors.append(f"Spec line {i + 1}: directive '{stripped}' appears before any '@file <path>' header.")
             i += 1
             continue
 
-        if s.startswith("@delete "):
-            if not current_file:
-                raise ValueError(f"Line {i + 1}: @delete encountered before @file declaration")
-            l_start, l_end = _parse_line_range(s[8:].strip())
-            ops_by_file[current_file].append(
-                PatchOp(
-                    kind="delete",
-                    line_start=l_start,
-                    line_end=l_end,
-                    raw_spec_chars=len(line) + 1,
-                )
-            )
-            i += 1
-            continue
-
-        for block_cmd in ("@replace ", "@insert_after ", "@insert_before "):
-            if s.startswith(block_cmd):
-                if not current_file:
-                    raise ValueError(f"Line {i + 1}: {block_cmd.strip()} encountered before @file declaration")
-                kind = block_cmd.strip().lstrip("@")
-                anchor_str = s[len(block_cmd) :].strip().split()[0]
-                l_start, l_end = _parse_line_range(anchor_str)
-                body: list[str] = []
-                spec_chars = len(line) + 1
-                i += 1
-                while i < n:
-                    if lines[i].strip() == "@end":
-                        spec_chars += len(lines[i]) + 1
-                        i += 1
-                        break
-                    body.append(lines[i])
-                    spec_chars += len(lines[i]) + 1
-                    i += 1
-                ops_by_file[current_file].append(
+        m_sub = _SUB_RE.match(stripped)
+        if m_sub:
+            s_str, e_str, all_tok, sym_tok, old_f, new_f = m_sub.groups()
+            if all_tok:
+                current_plan.ops.append(
                     PatchOp(
-                        kind=kind,
-                        line_start=l_start,
-                        line_end=l_end,
-                        body_lines=body,
-                        raw_spec_chars=spec_chars,
+                        kind="sub",
+                        line_start=1,
+                        line_end=999999,
+                        old_frag=old_f,
+                        new_frag=new_f,
+                        raw_header=stripped,
+                        anchor_mode="all",
                     )
                 )
-                break
-        else:
-            raise ValueError(f"Line {i + 1}: Unrecognized patch directive: {s!r}")
+            elif sym_tok:
+                current_plan.ops.append(
+                    PatchOp(
+                        kind="sub",
+                        line_start=1,
+                        line_end=999999,
+                        old_frag=old_f,
+                        new_frag=new_f,
+                        raw_header=stripped,
+                        anchor_mode="symbol",
+                        symbol_anchor=sym_tok,
+                    )
+                )
+            else:
+                s_line = int(s_str)
+                e_line = int(e_str) if e_str else s_line
+                current_plan.ops.append(
+                    PatchOp(
+                        kind="sub",
+                        line_start=s_line,
+                        line_end=e_line,
+                        old_frag=old_f,
+                        new_frag=new_f,
+                        raw_header=stripped,
+                        anchor_mode="line",
+                    )
+                )
+            i += 1
+            continue
 
-    return ops_by_file
-
-
-def _parse_json_patch_spec(json_str: str) -> dict[str, list[PatchOp]]:
-    data = json.loads(json_str)
-    if isinstance(data, dict):
-        data = data.get("patches", [data])
-    ops_by_file: dict[str, list[PatchOp]] = {}
-    for item in data:
-        rel = (item.get("file") or item.get("path") or "").replace("\\", "/")
-        if not rel:
-            raise ValueError("JSON patch item missing 'file'")
-        ops_by_file.setdefault(rel, [])
-        kind = item.get("op") or item.get("kind") or "replace"
-        lines_val = str(item.get("lines") or item.get("line") or "*")
-        a_mode, l_start, l_end, sym_a = _parse_anchor(lines_val)
-        body = item.get("body") or item.get("replacement") or ""
-        body_lines = body.splitlines() if isinstance(body, str) else list(body)
-        ops_by_file[rel].append(
-            PatchOp(
-                kind=kind,
-                line_start=l_start,
-                line_end=l_end,
-                anchor_mode=a_mode,
-                symbol_anchor=sym_a,
-                old_expr=item.get("old", ""),
-                new_expr=item.get("new", ""),
-                body_lines=body_lines,
-                raw_spec_chars=len(json.dumps(item)),
+        m_del = _DELETE_RE.match(stripped)
+        if m_del:
+            s_line = int(m_del.group(1))
+            e_line = int(m_del.group(2)) if m_del.group(2) else s_line
+            current_plan.ops.append(
+                PatchOp(
+                    kind="delete",
+                    line_start=s_line,
+                    line_end=e_line,
+                    raw_header=stripped,
+                )
             )
-        )
-    return ops_by_file
+            i += 1
+            continue
+
+        m_rep = _REPLACE_RE.match(stripped)
+        m_rep_body = _REPLACE_BODY_RE.match(stripped)
+        m_add_meth = _ADD_METHOD_RE.match(stripped)
+        m_ia = _INSERT_AFTER_RE.match(stripped)
+        m_ib = _INSERT_BEFORE_RE.match(stripped)
+
+        if m_rep or m_rep_body or m_add_meth or m_ia or m_ib:
+            anchor_mode = "line"
+            symbol_anchor = ""
+            if m_rep:
+                kind = "replace"
+                if m_rep.group(3):
+                    anchor_mode = "symbol"
+                    symbol_anchor = m_rep.group(3)
+                    s_line, e_line = 1, 999999
+                else:
+                    s_line = int(m_rep.group(1))
+                    e_line = int(m_rep.group(2)) if m_rep.group(2) else s_line
+            elif m_rep_body:
+                kind = "replace_body"
+                anchor_mode = "symbol"
+                symbol_anchor = m_rep_body.group(1)
+                s_line, e_line = 1, 999999
+            elif m_add_meth:
+                kind = "add_method"
+                anchor_mode = "symbol"
+                symbol_anchor = m_add_meth.group(1)
+                s_line, e_line = 1, 999999
+            elif m_ia:
+                kind = "insert_after"
+                s_line = e_line = int(m_ia.group(1))
+            else:
+                kind = "insert_before"
+                s_line = e_line = int(m_ib.group(1))  # type: ignore[union-attr]
+
+            header = stripped
+            i += 1
+            block: list[str] = []
+            closed = False
+            while i < n:
+                if lines[i].strip() == "@end":
+                    closed = True
+                    i += 1
+                    break
+                block.append(lines[i])
+                i += 1
+
+            if not closed:
+                errors.append(f"Unclosed block for '{header}' in {current_plan.rel_path} (missing '@end').")
+            else:
+                lazy_line = _has_lazy_elision(block)
+                if lazy_line:
+                    errors.append(
+                        f"Lazy elision placeholder rejected in '{header}' ({current_plan.rel_path}): "
+                        f"'{lazy_line}'. Emit complete replacement lines or use @sub."
+                    )
+                else:
+                    current_plan.ops.append(
+                        PatchOp(
+                            kind=kind,
+                            line_start=s_line,
+                            line_end=e_line,
+                            block_lines=block,
+                            raw_header=header,
+                            anchor_mode=anchor_mode,
+                            symbol_anchor=symbol_anchor,
+                        )
+                    )
+            continue
+
+        errors.append(f"Spec line {i + 1}: unrecognized directive '{stripped}'.")
+        i += 1
+
+    return plans, errors
 
 
-def _check_syntax(rel_path: str, content: str) -> dict[str, Any]:
-    """Validate syntax of patched file content using ast (Python) or Tree-sitter (TS/JS/etc.)."""
-    ext = Path(rel_path).suffix.lower()
-    if ext == ".py":
-        try:
-            ast.parse(content)
-            return {"valid": True, "checker": "python_ast", "errors": []}
-        except SyntaxError as e:
-            return {
-                "valid": False,
-                "checker": "python_ast",
-                "errors": [f"Line {e.lineno}: {e.msg}"],
-            }
+def _verify_syntax_with_treesitter(source_text: str, ext: str) -> dict:
+    """Verify whether patched source text has zero syntax errors using Tree-sitter."""
+    parser = parsers.get_parser(ext.lower())
+    if parser is None:
+        return {"checked": False, "valid": True, "error_Verify": "unsupported_extension", "error_lines": []}
 
-    if ext in (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"):
-        try:
-            from .parsers import _PARSERS
+    tree = parser.parse(source_text.encode("utf-8", errors="replace"))
+    root = tree.root_node
+    if not root.has_error:
+        if ext.lower() == ".py":
+            try:
+                compile(source_text, "<patch>", "exec")
+            except SyntaxError as exc:
+                return {"checked": True, "valid": False, "error_lines": [exc.lineno or 1]}
+        return {"checked": True, "valid": True, "error_lines": []}
 
-            parser = _PARSERS.get(ext)
-            if parser is not None:
-                tree = parser.parse(content.encode("utf-8"))
-                errors: list[str] = []
+    err_lines: list[int] = []
 
-                def _walk_err(node: Any) -> None:
-                    if len(errors) >= 5:
-                        return
-                    if node.type == "ERROR" or node.is_missing:
-                        row, col = node.start_point
-                        snippet = (node.text or b"").decode("utf-8", errors="ignore")[:40]
-                        errors.append(f"Line {row + 1}:{col + 1} syntax error near `{snippet}`")
-                    for child in node.children:
-                        _walk_err(child)
+    def _walk_errors(node):
+        if node.type == "ERROR" or node.is_missing:
+            ln = node.start_point[0] + 1
+            if ln not in err_lines:
+                err_lines.append(ln)
+        for ch in node.children:
+            if ch.has_error:
+                _walk_errors(ch)
 
-                _walk_err(tree.root_node)
-                return {"valid": len(errors) == 0, "checker": f"tree_sitter_{ext.lstrip('.')}", "errors": errors}
-        except Exception:
-            pass
+    _walk_errors(root)
+    return {
+        "checked": True,
+        "valid": False,
+        "error_lines": sorted(err_lines)[:15],
+    }
 
-    return {"valid": True, "checker": "none", "errors": []}
+
+def _resolve_ast_symbol_span(
+    parsed_info: dict, symbol_anchor: str, work_lines: list[str]
+) -> tuple[int, int, dict | None] | None:
+    """Resolve a function, method (`Class.method` or `method`), or class name to its 1-based [start, end] span."""
+    sym_clean = symbol_anchor.strip()
+    sym_low = sym_clean.lower()
+
+    # 1. Exact match in functions (qualified `Class.method` or `func_name`)
+    for fn in parsed_info.get("functions", []):
+        qname = f"{fn['parent_class']}.{fn['name']}" if fn.get("parent_class") else fn["name"]
+        if sym_clean in (fn["name"], qname):
+            return fn["line_start"], fn["line_end"], fn
+    for cls in parsed_info.get("classes", []):
+        if sym_clean == cls["name"]:
+            return cls["line_start"], cls["line_end"], cls
+
+    # 2. Case-insensitive match in functions/classes
+    for fn in parsed_info.get("functions", []):
+        qname = f"{fn['parent_class']}.{fn['name']}" if fn.get("parent_class") else fn["name"]
+        if sym_low in (fn["name"].lower(), qname.lower()):
+            return fn["line_start"], fn["line_end"], fn
+    for cls in parsed_info.get("classes", []):
+        if sym_low == cls["name"].lower():
+            return cls["line_start"], cls["line_end"], cls
+
+    # 3. Fallback: declaration regex scan (`def sym`, `function sym`, `class sym`, `const sym =`)
+    decl_pat = re.compile(
+        rf"^\s*(?:export\s+)?(?:async\s+)?(?:def|function|class|const|let|var)\s+{re.escape(sym_clean.split('.')[-1])}\b"
+    )
+    for idx, l_txt in enumerate(work_lines):
+        if decl_pat.search(l_txt):
+            start_ln = idx + 1
+            # Estimate end of block by indentation or 120 lines
+            base_indent = len(l_txt) - len(l_txt.lstrip())
+            end_ln = len(work_lines)
+            for j in range(idx + 1, len(work_lines)):
+                s_j = work_lines[j].strip()
+                if not s_j or s_j.startswith(("#", "//", "@")):
+                    continue
+                ind_j = len(work_lines[j]) - len(work_lines[j].lstrip())
+                if ind_j <= base_indent and re.match(r"^(?:def |async def |class |export |function )", s_j):
+                    end_ln = j
+                    break
+            return start_ln, end_ln, None
+    return None
+
+
+def _find_body_start_line(work_lines: list[str], sym_start: int, sym_end: int, ext: str) -> tuple[int, str]:
+    """Given a function's [sym_start, sym_end] 1-based span, find the 1-based first line of its body and body indent."""
+    is_py = ext.lower() == ".py"
+    sig_indent = ""
+    if 1 <= sym_start <= len(work_lines):
+        raw_s = work_lines[sym_start - 1]
+        sig_indent = raw_s[: len(raw_s) - len(raw_s.lstrip())]
+    default_indent = sig_indent + ("    " if is_py else "  ")
+
+    paren_depth = 0
+    for ln in range(sym_start, min(sym_end, len(work_lines)) + 1):
+        txt = work_lines[ln - 1]
+        for ch in txt:
+            if ch in "([{":
+                paren_depth += 1
+            elif ch in ")]}":
+                paren_depth = max(0, paren_depth - 1)
+        stripped = txt.strip()
+        if is_py:
+            if paren_depth == 0 and stripped.endswith(":"):
+                body_ln = min(sym_end, ln + 1)
+                if body_ln <= len(work_lines) and work_lines[body_ln - 1].strip():
+                    b_raw = work_lines[body_ln - 1]
+                    b_ind = b_raw[: len(b_raw) - len(b_raw.lstrip())]
+                    if len(b_ind) > len(sig_indent):
+                        return body_ln, b_ind
+                return body_ln, default_indent
+        else:
+            if "{" in stripped:
+                body_ln = min(sym_end, ln + 1)
+                return body_ln, default_indent
+    return min(sym_end, sym_start + 1), default_indent
 
 
 def apply_patch_spec(
@@ -277,176 +373,296 @@ def apply_patch_spec(
     spec_text: str,
     apply: bool = False,
     diff_out_path: Path | None = None,
-    fuzzy_window: int = 12,
-) -> dict[str, Any]:
-    """Execute or dry-run a Surgical Anchor Patch spec and compute exact output token savings."""
-    ops_by_file = parse_patch_spec(spec_text)
-    file_results: list[dict[str, Any]] = []
+    fuzzy_window: int = 8,
+) -> dict:
+    """Execute or dry-run a Surgical Anchor Patch spec against `root`.
+
+    Guarantees:
+      1. Path-traversal sandbox (`abs_path.is_relative_to(root.resolve())`).
+      2. Two-phase invariant application:
+         - Phase 1: Line-preserving `@sub` operations (with AST symbol scoping & unique fuzzy healing).
+         - Phase 2: Pre-resolved, conflict-checked, strictly bottom-up structural operations
+           (`@replace`, `@replace_body`, `@add_method`, `@insert_after`, `@insert_before`, `@delete`).
+      3. Native CRLF / LF line-ending preservation.
+      4. Tree-sitter AST syntax verification on every patched buffer.
+    """
+    root_resolved = root.resolve()
+    plans, parse_errors = parse_patch_spec(spec_text)
+    file_results: list[dict] = []
     unified_diffs: list[str] = []
-
-    total_spec_chars = len(spec_text)
-    total_edit_file_equiv_chars = 0
     total_ops_applied = 0
+    all_syntax_valid = len(parse_errors) == 0
 
-    for rel_path, ops in ops_by_file.items():
-        abs_path = (root / rel_path).resolve()
-        if not abs_path.exists():
-            file_results.append({"file": rel_path, "status": "error", "error": f"File not found: {rel_path}"})
+    for plan in plans:
+        rel_path = plan.rel_path
+        try:
+            abs_path = (root_resolved / rel_path).resolve()
+            in_sandbox = abs_path.is_relative_to(root_resolved)
+        except (OSError, ValueError):
+            in_sandbox = False
+            abs_path = root_resolved / rel_path
+
+        if not in_sandbox:
+            file_results.append({
+                "file": rel_path,
+                "status": "error",
+                "errors": [f"Security sandbox violation: path '{rel_path}' escapes repository root."],
+                "ops_applied": 0,
+            })
+            all_syntax_valid = False
             continue
 
-        raw_text = abs_path.read_text(encoding="utf-8", errors="replace")
-        orig_lines = raw_text.splitlines()
+        if not abs_path.exists() or not abs_path.is_file():
+            file_results.append({
+                "file": rel_path,
+                "status": "error",
+                "errors": [f"File not found: {rel_path}"],
+                "ops_applied": 0,
+            })
+            all_syntax_valid = False
+            continue
+
+        try:
+            raw_bytes = abs_path.read_bytes()
+            orig_text = raw_bytes.decode("utf-8", errors="replace")
+        except OSError as e:
+            file_results.append({
+                "file": rel_path,
+                "status": "error",
+                "errors": [f"Read error: {e}"],
+                "ops_applied": 0,
+            })
+            all_syntax_valid = False
+            continue
+
+        line_sep = "\r\n" if "\r\n" in orig_text else "\n"
+        orig_lines = orig_text.splitlines()
         work_lines = list(orig_lines)
+        op_errors: list[str] = []
+        ops_applied = 0
 
-        # Sort operations bottom-up by line_start so earlier line numbers never shift
-        sorted_ops = sorted(ops, key=lambda o: (o.line_start, o.line_end), reverse=True)
-        applied_details: list[dict[str, Any]] = []
+        ext = abs_path.suffix.lower()
+        parsed_info = parsers.parse(orig_text, ext)
 
-        for op in sorted_ops:
-            n_lines = len(work_lines)
-            idx_s = max(0, min(n_lines, op.line_start - 1))
-            idx_e = max(idx_s, min(n_lines, op.line_end))
+        # Split into Phase 1 (line-count-preserving @sub) and Phase 2 (structural / line-count-changing)
+        phase1_subs: list[tuple[int, PatchOp]] = []
+        phase2_structural: list[tuple[int, PatchOp]] = []
+        for idx, op in enumerate(plan.ops):
+            if op.kind == "sub" and op.old_frag.count("\n") == op.new_frag.count("\n"):
+                phase1_subs.append((idx, op))
+            else:
+                phase2_structural.append((idx, op))
 
-            ctx_s = max(0, idx_s - 2)
-            ctx_e = min(n_lines, idx_e + 2)
-            target_block = "\n".join(orig_lines[ctx_s:ctx_e])
-            if op.kind == "sub":
-                if op.anchor_mode == "all":
-                    matched_lines: list[int] = []
-                    for k in range(n_lines):
-                        if op.old_expr in work_lines[k]:
-                            work_lines[k] = work_lines[k].replace(op.old_expr, op.new_expr)
-                            matched_lines.append(k + 1)
-                    if not matched_lines:
-                        raise ValueError(f"{rel_path}: @sub ALL target {op.old_expr!r} not found in file")
-                    # Standard edit_file replaces all occurrences of a unique target in 1 call
-                    first_k = matched_lines[0] - 1
-                    c_s = max(0, first_k - 2)
-                    c_e = min(len(orig_lines), first_k + 3)
-                    t_b = "\n".join(orig_lines[c_s:c_e])
-                    r_b = t_b.replace(op.old_expr, op.new_expr)
-                    total_edit_file_equiv_chars += len(t_b) + len(r_b) + len(rel_path) + 80
-                    applied_details.append(
-                        {"op": "sub_all", "lines": matched_lines, "spec_chars": op.raw_spec_chars}
+        # ── Phase 1: Line-preserving @sub operations (in spec order) ──────────
+        for _, op in phase1_subs:
+            total_l = len(work_lines)
+            if op.anchor_mode == "all":
+                count_all = 0
+                for l_idx in range(total_l):
+                    if op.old_frag in work_lines[l_idx]:
+                        c_occ = work_lines[l_idx].count(op.old_frag)
+                        work_lines[l_idx] = work_lines[l_idx].replace(op.old_frag, op.new_frag)
+                        count_all += c_occ
+                if count_all > 0:
+                    ops_applied += count_all
+                else:
+                    op_errors.append(f"Failed '{op.raw_header}': `{op.old_frag}` not found anywhere in {rel_path}.")
+                continue
+
+            if op.anchor_mode == "symbol":
+                span_res = _resolve_ast_symbol_span(parsed_info, op.symbol_anchor, work_lines)
+                if span_res is not None:
+                    sym_s, sym_e, _ = span_res
+                else:
+                    sym_s, sym_e = 0, 0
+                matched = False
+                if sym_s > 0:
+                    for l_idx in range(max(0, sym_s - 1), min(total_l, sym_e)):
+                        if op.old_frag in work_lines[l_idx]:
+                            work_lines[l_idx] = work_lines[l_idx].replace(op.old_frag, op.new_frag, 1)
+                            matched = True
+                            ops_applied += 1
+                            break
+                if not matched:
+                    op_errors.append(
+                        f"Failed '{op.raw_header}': symbol `{op.symbol_anchor}` or `{op.old_frag}` not found in symbol scope."
                     )
-                    total_ops_applied += len(matched_lines)
-                    continue
+                continue
 
-                found_idx = -1
-                if op.anchor_mode == "symbol" and op.symbol_anchor:
-                    sym_line = 0
-                    for k, l_txt in enumerate(work_lines):
-                        if op.symbol_anchor in l_txt:
-                            sym_line = k
-                            break
-                    for k in range(sym_line, n_lines):
-                        if op.old_expr in work_lines[k]:
-                            found_idx = k
-                            break
-
-                if found_idx == -1 and op.anchor_mode == "line":
-                    for k in range(idx_s, min(n_lines, idx_e)):
-                        if op.old_expr in work_lines[k]:
-                            found_idx = k
-                            break
-                    if found_idx == -1:
-                        w_start = max(0, idx_s - fuzzy_window)
-                        w_end = min(n_lines, idx_e + fuzzy_window)
-                        for k in range(w_start, w_end):
-                            if op.old_expr in work_lines[k]:
-                                found_idx = k
-                                break
-
-                # Fallback: if unique or first match in file
-                if found_idx == -1:
-                    for k in range(n_lines):
-                        if op.old_expr in work_lines[k]:
-                            found_idx = k
-                            break
-
-                if found_idx == -1:
-                    raise ValueError(f"{rel_path}: @sub target {op.old_expr!r} not found")
-
-                old_line = work_lines[found_idx]
-                new_line = old_line.replace(op.old_expr, op.new_expr, 1)
-                work_lines[found_idx] = new_line
-
-                ctx_s = max(0, found_idx - 3)
-                ctx_e = min(len(orig_lines), found_idx + 4)
-                t_blk = "\n".join(orig_lines[ctx_s:ctx_e])
-                r_blk = t_blk.replace(op.old_expr, op.new_expr, 1)
-                equiv_chars = len(t_blk) + len(r_blk) + len(rel_path) + 120
-                total_edit_file_equiv_chars += equiv_chars
-                applied_details.append(
-                    {"op": "sub", "line": found_idx + 1, "spec_chars": op.raw_spec_chars, "edit_file_equiv_chars": equiv_chars}
+            # Standard line-anchored @sub (with unique fuzzy window drift healing)
+            s_idx = max(1, min(op.line_start, max(1, total_l)))
+            e_idx = max(s_idx, min(op.line_end, max(1, total_l)))
+            matched = False
+            for l_idx in range(s_idx - 1, e_idx):
+                if op.old_frag in work_lines[l_idx]:
+                    work_lines[l_idx] = work_lines[l_idx].replace(op.old_frag, op.new_frag, 1)
+                    matched = True
+                    ops_applied += 1
+                    break
+            if not matched:
+                lo = max(1, s_idx - fuzzy_window)
+                hi = min(total_l, e_idx + fuzzy_window)
+                candidates: list[tuple[int, int]] = []
+                for l_idx in range(lo - 1, hi):
+                    if op.old_frag in work_lines[l_idx]:
+                        dist = min(abs((l_idx + 1) - s_idx), abs((l_idx + 1) - e_idx))
+                        candidates.append((dist, l_idx))
+                if candidates:
+                    candidates.sort(key=lambda x: x[0])
+                    # Apply if unique or strictly closest anchor within window
+                    best_l_idx = candidates[0][1]
+                    work_lines[best_l_idx] = work_lines[best_l_idx].replace(op.old_frag, op.new_frag, 1)
+                    matched = True
+                    ops_applied += 1
+            if not matched:
+                op_errors.append(
+                    f"Failed '{op.raw_header}': `{op.old_frag}` not found near L{op.line_start} (±{fuzzy_window} lines)."
                 )
-                total_ops_applied += 1
+
+        # ── Phase 2: Pre-resolve spans and apply structural ops bottom-to-top ─
+        # Each entry in resolved_ops: (sort_line_start, sort_line_end, orig_idx, eff_s, eff_e, new_lines_to_splice, op)
+        resolved_structural: list[tuple[int, int, int, int, int, list[str], PatchOp]] = []
+        total_l = len(work_lines)
+
+        for orig_idx, op in phase2_structural:
+            if op.kind == "sub":
+                # Multi-line @sub
+                if op.anchor_mode == "symbol":
+                    span_res = _resolve_ast_symbol_span(parsed_info, op.symbol_anchor, work_lines)
+                    if not span_res:
+                        op_errors.append(f"Failed '{op.raw_header}': symbol `{op.symbol_anchor}` not found.")
+                        continue
+                    s_idx, e_idx, _ = span_res
+                elif op.anchor_mode == "all":
+                    s_idx, e_idx = 1, total_l
+                else:
+                    s_idx = max(1, min(op.line_start - fuzzy_window, total_l))
+                    e_idx = max(s_idx, min(op.line_end + fuzzy_window, total_l))
+                sub_slice = "\n".join(work_lines[s_idx - 1 : e_idx])
+                if op.old_frag not in sub_slice:
+                    op_errors.append(f"Failed '{op.raw_header}': `{op.old_frag}` not found in L{s_idx}-L{e_idx}.")
+                    continue
+                replaced_slice = (
+                    sub_slice.replace(op.old_frag, op.new_frag)
+                    if op.anchor_mode == "all"
+                    else sub_slice.replace(op.old_frag, op.new_frag, 1)
+                )
+                resolved_structural.append(
+                    (s_idx, e_idx, orig_idx, s_idx - 1, e_idx, replaced_slice.splitlines(), op)
+                )
 
             elif op.kind == "replace":
-                work_lines[idx_s:idx_e] = op.body_lines
-                r_blk = "\n".join(orig_lines[ctx_s:idx_s] + op.body_lines + orig_lines[idx_e:ctx_e])
-                equiv_chars = len(target_block) + len(r_blk) + len(rel_path) + 120
-                total_edit_file_equiv_chars += equiv_chars
-                applied_details.append(
-                    {
-                        "op": "replace",
-                        "lines": f"L{op.line_start}-L{op.line_end}",
-                        "spec_chars": op.raw_spec_chars,
-                        "edit_file_equiv_chars": equiv_chars,
-                    }
-                )
-                total_ops_applied += 1
+                if op.anchor_mode == "symbol":
+                    span_res = _resolve_ast_symbol_span(parsed_info, op.symbol_anchor, work_lines)
+                    if not span_res:
+                        op_errors.append(f"Failed '{op.raw_header}': symbol `{op.symbol_anchor}` not found in {rel_path}.")
+                        continue
+                    s_idx, e_idx, _ = span_res
+                else:
+                    s_idx = max(1, min(op.line_start, max(1, total_l)))
+                    e_idx = max(s_idx, min(op.line_end, max(1, total_l)))
+                    # Auto-heal ±5 line drift if first line of block_lines is a `def`/`function`/`class` header that drifted
+                    if op.block_lines and s_idx <= total_l:
+                        first_blk = op.block_lines[0].strip()
+                        m_hdr = re.match(r"^(?:export\s+)?(?:async\s+)?(?:def|function|class)\s+([A-Za-z_]\w*)", first_blk)
+                        if m_hdr:
+                            sym_nm = m_hdr.group(1)
+                            if sym_nm not in work_lines[s_idx - 1]:
+                                span_len = e_idx - s_idx
+                                drift_hits = [
+                                    ln_i
+                                    for ln_i in range(max(1, s_idx - 5), min(total_l, s_idx + 5) + 1)
+                                    if re.search(rf"\b(?:def|function|class)\s+{re.escape(sym_nm)}\b", work_lines[ln_i - 1])
+                                ]
+                                if len(drift_hits) == 1:
+                                    s_idx = drift_hits[0]
+                                    e_idx = min(total_l, s_idx + span_len)
+                resolved_structural.append((s_idx, e_idx, orig_idx, s_idx - 1, e_idx, list(op.block_lines), op))
 
-            elif op.kind == "insert_after":
-                ins_pos = min(n_lines, op.line_start)
-                work_lines[ins_pos:ins_pos] = op.body_lines
-                r_blk = "\n".join(orig_lines[ctx_s:ins_pos] + op.body_lines + orig_lines[ins_pos:ctx_e])
-                equiv_chars = len(target_block) + len(r_blk) + len(rel_path) + 120
-                total_edit_file_equiv_chars += equiv_chars
-                applied_details.append(
-                    {
-                        "op": "insert_after",
-                        "line": op.line_start,
-                        "spec_chars": op.raw_spec_chars,
-                        "edit_file_equiv_chars": equiv_chars,
-                    }
-                )
-                total_ops_applied += 1
+            elif op.kind == "replace_body":
+                span_res = _resolve_ast_symbol_span(parsed_info, op.symbol_anchor, work_lines)
+                if not span_res:
+                    op_errors.append(f"Failed '{op.raw_header}': symbol `{op.symbol_anchor}` not found in {rel_path}.")
+                    continue
+                sym_s, sym_e, _ = span_res
+                body_start, body_indent = _find_body_start_line(work_lines, sym_s, sym_e, ext)
+                is_py = ext == ".py"
+                eff_end = sym_e if is_py else max(body_start, sym_e - 1)
+                blk = list(op.block_lines)
+                # If block lines start with the function signature itself, replace from sym_s
+                if blk and re.match(
+                    rf"^\s*(?:export\s+)?(?:async\s+)?(?:def|function)\s+{re.escape(op.symbol_anchor.split('.')[-1])}\b",
+                    blk[0],
+                ):
+                    resolved_structural.append((sym_s, sym_e, orig_idx, sym_s - 1, sym_e, blk, op))
+                else:
+                    # Auto-indent if caller supplied unindented body lines
+                    non_empty = [ln for ln in blk if ln.strip()]
+                    if non_empty and all(len(ln) == len(ln.lstrip()) for ln in non_empty):
+                        blk = [(body_indent + ln if ln.strip() else ln) for ln in blk]
+                    resolved_structural.append((body_start, eff_end, orig_idx, body_start - 1, eff_end, blk, op))
 
-            elif op.kind == "insert_before":
-                ins_pos = max(0, op.line_start - 1)
-                work_lines[ins_pos:ins_pos] = op.body_lines
-                r_blk = "\n".join(orig_lines[ctx_s:ins_pos] + op.body_lines + orig_lines[ins_pos:ctx_e])
-                equiv_chars = len(target_block) + len(r_blk) + len(rel_path) + 120
-                total_edit_file_equiv_chars += equiv_chars
-                applied_details.append(
-                    {
-                        "op": "insert_before",
-                        "line": op.line_start,
-                        "spec_chars": op.raw_spec_chars,
-                        "edit_file_equiv_chars": equiv_chars,
-                    }
-                )
-                total_ops_applied += 1
+            elif op.kind == "add_method":
+                span_res = _resolve_ast_symbol_span(parsed_info, op.symbol_anchor, work_lines)
+                if not span_res:
+                    op_errors.append(f"Failed '{op.raw_header}': class `{op.symbol_anchor}` not found in {rel_path}.")
+                    continue
+                cls_s, cls_e, _ = span_res
+                is_py = ext == ".py"
+                cls_raw = work_lines[cls_s - 1] if cls_s <= total_l else ""
+                cls_indent = cls_raw[: len(cls_raw) - len(cls_raw.lstrip())]
+                meth_indent = cls_indent + ("    " if is_py else "  ")
+                blk = list(op.block_lines)
+                non_empty = [ln for ln in blk if ln.strip()]
+                if non_empty:
+                    min_ind = min(len(ln) - len(ln.lstrip()) for ln in non_empty)
+                    if min_ind == 0:
+                        blk = [(meth_indent + ln if ln.strip() else ln) for ln in blk]
+                ins_pos = cls_e if is_py else max(cls_s, cls_e - 1)
+                spliced = ([""] + blk) if is_py and ins_pos > 0 and work_lines[ins_pos - 1].strip() else blk
+                resolved_structural.append((ins_pos, ins_pos, orig_idx, ins_pos, ins_pos, spliced, op))
 
             elif op.kind == "delete":
-                del work_lines[idx_s:idx_e]
-                r_blk = "\n".join(orig_lines[ctx_s:idx_s] + orig_lines[idx_e:ctx_e])
-                equiv_chars = len(target_block) + len(r_blk) + len(rel_path) + 120
-                total_edit_file_equiv_chars += equiv_chars
-                applied_details.append(
-                    {
-                        "op": "delete",
-                        "lines": f"L{op.line_start}-L{op.line_end}",
-                        "spec_chars": op.raw_spec_chars,
-                        "edit_file_equiv_chars": equiv_chars,
-                    }
-                )
-                total_ops_applied += 1
+                s_idx = max(1, min(op.line_start, max(1, total_l)))
+                e_idx = max(s_idx, min(op.line_end, max(1, total_l)))
+                resolved_structural.append((s_idx, e_idx, orig_idx, s_idx - 1, e_idx, [], op))
 
-        trailing_nl = "\n" if raw_text.endswith("\n") else ""
-        new_text = "\n".join(work_lines) + trailing_nl
-        syntax_res = _check_syntax(rel_path, new_text)
+            elif op.kind == "insert_after":
+                s_idx = max(0, min(op.line_start, total_l))
+                resolved_structural.append((s_idx, s_idx, orig_idx, s_idx, s_idx, list(op.block_lines), op))
+
+            elif op.kind == "insert_before":
+                s_idx = max(1, min(op.line_start, total_l + 1))
+                resolved_structural.append((s_idx, s_idx - 1, orig_idx, s_idx - 1, s_idx - 1, list(op.block_lines), op))
+
+        # Detect overlapping destructive spans among replace/replace_body/delete ops
+        destructive_spans: list[tuple[int, int, str]] = []
+        overlapping_indices: set[int] = set()
+        for _, _, orig_idx, eff_s, eff_e, _, op in resolved_structural:
+            if eff_e > eff_s:  # modifies an existing line interval [eff_s, eff_e)
+                for prev_s, prev_e, prev_hdr in destructive_spans:
+                    if max(eff_s, prev_s) < min(eff_e, prev_e):
+                        op_errors.append(
+                            f"Overlapping structural patch spans in {rel_path}: '{op.raw_header}' collides with '{prev_hdr}'."
+                        )
+                        overlapping_indices.add(orig_idx)
+                        break
+                destructive_spans.append((eff_s, eff_e, op.raw_header))
+
+        # Sort structural operations strictly bottom-to-top by (eff_s, eff_e, orig_idx) descending
+        valid_structural = [item for item in resolved_structural if item[2] not in overlapping_indices]
+        valid_structural.sort(key=lambda x: (x[3], x[4], x[2]), reverse=True)
+
+        for _, _, _, eff_s, eff_e, new_slice, _ in valid_structural:
+            work_lines[eff_s:eff_e] = new_slice
+            ops_applied += 1
+
+        trailing_nl = line_sep if (orig_text.endswith("\n") or orig_text.endswith("\r\n") or not orig_text) else ""
+        patched_text = line_sep.join(work_lines) + trailing_nl
+
+        syntax_check = _verify_syntax_with_treesitter(patched_text, ext)
+        if not syntax_check["valid"] or op_errors:
+            all_syntax_valid = False
 
         diff_lines = list(
             difflib.unified_diff(
@@ -455,46 +671,49 @@ def apply_patch_spec(
                 fromfile=f"a/{rel_path}",
                 tofile=f"b/{rel_path}",
                 lineterm="",
-                n=3,
             )
         )
         diff_str = "\n".join(diff_lines)
         if diff_str:
             unified_diffs.append(diff_str)
 
-        if apply and syntax_res["valid"]:
-            abs_path.write_text(new_text, encoding="utf-8")
+        applied_to_disk = False
+        if apply and syntax_check["valid"] and not op_errors and ops_applied > 0:
+            abs_path.write_bytes(patched_text.encode("utf-8"))
+            applied_to_disk = True
 
-        file_results.append(
-            {
-                "file": rel_path,
-                "status": "applied" if (apply and syntax_res["valid"]) else "verified_dry_run",
-                "ops_applied": len(applied_details),
-                "syntax": syntax_res,
-                "diff_lines": len(diff_lines),
-                "operations": list(reversed(applied_details)),
-                "_patched_text": new_text,
-            }
-        )
+        total_ops_applied += ops_applied
+        file_results.append({
+            "file": rel_path,
+            "status": "applied" if applied_to_disk else ("dry_run_ok" if syntax_check["valid"] and not op_errors else "failed"),
+            "ops_requested": len(plan.ops),
+            "ops_applied": ops_applied,
+            "syntax_valid": syntax_check["valid"],
+            "syntax_error_lines": syntax_check.get("error_lines", []),
+            "errors": op_errors,
+            "diff_lines": len(diff_lines),
+            "_patched_text": patched_text,
+        })
 
-    combined_diff = "\n\n".join(unified_diffs)
-    out_diff_file = diff_out_path or (root / ".projectbrain_patch.diff")
-    if combined_diff:
-        out_diff_file.write_text(combined_diff + "\n", encoding="utf-8")
+    combined_diff = "\n".join(unified_diffs)
+    if diff_out_path is not None and combined_diff:
+        try:
+            diff_out_path.write_text(combined_diff + "\n", encoding="utf-8")
+        except OSError:
+            pass
 
-    total_diff_lines = sum(f.get("diff_lines", 0) for f in file_results)
-    syntax_verified_files = sum(1 for f in file_results if f.get("syntax", {}).get("valid"))
     return {
         "mode": "applied" if apply else "dry_run",
         "files_patched": len(file_results),
         "total_ops_applied": total_ops_applied,
-        "all_syntax_valid": all(f.get("syntax", {}).get("valid", False) for f in file_results),
-        "diff_path": str(out_diff_file) if combined_diff else None,
-        "mutation_telemetry": {
-            "spec_chars": total_spec_chars,
-            "diff_lines": total_diff_lines,
-            "syntax_verified_files": syntax_verified_files,
-        },
-        "files": file_results,
+        "all_syntax_valid": all_syntax_valid,
+        "parse_errors": parse_errors,
+        "diff_path": str(diff_out_path) if (diff_out_path and combined_diff) else None,
         "unified_diff": combined_diff,
+        "files": file_results,
+        "mutation_telemetry": {
+            "ops_applied": total_ops_applied,
+            "files_patched": len(file_results),
+            "syntax_verified_files": sum(1 for f in file_results if f.get("syntax_valid")),
+        },
     }
