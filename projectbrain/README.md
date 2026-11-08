@@ -1,4 +1,4 @@
-# ProjectBrain (`projectbrain-mcp` v0.8.3)
+# ProjectBrain (`projectbrain-mcp` v0.8.4)
 
 [![PyPI](https://img.shields.io/pypi/v/projectbrain-mcp.svg)](https://pypi.org/project/projectbrain-mcp/)
 [![License: MIT](https://img.shields.io/badge/License: MIT-blue.svg)](https://opensource.org/licenses/MIT)

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "projectbrain-mcp"
-version = "0.8.3"
+version = "0.8.4"
 description = "Universal 6D Behavioral IR, Pure SQLite Graph-as-Storage (FTS5 + Recursive CTE + Delta Overlay), Polyglot AST Slicer (Py/TS/Go/Rust/Java/SQL), and Symbol-Anchored Patch Engine for AI Coding Agents"
 readme = "README.md"
 license = { text = "MIT" }
