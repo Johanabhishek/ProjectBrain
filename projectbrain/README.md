@@ -1,4 +1,4 @@
-# ProjectBrain (`projectbrain-mcp` v0.8.8)
+# ProjectBrain (`projectbrain-mcp` v0.8.9)
 
 [![PyPI](https://img.shields.io/pypi/v/projectbrain-mcp.svg)](https://pypi.org/project/projectbrain-mcp/)
 [![License: MIT](https://img.shields.io/badge/License: MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -9,14 +9,14 @@
 ProjectBrain indexes a repository locally into `.projectbrain.db` (SQLite WAL + FTS5) using `tree-sitter` and language AST parsers. It gives CLI and MCP coding agents four concrete primitives in a single dependency-light package—with no external database server, no Docker, no cloud embeddings, and no API keys:
 
 1. **Program & Symbol Slicing (`projectbrain slice` / `brain_slice`):**
-   - Slices exact functions, classes, methods, or line ranges (`file.py:ClassName.method` or `file.py:120-160`) directly from SQLite in `< 20ms` without loading full files into the context window.
+   - Slices exact functions, classes, methods, CommonJS/prototype assignments (`res.send`, `app.use`), or line ranges (`file.py:ClassName.method` or `file.py:120-160`) directly from SQLite in `< 20ms` without loading full files into the context window.
    - For large functions sliced around a target variable or call, computes an AST/Program Dependence Graph (PDG) slice across three orthogonal dimensions: **backward data dependence (`def -> use`)**, **forward data dependence (`def -> use`)**, and **enclosing control-flow guards (`if`/`try`/`for`/`with`)**, collapsing unrelated lines while keeping governing logic intact.
 2. **One-Turn Code Dossiers (`projectbrain dossier` / `brain_dossier`):**
-   - Given a bug report, stack trace, or architectural question, ranks relevant symbols using sub-identifier BM25 + call/import/state-flow graph traversal and returns target code slices plus 1-hop caller/callee signatures in a single read.
+   - Given a bug report, stack trace, or architectural question, ranks relevant symbols using sub-identifier BM25 + call/import/state-flow graph traversal and returns class-qualified (`ClassName.method`) target code slices plus 1-hop caller/callee signatures in a single read.
 3. **Syntax-Verified Symbol Patching (`projectbrain patch` / `brain_patch`):**
    - Applies symbol-anchored edits (`@replace_body <Symbol>`, `@add_method <ClassName>`, `@replace <Symbol>`, `@sub <Symbol>`) validated against Tree-sitter + language syntax compilers and caller arity contracts before touching disk, with automatic rollback on syntax errors and zero-change dry runs.
 4. **Closed-World Structural Verification (`projectbrain verify` / `projectbrain_verify_claim`):**
-   - Verifies structural claims (`calls`, `reaches`, `imports`, `handles`) with explicit evidence provenance (`exact`, `import_resolved`, `candidate`) and refuses to guess (`UNKNOWN`) when any traversed file has a syntax error.
+   - Verifies structural claims (`calls`, `reaches`, `imports`, `handles`) with explicit evidence provenance (`exact`, `import_resolved`, `candidate`) and refuses to guess (`UNKNOWN`) when any traversed file has a syntax error or when a call goes through a dynamic local receiver (`adapter.send(...)`) whose type cannot be resolved statically.
 
 ---
 
@@ -26,7 +26,7 @@ ProjectBrain indexes 29 file extensions across three explicit capability tiers:
 
 | Tier | Languages / Formats | Capabilities |
 | :--- | :--- | :--- |
-| **Tier 1: Deep AST + PDG + Contracts** | **Python** (`.py`), **TypeScript / JavaScript** (`.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`) | Full Tree-sitter + Python `ast` parsing; intra-function PDG data/control-dependence slicing (`def -> use` + enclosing guards); cross-file relative import & `tsconfig` path-alias resolution; class/module config & descriptor tracking (`ConfigAttribute`, `Field`, `Column`, constants); route extraction (Flask, FastAPI, Django, Next.js, Express, Hono); caller arity & SQL schema contract checks. |
+| **Tier 1: Deep AST + PDG + Contracts** | **Python** (`.py`), **TypeScript / JavaScript** (`.ts`, `.tsx`, `.js`, `.jsx`, `.mjs`, `.cjs`) | Full Tree-sitter + Python `ast` parsing (including CommonJS `obj.method = function`, chained assignments, `Class.prototype.method`, `exports.foo`, `defineGetter`, and `@typing.overload` stub deduplication); intra-function PDG data/control-dependence slicing (`def -> use` + enclosing guards); cross-file relative import, `require('./mod')`, & `tsconfig` path-alias resolution; class/module config & descriptor tracking (`ConfigAttribute`, `Field`, `Column`, constants); route extraction (Flask, FastAPI, Django, Next.js, Express, Hono); caller arity & SQL schema contract checks. |
 | **Tier 2: Tree-sitter Structural + Call Graph** | **Go** (`.go`), **Rust** (`.rs`), **Java** (`.java`), **Kotlin** (`.kt`), **C / C++** (`.c`, `.h`, `.cpp`, `.hpp`), **C#** (`.cs`), **Ruby** (`.rb`), **PHP** (`.php`) | Structural symbol extraction (functions, methods, structs, classes, interfaces, traits); intra-file and cross-file call/import graph edges; signature skeletons; symbol & line-range slicing; syntax-verified symbol patching. |
 | **Tier 3: Schema, Query & Component Indexing** | **SQL** (`.sql`), **GraphQL** (`.graphql`, `.gql`), **Prisma** (`.prisma`), **Protobuf** (`.proto`), **Vue / Svelte** (`.vue`, `.svelte`), **Scala** (`.scala`), **Swift** (`.swift`) | DDL table/column/constraint extraction (`CREATE TABLE`, `NOT NULL`), schema-to-code linking, component script extraction, and symbol/line slicing. |
 
@@ -36,8 +36,8 @@ ProjectBrain indexes 29 file extensions across three explicit capability tiers:
 
 - **When plain `rg` / `grep` is faster:** Looking up a single literal string or constant when you already know the exact identifier name and just want matching line numbers.
 - **When ProjectBrain wins:**
-  - **Multi-hop call and dispatch questions** (e.g., *"how are exceptions routed to error handlers"* or *"trace POST /checkout to database validation"*), where following imports, base classes, and helper methods across files takes 10–30 turns of manual search/read loops.
-  - **Reading specific methods inside large files** (`projectbrain slice django/db/models/sql/query.py:Query.build_filter`) without dumping a 2,500-line file into the prompt.
+  - **Multi-hop call and dispatch questions** (e.g., *"how are exceptions routed to error handlers"* or *"how are redirects handled and when is auth stripped"*), where following imports, mixins, and helper methods across files takes multiple turns of manual search/read loops.
+  - **Reading specific methods inside large files** (`projectbrain slice django/db/models/sql/query.py:Query.build_filter` or `projectbrain slice res.send`) without dumping a 2,500-line file into the prompt.
   - **Safe symbol-anchored patching** (`projectbrain patch --apply`) where line numbers have drifted or where syntax errors must be rejected before writing to disk.
 
 ---
@@ -47,7 +47,7 @@ ProjectBrain indexes 29 file extensions across three explicit capability tiers:
 ### 1. Install
 
 ```bash
-pip install "projectbrain-mcp>=0.8.8"
+pip install "projectbrain-mcp>=0.8.9"
 ```
 
 ### 2. Initialize a Repository (Minimal & Non-Destructive)
@@ -77,7 +77,7 @@ projectbrain --path /path/to/your/repo init
 
 ```bash
 # 1. Slice exact symbols or line ranges (fast <20ms SQLite lookup on indexed repos)
-projectbrain --path /path/to/repo slice Query.build_filter src/flask/app.py:Flask.wsgi_app
+projectbrain --path /path/to/repo slice Query.build_filter res.send should_strip_auth
 
 # 2. Compile a 1-turn code dossier (target slices + callers + callees)
 projectbrain --path /path/to/repo dossier "how are exceptions routed to error handlers"
@@ -86,67 +86,72 @@ projectbrain --path /path/to/repo dossier "how are exceptions routed to error ha
 projectbrain --path /path/to/repo patch --apply --spec-file patch.spec
 
 # 4. Verify closed-world structural claims (calls, reaches, imports, handles)
-projectbrain --path /path/to/repo verify "checkout" reaches "validate_coupon"
+projectbrain --path /path/to/repo verify "Session.send" calls "HTTPAdapter.send"
 ```
 
 ---
 
-## Reproducible Evaluation & Scale Benchmarks (`eval/`)
+## Reproducible Evaluation & Scale Benchmarks (`projectbrain/eval/`)
 
-All correctness, retrieval, claim-verification, and scale benchmarks in this repository can be run locally:
+All correctness, retrieval, claim-verification, and external repository benchmarks can be run locally from the repository root:
 
 ```bash
-# 1. Retrieval precision/recall, multi-hop graph vs. grep baseline, claim verification, and zero-ID slicing
-python eval/run_eval.py
+# 1. Fixture regression guards, self-dogfooding, and zero-ID adversarial evaluation
+python projectbrain/eval/run_eval.py
 
 # 2. 200-file polyglot scale, incremental Salsa early-cutoff, FTS5, and recursive CTE latency benchmark
-python eval/bench_scale.py
+python projectbrain/eval/bench_scale.py
 
-# 3. External repository benchmark on pallets/flask (6 dossiers + E2E bug-fix) and django/django (3,051 files)
-python projectbrain/eval/bench_external.py
+# 3. External repository benchmarks: pallets/flask, django/django, psf/requests, pallets/click, expressjs/express
+python projectbrain/eval/bench_external.py --suite all
 
-# 4. Full unit, integration, security, and regression test suite (199 tests)
+# 4. Full unit, integration, security, and regression test suite (202 tests)
 pytest projectbrain/tests -q
 ```
 
-### Built-In Verification Suite Results (`python eval/run_eval.py`)
+### 1. Held-Out External Repository Benchmark (`python projectbrain/eval/bench_external.py --suite heldout`)
 
-| Suite | Metric | Result | What It Tests |
-| :--- | :--- | :---: | :--- |
-| **File Localization (`eval/tasks.json`)** | Precision / Recall (10 tasks) | **`100%` Precision / `100%` Recall** | Regression guard on single-file and multi-file retrieval ranking |
-| **Multi-Hop Graph vs. Grep (`eval/relationship_tasks.json`)** | Pass Rate (8 tasks, incl. negative controls) | **`8 / 8 (100%)`** | 2-hop call paths where keyword `grep` misses the intermediate module |
-| **Closed-World Claim Verification (`eval/claim_tasks.json`)** | Exact Verdict Accuracy (22 tasks) | **`22 / 22 (100%)`** | `SUPPORTED` / `REFUTED` / `UNKNOWN` accuracy (`0` false supports, `0` false refutations; returns `UNKNOWN` on syntax-broken files) |
-| **Self-Dogfooding & Zero-ID Slicing** | Symbol Recall (7 tasks) | **`7 / 7 (100% Recall)`** | Natural-language prompts with zero function names leaked |
+Tested on three open-source repositories across Python and CommonJS JavaScript (`psf/requests`, `pallets/click`, `expressjs/express`):
 
-### External Repository Benchmarks (`python projectbrain/eval/bench_external.py`, `v0.8.8`)
+| Repository | Dossier Questions | Target Symbol Slice Recall | Cost per Hit | Additional Structural Checks |
+| :--- | :---: | :---: | :---: | :--- |
+| **`psf/requests`** | 4 questions (`proxies`, `redirects/auth`, `cookies`, `adapters/pool`) | **`15 / 15` (`100%`)** | `3.71 KB` | `verify_claim("Session.send", "calls", "HTTPAdapter.send")` -> **`UNKNOWN`** (dynamic receiver `adapter.send`, never false `REFUTED`); `slice_symbols(["should_strip_auth", "get_environ_proxies"])` -> `2 / 2` |
+| **`pallets/click`** | 3 questions (`option/arg parsing`, `Group subcommand dispatch`, `ParamType converters`) | **`9 / 11` (`81.8%`)** | `4.95 KB` | **`0` bare `__init__` headers** (all methods qualified as `ClassName.method`, e.g. `Group.invoke`, `Group.resolve_command`, `ParamType.convert`, `Parameter.type_cast_value`) |
+| **`expressjs/express`** | 3 questions (`res.send content-type`, `app.use mounting`, `app.handle dispatch`) | **`6 / 6` (`100%`)** | `2.34 KB` | `lib/response.js`: **32 functions** indexed; `lib/application.js`: **18 functions** indexed; `slice_symbols(["res.send", "app.use", "app.handle"])` -> **`3 / 3`** |
+| **Combined Held-Out Total** | **10 questions** | **`30 / 32` (`93.8%`)** | **`3.81 KB`** | — |
 
-| Benchmark | `v0.8.4` | `v0.8.6` | `v0.8.8` |
+### 2. Tuned External Repository Benchmarks (`pallets/flask` & `django/django`)
+
+*(Note: `pallets/flask` and `django/django` were used during `v0.8.5`–`v0.8.8` development to tune dossier token budgets, PDG slicing, and incremental indexing latency.)*
+
+| Benchmark | `v0.8.4` | `v0.8.6` | `v0.8.9` |
 | :--- | :---: | :---: | :---: |
-| **`pallets/flask` (6 Architectural Questions) — Target Function Slice Recall** | `9 / 19` (`47.4%`) | `12 / 19` (`63.2%`) | **`19 / 19` (`100%`, `21 / 21` full set)** |
-| **`pallets/flask` (6 Architectural Questions) — Total Dossier Output** | `68.0 KB` | `113.0 KB` | **`56.8 KB` (`-49.7%` vs `v0.8.6`)** |
-| **`pallets/flask` (6 Architectural Questions) — Cost per Correct Hit** | `7.6 KB` | `9.4 KB` | **`2.70 KB` (`2.99 KB` on 19-fn subset)** |
+| **`pallets/flask` (6 Architectural Questions) — Target Function Slice Recall** | `9 / 19` (`47.4%`) | `12 / 19` (`63.2%`) | **`21 / 21` (`100%`, `19 / 19` subset)** |
+| **`pallets/flask` (6 Architectural Questions) — Total Dossier Output** | `68.0 KB` | `113.0 KB` | **`55.8 KB` (`-50.6%` vs `v0.8.6`)** |
+| **`pallets/flask` (6 Architectural Questions) — Cost per Correct Hit** | `7.6 KB` | `9.4 KB` | **`2.66 KB`** |
 | **`pallets/flask` — End-to-End Bug-Fix (`dossier` -> `slice` -> `patch` -> `test`)** | — | — | **`PASS` (`red -> green` in `1.51 s`, `0` syntax/contract errors)** |
-| **`django/django` (`3,051` files) — Cold `brain.load()` / Cold Walk Latency** | ~8,300 ms / 820 ms | ~8,300 ms / 820 ms | **`~3,040 ms` (`-63%`) / `~220 ms` (`-73%`)** |
-| **`django/django` (`3,051` files) — Single-File Edit `incremental_index()` Latency** | ~7,000 ms (global rebuild) | ~7,000 ms (global rebuild) | **`540 ms` (`salsa_early_cutoff: True`, `O(Δ)` graph + SQLite delta)** |
+| **`django/django` (`3,051` files) — Cold `brain.load()` / Cold Walk Latency** | ~8,300 ms / 820 ms | ~8,300 ms / 820 ms | **`~4,400 ms` / `~245 ms`** |
+| **`django/django` (`3,051` files) — Single-File Edit `incremental_index()` Latency** | ~7,000 ms (global rebuild) | ~7,000 ms (global rebuild) | **`515 ms` body edit (`salsa_early_cutoff: True`) / `894 ms` interface edit** |
 
-### What Changed in `v0.8.5` – `v0.8.8` (From `pallets/flask` & `django/django` Sandbox Reviews)
+### 3. Built-In Verification & Dogfooding Suite (`python projectbrain/eval/run_eval.py`)
 
-1. **Tree-sitter CST Program Dependence Graph (PDG) Slicing for JS/TS/Go/Rust/Java (`v0.8.8`):**
-   - Added [`_analyze_treesitter_cst_pdg`](src/projectbrain/slicer.py) so [`compute_multidim_program_slice`](src/projectbrain/slicer.py) uses real Tree-sitter Concrete Syntax Trees (multi-line destructuring, typed parameters, `try`/`catch`, `switch`/`case`, and statement span grouping) for `.ts`, `.tsx`, `.js`, `.jsx`, `.go`, `.rs`, and `.java` in addition to Python's `ast` module.
-2. **Fast Cold `brain.load()`, Union-Regex `.gitignore`, and Checked-In External Benchmarks (`v0.8.8`):**
-   - Deferred `classify_file_functions` to on-demand `_get_file_behaviors(rel)`, memoized `_tokenize_symbol` with pre-compiled regexes, and compiled non-negated `.gitignore` rules into union regexes, cutting cold `load()` on `django/django` (`3,051` files) from `8.32 s` to `3.04 s` and single-file incremental edits to **`540 ms`**.
-   - Checked in [`eval/bench_external.py`](eval/bench_external.py) reproducing the 6-question Flask dossier benchmark, end-to-end `red -> green` bug-fix workflow (`compile_dossier` -> `slice_symbols` -> `patch` -> functional test), and 3,051-file Django scale suite.
+| Suite | Scope | Metric | Result | Notes & Grep Comparison |
+| :--- | :--- | :--- | :---: | :--- |
+| **File Localization (`eval/tasks.json`)** | Small fixture repos (10 tasks) | Precision / Recall | **`100%` / `100%`** | Regression guard on basic file ranking (many are grep-answerable) |
+| **Multi-Hop Graph vs. Grep (`eval/relationship_tasks.json`)** | Small fixture repos (8 tasks, incl. negative controls) | Pass Rate | **`8 / 8` (`100%`)** | Tests 2-hop call paths where single-file `grep` misses the intermediate module |
+| **Closed-World Claim Verification (`eval/claim_tasks.json`)** | Small fixture repos (22 tasks) | Exact Verdict Accuracy | **`22 / 22` (`100%`)** | `0` false supports, `0` false refutations; returns `UNKNOWN` on syntax-broken files |
+| **Self-Dogfooding (`compile_context`)** | ProjectBrain repo (3 tasks, 6 target symbols) | Symbol Recall & Token Savings | **`100%` (`6 / 6` symbols)** | **`22.2%–29.9%` fewer tokens** than disciplined `grep + 120-line windows` (`93.1%–97.6%` vs full files); `grep` recall is `100%` on 2 tasks and `0%` on 1 task |
+| **Adversarial Zero-Identifier (`compile_context`)** | ProjectBrain repo (4 tasks, 8 target symbols; zero function names in prompt) | Symbol Recall & Token Savings | **`87.5%` (`7 / 8` symbols)** | `100%` recall on 3 tasks and `50%` on 1 task vs **`50.0%` (`4 / 8`)** for disciplined `grep`; token delta vs `grep` ranges from `-6.0%` to `+26.4%` |
 
-1. **Dossier Token Budget, Docstring Folding, and Visible PDG Provenance (`v0.8.7`):**
-   - Folded multi-line Python docstrings (`> 3` lines) in dossier slices before budgeting `max_lines`, replaced verbose Markdown 6D tables and file skeletons with compact 1-line summaries on secondary files, and wired [`compute_multidim_program_slice`](src/projectbrain/slicer.py) directly into `compile_dossier()` with explicit `# [PDG Slice: seeds=L.. | bwd_defs=L.. | fwd_uses=L.. | guards=L.. | vars=...]` headers.
-   - Across the 6-question `pallets/flask` benchmark, target function slice recall improved from `12 / 19` (`v0.8.6`) to **`19 / 19` (`21 / 21`)** while total dossier size dropped **49.3%** (`113 KB` -> **`57.28 KB`**, **`2.73 KB` per hit**).
-2. **Compound Domain Term Splitting & State-Flow Dispatch Bridging (`v0.8.7`):**
-   - `_extract_keywords()` now splits glued compound identifiers (`"errorhandlers"` -> `["errorhandlers", "error_handler", "error", "handlers", "handler"]`) and stems agentive nouns (`"handler"` -> `"handle"`), discounts docstring-only matches (`teardown_appcontext`), and bridges `state_flow` writers (`register_error_handler`) to readers (`_find_error_handler`) and their callers (`handle_user_exception`, `handle_http_exception`).
-3. **$O(\Delta)$ Incremental Graph & SQLite Updates (`v0.8.7`):**
-   - `incremental_index()` now updates `_blobs`, `CodeGraph` (`update_files`), and SQLite (`apply_incremental` with `graph_delta`) incrementally for only the modified files, and sorts Tree-sitter 0.23+ capture nodes deterministically so `salsa_early_cutoff` triggers reliably on body-only edits (cutting single-file edit latency on `django/django` from `~7.0 s` to `< 1.0 s`).
-4. **Fixed Perpetual Graph Rebuild on Skipped/Vendored Files (`I-02`):**
-   - `is_stale()` and `incremental_index()` track `_skipped` alongside `_index`, preventing vendored/minified files from triggering repeated re-indexing.
-5. **Fast Cold-Start SQLite Slicing & Zero-Copy Graph Persistence (`I-03`):**
-   - `projectbrain slice <Symbol>` queries indexed `symbols` and `files` tables in `.projectbrain.db` directly before loading the full repository graph into memory.
-6. **Flask Tuple Route Methods, Scoped Contract Checks, and Pinned `mcp` (`I-01`, `I-04`, `I-06`, `I-07`):**
-   - `_flask_methods` parses `tuple` and `set` literals (`methods=("GET", "POST")`), `.py` pytest `client.post(...)` calls are excluded from frontend HTTP contract checks, `mcp>=1.2.0,<2.0.0` is pinned, and the PyPI classifier is set to `Development Status :: 4 - Beta`.
+---
+
+## Changelog (`v0.8.5` – `v0.8.9`)
+
+1. **CommonJS / Prototype Method Indexing, Dynamic Dispatch Verification, and Held-Out Benchmarks (`v0.8.9`):**
+   - **JS CommonJS & Prototype Indexing:** `_parse_js` now indexes `obj.method = function`, chained assignments (`res.contentType = res.type = function`), `Class.prototype.method = function`, `exports.foo = function`, `module.exports = function`, and `defineGetter(obj, 'prop', function)`, plus CommonJS `require('./mod')` symbol bindings. On `expressjs/express`, `lib/response.js` indexes **32 functions** (up from 10), `lib/application.js` indexes **18 functions** (up from 2), and `res.send`, `app.use`, and `app.handle` slice cleanly.
+   - **Dynamic Receiver Dispatch -> `UNKNOWN` in `verify_claim`:** When a function calls `.method()` on a local variable or dynamic receiver (`adapter.send(request)` in `Session.send`), `verify_claim("Session.send", "calls", "HTTPAdapter.send")` now returns **`UNKNOWN`** (explaining that the dynamic receiver cannot be resolved statically) instead of a false `REFUTED`.
+   - **Class-Qualified Headers & Retrieval:** All dossier headers and call-graph pointers now format methods as `ClassName.method` (eliminating ambiguous bare `__init__` or bare `convert` headers), `@typing.overload` stubs are filtered during Python indexing, and [`eval/bench_external.py`](eval/bench_external.py) now includes a held-out benchmark suite across `psf/requests`, `pallets/click`, and `expressjs/express`.
+2. **Tree-sitter CST Program Dependence Graph (PDG) Slicing for JS/TS/Go/Rust/Java (`v0.8.8`):**
+   - Added [`_analyze_treesitter_cst_pdg`](src/projectbrain/slicer.py) so [`compute_multidim_program_slice`](src/projectbrain/slicer.py) uses real Tree-sitter Concrete Syntax Trees for `.ts`, `.tsx`, `.js`, `.jsx`, `.go`, `.rs`, and `.java` in addition to Python's `ast` module.
+3. **Dossier Token Budget, Docstring Folding, Visible PDG Provenance, and $O(\Delta)$ Incremental Graph Updates (`v0.8.7`):**
+   - Folded multi-line Python docstrings (`> 3` lines) in dossier slices, wired [`compute_multidim_program_slice`](src/projectbrain/slicer.py) into `compile_dossier()` with `# [PDG Slice: ...]` banners, and added incremental `CodeGraph.update_files` + SQLite `graph_delta` persistence.

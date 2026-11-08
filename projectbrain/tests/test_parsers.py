@@ -337,3 +337,57 @@ function handler() {
     assert "process" in fn["calls"]
     assert "userService.findUser" in fn["qualified_calls"]
     assert "process" not in fn["qualified_calls"]
+
+
+def test_js_commonjs_and_prototype_method_assignments():
+    src = '''
+var res = Object.create(http.ServerResponse.prototype);
+module.exports = res;
+
+res.send = function send(body) {
+    this.type('html');
+    return this;
+};
+
+res.contentType =
+res.type = function contentType(type) {
+    return this.set('Content-Type', type);
+};
+
+Router.prototype.handle = function(req, res, out) {
+    return out();
+};
+
+defineGetter(req, 'protocol', function protocol() {
+    return 'http';
+});
+'''
+    result = parse(src, ".js")
+    names = {f["name"]: f for f in result["functions"]}
+    assert "send" in names
+    assert names["send"]["parent_class"] == "res"
+    assert "contentType" in names
+    assert "type" in names
+    assert "handle" in names
+    assert names["handle"]["parent_class"] == "Router"
+    assert "protocol" in names
+    assert names["protocol"]["parent_class"] == "req"
+
+
+def test_py_typing_overload_stubs_filtered():
+    src = '''
+from typing import overload
+
+@overload
+def convert(val: int) -> str: ...
+
+@overload
+def convert(val: str) -> str: ...
+
+def convert(val: int | str) -> str:
+    return str(val)
+'''
+    result = parse(src, ".py")
+    fns = [f for f in result["functions"] if f["name"] == "convert"]
+    assert len(fns) == 1
+    assert fns[0]["line_start"] == 10

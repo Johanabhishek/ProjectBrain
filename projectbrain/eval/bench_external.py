@@ -115,6 +115,7 @@ def run_flask_dossier_suite(flask_dir: Path) -> dict:
         expected = item["expected"]
         total_expected += len(expected)
 
+        brain.stats(reset=True)
         res = brain.compile_dossier(q)
         md = res.get("markdown", "")
         b_len = len(md.encode("utf-8"))
@@ -319,16 +320,174 @@ def run_django_scale_suite(django_dir: Path) -> dict:
     }
 
 
+def _run_question_list(brain: ProjectBrain, questions: list[dict]) -> dict:
+    total_bytes = 0
+    total_expected = 0
+    total_found_slices = 0
+    bare_init_headers = 0
+    per_question = []
+
+    for item in questions:
+        q = item["question"]
+        expected = item["expected"]
+        total_expected += len(expected)
+
+        brain.stats(reset=True)
+        res = brain.compile_dossier(q)
+        md = res.get("markdown", "")
+        b_len = len(md.encode("utf-8"))
+        total_bytes += b_len
+        kb = b_len / 1024.0
+        bare_init_headers += md.count(":: __init__ (")
+
+        found_in_slices = []
+        missing = []
+        for fn in expected:
+            if (
+                f":: {fn} (" in md
+                or f".{fn} (" in md
+                or f"def {fn}(" in md
+                or f"function {fn}(" in md
+            ):
+                found_in_slices.append(fn)
+                total_found_slices += 1
+            else:
+                missing.append(fn)
+
+        per_question.append({
+            "question": q,
+            "kb": round(kb, 2),
+            "expected": expected,
+            "found_in_slices": found_in_slices,
+            "missing": missing,
+        })
+
+    total_kb = total_bytes / 1024.0
+    return {
+        "total_kb": round(total_kb, 2),
+        "recall_slices": f"{total_found_slices}/{total_expected}",
+        "found": total_found_slices,
+        "expected": total_expected,
+        "cost_per_hit_kb": round(total_kb / max(1, total_found_slices), 2),
+        "bare_init_headers": bare_init_headers,
+        "questions": per_question,
+    }
+
+
+def run_heldout_repos_suite(repos_dir: Path) -> dict:
+    """Evaluate ProjectBrain on held-out repos (`psf/requests`, `pallets/click`, `expressjs/express`)."""
+    req_dir = ensure_clone("https://github.com/psf/requests.git", repos_dir / "requests")
+    click_dir = ensure_clone("https://github.com/pallets/click.git", repos_dir / "click")
+    express_dir = ensure_clone("https://github.com/expressjs/express.git", repos_dir / "express")
+
+    # 1. psf/requests
+    req_brain = ProjectBrain(str(req_dir))
+    t0 = time.perf_counter()
+    req_brain.index()
+    req_index_ms = (time.perf_counter() - t0) * 1000.0
+    req_verify = req_brain.verify_claim("Session.send", "calls", "HTTPAdapter.send")
+    req_slice = req_brain.slice_symbols(["should_strip_auth", "get_environ_proxies"])
+    req_questions = [
+        {
+            "question": "how are proxies resolved and merged with environment settings",
+            "expected": ["rebuild_proxies", "merge_environment_settings", "resolve_proxies", "get_environ_proxies"],
+        },
+        {
+            "question": "how are redirects handled and when is auth stripped",
+            "expected": ["resolve_redirects", "rebuild_auth", "should_strip_auth"],
+        },
+        {
+            "question": "how does cookie handling work across requests and responses",
+            "expected": ["extract_cookies_to_jar", "merge_cookies", "cookiejar_from_dict", "prepare_cookies"],
+        },
+        {
+            "question": "how are adapters mounted and how is the connection pool initialized",
+            "expected": ["mount", "get_adapter", "init_poolmanager", "send"],
+        },
+    ]
+    req_dossiers = _run_question_list(req_brain, req_questions)
+
+    # 2. pallets/click
+    click_brain = ProjectBrain(str(click_dir))
+    t0 = time.perf_counter()
+    click_brain.index()
+    click_index_ms = (time.perf_counter() - t0) * 1000.0
+    click_questions = [
+        {
+            "question": "how are options and arguments parsed from command line args",
+            "expected": ["parse_args", "handle_parse_result", "consume_value", "process_value"],
+        },
+        {
+            "question": "how does Group dispatch subcommands and resolve commands",
+            "expected": ["invoke", "resolve_command", "get_command"],
+        },
+        {
+            "question": "how are parameter types and custom converters validated",
+            "expected": ["ParamType.convert", "type_cast_value", "convert_type", "ParamType.fail"],
+        },
+    ]
+    click_dossiers = _run_question_list(click_brain, click_questions)
+
+    # 3. expressjs/express
+    exp_brain = ProjectBrain(str(express_dir))
+    t0 = time.perf_counter()
+    exp_brain.index()
+    exp_index_ms = (time.perf_counter() - t0) * 1000.0
+    exp_slice = exp_brain.slice_symbols(["res.send", "app.use", "app.handle"])
+    exp_questions = [
+        {
+            "question": "how does res.send set content type and send responses",
+            "expected": ["res.send", "res.contentType"],
+        },
+        {
+            "question": "how does app.use mount middleware and sub-apps",
+            "expected": ["app.use", "app.handle"],
+        },
+        {
+            "question": "how does app.handle dispatch requests through router",
+            "expected": ["app.handle", "app"],
+        },
+    ]
+    exp_dossiers = _run_question_list(exp_brain, exp_questions)
+
+    total_found = req_dossiers["found"] + click_dossiers["found"] + exp_dossiers["found"]
+    total_expected = req_dossiers["expected"] + click_dossiers["expected"] + exp_dossiers["expected"]
+    total_kb = req_dossiers["total_kb"] + click_dossiers["total_kb"] + exp_dossiers["total_kb"]
+
+    return {
+        "overall_recall": f"{total_found}/{total_expected}",
+        "overall_cost_per_hit_kb": round(total_kb / max(1, total_found), 2),
+        "requests": {
+            "index_ms": round(req_index_ms, 1),
+            "verify_dynamic_dispatch_verdict": req_verify.get("verdict"),
+            "verify_dynamic_dispatch_explanation": req_verify.get("explanation"),
+            "sliced_symbols": [s["symbol"] for s in req_slice.get("slices", [])],
+            "dossiers": req_dossiers,
+        },
+        "click": {
+            "index_ms": round(click_index_ms, 1),
+            "dossiers": click_dossiers,
+        },
+        "express": {
+            "index_ms": round(exp_index_ms, 1),
+            "response_js_functions": len(exp_brain._index.get("lib/response.js", {}).get("functions", [])),
+            "application_js_functions": len(exp_brain._index.get("lib/application.js", {}).get("functions", [])),
+            "sliced_symbols": [s["symbol"] for s in exp_slice.get("slices", [])],
+            "dossiers": exp_dossiers,
+        },
+    }
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Run external repository benchmarks for ProjectBrain.")
     parser.add_argument(
         "--repos-dir",
         default=str(Path(tempfile.gettempdir()) / "pb_eval_repos"),
-        help="Directory to clone/reuse pallets/flask and django/django.",
+        help="Directory to clone/reuse external benchmark repositories.",
     )
     parser.add_argument(
         "--suite",
-        choices=("all", "flask", "django"),
+        choices=("all", "flask", "django", "heldout"),
         default="all",
         help="Which benchmark suite to execute.",
     )
@@ -344,6 +503,9 @@ def main() -> None:
     if args.suite in ("all", "django"):
         django_dir = ensure_clone("https://github.com/django/django.git", repos_dir / "django")
         report["django_scale"] = run_django_scale_suite(django_dir)
+
+    if args.suite in ("all", "heldout"):
+        report["heldout_repos"] = run_heldout_repos_suite(repos_dir)
 
     print(json.dumps(report, indent=2))
 

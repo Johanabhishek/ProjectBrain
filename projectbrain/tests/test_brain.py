@@ -170,3 +170,27 @@ def test_get_context_for_file_imports_and_importers(tmp_project):
         "routes/checkout.py", "services/discount.py", "services/pricing.py",
     }
     assert ctx["imports_resolved"] == []
+
+
+def test_verify_claim_dynamic_receiver_returns_unknown_not_refuted(tmp_path):
+    (tmp_path / "adapters.py").write_text(
+        "class HTTPAdapter:\n"
+        "    def send(self, request):\n"
+        "        return 200\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "sessions.py").write_text(
+        "from adapters import HTTPAdapter\n"
+        "class Session:\n"
+        "    def get_adapter(self, url):\n"
+        "        return HTTPAdapter()\n"
+        "    def send(self, request):\n"
+        "        adapter = self.get_adapter(request.url)\n"
+        "        return adapter.send(request)\n",
+        encoding="utf-8",
+    )
+    brain = ProjectBrain(str(tmp_path))
+    brain.index()
+    res = brain.verify_claim("Session.send", "calls", "HTTPAdapter.send")
+    assert res["verdict"] == "UNKNOWN"
+    assert "dynamic receiver" in res["explanation"]

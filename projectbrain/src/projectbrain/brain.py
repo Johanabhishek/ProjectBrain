@@ -365,7 +365,7 @@ class ProjectBrain:
                         q_callee = f"{callee_fn.get('parent_class')}.{callee_fn['name']}" if callee_fn.get("parent_class") else callee_fn["name"]
                         if q_callee in scored_fns and q_callee != q_caller:
                             callee_sc = scored_fns[q_callee][0]
-                            mult = 0.70 if callee_fn["name"].startswith("_") and not fn["name"].startswith("_") else 0.35
+                            mult = 0.70 if callee_fn["name"].startswith("_") and not fn["name"].startswith("_") else 0.12
                             boosts[q_caller] = max(boosts.get(q_caller, 0.0), callee_sc * mult)
                         for callee2_nm in callee_fn.get("calls", []):
                             callee2_fn = all_fns_by_name.get(f"{callee_fn.get('parent_class')}.{callee2_nm}") or all_fns_by_name.get(callee2_nm)
@@ -374,7 +374,7 @@ class ProjectBrain:
                             q_callee2 = f"{callee2_fn.get('parent_class')}.{callee2_fn['name']}" if callee2_fn.get("parent_class") else callee2_fn["name"]
                             if q_callee2 in scored_fns and q_callee2 != q_caller:
                                 callee2_sc = scored_fns[q_callee2][0]
-                                mult2 = 0.55 if callee2_fn["name"].startswith("_") and not fn["name"].startswith("_") else 0.25
+                                mult2 = 0.55 if callee2_fn["name"].startswith("_") and not fn["name"].startswith("_") else 0.08
                                 boosts[q_caller] = max(boosts.get(q_caller, 0.0), callee2_sc * mult2)
                 for q_k, b_val in boosts.items():
                     fn_obj = all_fns_by_name[q_k]
@@ -444,12 +444,14 @@ class ProjectBrain:
                         selected_priv_callees[chosen_fn["name"]] = max(
                             selected_priv_callees.get(chosen_fn["name"], 0.0), chosen_sc
                         )
+                    ch_nm_l = chosen_fn["name"].lower()
+                    ch_nm_toks = set(_tokenize_symbol(chosen_fn["name"]))
                     sig_toks = set(re.findall(r"[a-z0-9]+", (chosen_fn.get("signature") or "").lower()))
                     doc_l = (chosen_fn.get("docstring") or "").lower()
                     for kw in keywords:
                         kw_s = re.sub(r"(?:ed|ing|es|s)$", "", kw) if len(kw) >= 4 else kw
                         if (
-                            kw == nm_l or kw in nm_toks or (len(kw_s) >= 3 and kw_s in nm_toks)
+                            kw == ch_nm_l or kw in ch_nm_toks or (len(kw_s) >= 3 and kw_s in ch_nm_toks)
                             or kw in sig_toks or (len(kw_s) >= 3 and kw_s in sig_toks)
                         ):
                             id_cov_kws.add(kw)
@@ -770,6 +772,13 @@ class ProjectBrain:
             buf.append(f"### [{rel_path} :: Module Constants, State & Bootstrap]")
             buf.append(glob_text)
 
+        def _node_display_name(nd_obj: dict) -> str:
+            p_cls = nd_obj.get("parent_class")
+            nm_s = nd_obj.get("name") or ""
+            if p_cls and nm_s and not nm_s.startswith(f"{p_cls}."):
+                return f"{p_cls}.{nm_s}"
+            return nm_s
+
         # Helper to add a function/class slice once (skipping nested functions already covered by an outer slice)
         def _add_node_slice(node_id: str, reason: str, kw_list: list[str], buf: list[str], max_l: int = 44, max_g: int = 24) -> None:
             if not self._graph or node_id not in self._graph.nodes:
@@ -811,7 +820,7 @@ class ProjectBrain:
             # Session Zero-Waste Guard inside dossier: skip re-emitting spans already delivered unfolded in this session
             s_plan = self._ledger.plan_slice_intervals(rel, slice_s, slice_e, commit=False)
             if not s_plan["unseen_intervals"]:
-                buf.append(f"### [{rel} :: {nd.get('name')} (L{slice_s}-L{slice_e}) ? [Session Cache] Already delivered in this session (0 duplicate lines)]")
+                buf.append(f"### [{rel} :: {_node_display_name(nd)} (L{slice_s}-L{slice_e}) — [Session Cache] Already delivered in this session (0 duplicate lines)]")
                 return
 
             node_pins: set[int] = set(self._last_pin_lines.get(rel, set()))
@@ -953,7 +962,7 @@ class ProjectBrain:
             if code:
                 emitted_by_file.setdefault(rel, []).extend(extract_emitted_intervals(code))
             hdr_span = f"L{slice_s}-L{slice_e}" if (m_call_line and (l_end - l_start) > 120) else f"L{l_start}-L{l_end}"
-            buf.append(f"### [{rel} :: {nd.get('name')} ({hdr_span}) ? {reason}]")
+            buf.append(f"### [{rel} :: {_node_display_name(nd)} ({hdr_span}) — {reason}]")
             if matrix_header:
                 buf.append(matrix_header)
             for cs in cell_slices:
@@ -968,7 +977,7 @@ class ProjectBrain:
             if not zoom:
                 self._compile_6d_contract_diagnostics(task, set(self._index.keys()))
 
-            # 1. Identify explicitly named code symbols (camelCase, snake_case, or backtick/paren-wrapped) or routes
+            # 1. Identify explicitly named code symbols (camelCase, snake_case, dotted obj.method, or backtick/paren-wrapped) or routes
             explicit_nodes: list[str] = []
             explicit_task_files: list[str] = []
             for m_path in re.findall(r"\b([a-zA-Z0-9_.\-]+(?:/[a-zA-Z0-9_.\-]+)+\.[a-zA-Z0-9]+)\b", clean_task_for_search):
@@ -994,7 +1003,11 @@ class ProjectBrain:
                                 has_explicit_route = True
                     elif ntype in ("fn", "cls"):
                         raw_nm = nd.get("name") or ""
-                        if len(raw_nm) >= 5 and (
+                        p_cls = nd.get("parent_class") or ""
+                        q_nm = f"{p_cls}.{raw_nm}" if p_cls else ""
+                        if q_nm and re.search(r"\b" + re.escape(q_nm) + r"\b", clean_task_for_search, re.IGNORECASE):
+                            explicit_nodes.append(nid)
+                        elif len(raw_nm) >= 5 and (
                             any(c.isupper() for c in raw_nm[1:])
                             or "_" in raw_nm
                             or f"`{raw_nm}`" in task
@@ -1241,9 +1254,11 @@ class ProjectBrain:
                     decl_list: list[dict] = []
                     for r_item in ranked_all:
                         r_p = r_item["rel_path"]
+                        if not q_wants_t and _is_test_file(r_p):
+                            continue
                         if _is_exec_file(r_p):
                             exec_map[r_p] = r_item["score"]
-                        else:
+                        elif Path(r_p).stem.lower() not in ("_types", "types", "typing"):
                             decl_list.append(r_item)
                     # Bipartite Importer Bridge: traverse incoming imports from top passive declaration files to executable consumers
                     for d_item in decl_list[:3]:
@@ -1302,18 +1317,33 @@ class ProjectBrain:
                         continue
                     info = self._index.get(rp, {})
                     behaviors = self._get_file_behaviors(rp)
+                    base_classes_in_file = {b for c in info.get("classes", []) for b in c.get("bases", [])}
                     scored: list[tuple[float, str, dict]] = []
                     for fn in info.get("functions", []):
                         sc = self._score_symbol_for_query(fn, t_kw, behaviors, info.get("routes", []), info.get("cells_4d", []))
                         if sc > 0:
+                            if fn.get("parent_class") in base_classes_in_file:
+                                sc *= 1.25
+                            if self._graph and not fn.get("name", "").startswith("_"):
+                                fn_nid = fn_id(rp, fn["name"], fn.get("parent_class"))
+                                cross_prod_callers = sum(
+                                    1 for ei in self._graph._radj.get(fn_nid, [])
+                                    if self._graph.edges[ei].get("type") == "calls"
+                                    and self._graph.edges[ei].get("confidence") in ("exact", "import_resolved")
+                                    and self._graph.nodes.get(self._graph.edges[ei]["src"], {}).get("rel_path", rp) != rp
+                                    and not _is_test_file(self._graph.nodes.get(self._graph.edges[ei]["src"], {}).get("rel_path", ""))
+                                )
+                                if cross_prod_callers >= 1:
+                                    sc *= 1.0 + 0.14 * min(4, cross_prod_callers)
                             scored.append((sc, "fn", fn))
                     for cls in info.get("classes", []):
                         sc = self._score_class_for_query(cls, t_kw)
                         if sc > 0:
                             scored.append((sc, "cls", cls))
                     scored.sort(key=lambda x: x[0], reverse=True)
-                    # Deduplicate nested functions so inner helpers don't consume top_k slots of the same outer function
+                    # Deduplicate nested functions and cap same-method-name subclass overrides per file
                     dedup_scored: list[tuple[float, str, dict]] = []
+                    method_name_counts: dict[str, int] = {}
                     for item in scored:
                         s_fn = item[2]
                         s_st, s_en = s_fn.get("line_start", 1), s_fn.get("line_end", 1)
@@ -1323,6 +1353,11 @@ class ProjectBrain:
                             for _, _, o_fn in dedup_scored
                         ):
                             continue
+                        if item[1] == "fn" and s_fn.get("parent_class"):
+                            m_nm = s_fn.get("name", "")
+                            if method_name_counts.get(m_nm, 0) >= 2:
+                                continue
+                            method_name_counts[m_nm] = method_name_counts.get(m_nm, 0) + 1
                         dedup_scored.append(item)
                     if file_rank == 0 and dedup_scored:
                         rank0_top_sym_score = dedup_scored[0][0]
@@ -1342,8 +1377,11 @@ class ProjectBrain:
                                 top_k = 4
                             elif len(dedup_scored) >= 3 and dedup_scored[2][0] >= dedup_scored[0][0] * 0.48:
                                 top_k = 3
-                        elif file_rank <= 2 and len(dedup_scored) >= 2 and dedup_scored[1][0] >= dedup_scored[0][0] * 0.65:
-                            top_k = max(top_k, 2)
+                        elif file_rank <= 2:
+                            if len(dedup_scored) >= 3 and dedup_scored[2][0] >= dedup_scored[0][0] * 0.65:
+                                top_k = max(top_k, 3)
+                            elif len(dedup_scored) >= 2 and dedup_scored[1][0] >= dedup_scored[0][0] * 0.60:
+                                top_k = max(top_k, 2)
                     multi_file_budget = (len(tasks) >= 3 and len(ranked) >= 3)
                     for rank_idx, (sc, kind, sym) in enumerate(dedup_scored[:top_k]):
                         nid = fn_id(rp, sym["name"], sym.get("parent_class")) if kind == "fn" else cls_id(rp, sym["name"])
@@ -1375,7 +1413,7 @@ class ProjectBrain:
             if self._graph and explicit_nodes:
                 chain_lines: list[str] = []
                 expanded_nodes: list[tuple[str, str, list[str], int, int]] = []
-                for seed_id in explicit_nodes[:4]:
+                for seed_id in explicit_nodes[:6]:
                     hop1_list: list[tuple[str, str, list[str], int, int]] = []
                     hop2_cross: list[tuple[str, str, list[str], int, int]] = []
                     hop2_same: list[tuple[str, str, list[str], int, int]] = []
@@ -1528,6 +1566,8 @@ class ProjectBrain:
                     seed_sym = (self._graph.nodes.get(seed_id, {}).get("name") or "").lower()
                     if seed_rel and seed_sym and seed_id in explicit_nodes[:2]:
                         for imp_rel in self._imported_by.get(seed_rel, []):
+                            if not q_wants_tests_bwd and _is_test_file(imp_rel):
+                                continue
                             if seed_sym in self._blobs.get(imp_rel, ""):
                                 imp_info = self._index.get(imp_rel, {})
                                 for ifn in imp_info.get("functions", []):
@@ -1542,7 +1582,7 @@ class ProjectBrain:
                     expanded_nodes.append((sc_id, sc_reason, sc_kw, 20, 0))
 
                 # Append Transitive Interprocedural Effects & State-Channel Flow Edges for seed symbols
-                for seed_id in explicit_nodes[:4]:
+                for seed_id in explicit_nodes[:6]:
                     s_nd = self._graph.nodes.get(seed_id, {})
                     t_zw = s_nd.get("transitive_z_write", [])
                     t_eff = s_nd.get("transitive_effects", [])
@@ -1575,11 +1615,11 @@ class ProjectBrain:
                             chain_lines.append(f"- `{esfr['src']}` -[{esfr['type']}: {esfr.get('reason', '')}]-> `{seed_id}`")
 
                 # Multiplex Personalized PageRank (PPR) + Causal Symptom Chop across 4-Layer Graph
-                ppr_results = self._graph.multiplex_ppr({sid: 1.0 for sid in explicit_nodes[:4]}, top_k=10)
+                ppr_results = self._graph.multiplex_ppr({sid: 1.0 for sid in explicit_nodes[:6]}, top_k=10)
                 ppr_scores: dict[str, float] = {nid: prob for nid, prob, _ in ppr_results}
                 existing_exp_ids = {item[0] for item in expanded_nodes}
 
-                chop_hits = self._graph.causal_symptom_chop(explicit_nodes[:4], clean_task_for_search)
+                chop_hits = self._graph.causal_symptom_chop(explicit_nodes[:6], clean_task_for_search)
                 for chop_nid, chop_sym, chop_path in chop_hits[:2]:
                     path_str = " -> ".join(f"`{p}`" for p in chop_path)
                     chain_lines.append(f"- ?? **[Causal Symptom Chop]** {path_str} *(origin of `{chop_sym}`)*")
@@ -1633,7 +1673,10 @@ class ProjectBrain:
 
                 remaining_cands: list[tuple[str, str, list[str], int, int]] = []
                 seen_cand_ids: set[str] = set()
+                seed_call_freq: dict[str, int] = {}
                 for item in expanded_nodes:
+                    if item[1].startswith(("called by ", "calls ", "2-hop callee")):
+                        seed_call_freq[item[0]] = seed_call_freq.get(item[0], 0) + 1
                     m_cl = re.search(r"@L(\d+)", item[1])
                     cand_key = f"{item[0]}@L{m_cl.group(1)}" if m_cl else item[0]
                     if cand_key not in seen_cand_ids and cand_key not in seen_slices and item[0] in self._graph.nodes:
@@ -1661,20 +1704,24 @@ class ProjectBrain:
                         gain = 0.0
                         nd_tokens = set(_tokenize_symbol(nd_nm))
                         for w in t_kw:
+                            if w in ("handled", "handling", "work", "works", "working", "across"):
+                                continue
                             if len(w) >= 4 and (w in nd_nm or w[:4] in nd_nm or w[:3] in nd_tokens):
                                 feat_k = f"kw:{w}"
                                 gain += (6.0 if feat_k not in covered_features else 1.5) * self._idf.get(w, 1.0)
-                        for zw in nd_obj.get("local_z_write", []):
+                        for zw in nd_obj.get("local_z_write", [])[:2]:
                             feat_zw = f"zw:{zw.lower()}"
-                            gain += 3.2 if feat_zw not in covered_features else 0.4
-                        for ex in nd_obj.get("exit_contracts", []):
+                            gain += 1.4 if feat_zw not in covered_features else 0.2
+                        for ex in nd_obj.get("exit_contracts", [])[:1]:
                             feat_ex = f"ex:{ex.lower()}"
-                            gain += 2.2 if feat_ex not in covered_features else 0.3
+                            gain += 1.2 if feat_ex not in covered_features else 0.2
                         feat_file = f"file:{nd_rel}"
                         if nd_rel in top3_query_files:
-                            gain += 5.0 if feat_file not in covered_features else 1.0
+                            gain += 5.0 if feat_file not in covered_features else 1.5
                         if c_rsn.startswith("called by "):
-                            gain += 6.5
+                            gain += 6.5 + 8.0 * min(3, seed_call_freq.get(c_nid, 1) - 1)
+                        elif c_rsn.startswith("calls ") and nd_rel in primary_files:
+                            gain += 6.0 + 6.5 * min(3, seed_call_freq.get(c_nid, 1) - 1)
                         elif not c_rsn.startswith(("2-hop", "3-hop")):
                             gain += 3.5
                         if "http_flow" in c_rsn or "state_flow" in c_rsn:
@@ -1682,8 +1729,8 @@ class ProjectBrain:
                         feat_ppr = f"ppr:{c_nid}"
                         if feat_ppr not in covered_features:
                             gain += 25.0 * ppr_scores.get(c_nid, 0.0)
-                        if nd_span < 6:
-                            gain *= 0.35
+                        if nd_span < 8 or nd_nm.startswith("_"):
+                            gain *= 0.40
 
                         ratio = gain / (cost_u ** 0.55)
                         if ratio > best_ratio:
@@ -1722,17 +1769,19 @@ class ProjectBrain:
                     espan = 12 if is_monolith_call else full_node_span
                     sec_lines_now = sum(len(x.splitlines()) for x in sec)
                     is_chop = "Causal Symptom Chop" in ereason
+                    is_direct_callee = ereason.startswith(("called by ", "calls "))
                     kw_direct = (
                         is_chop
                         or is_monolith_call
+                        or is_direct_callee
                         or any(w in enm or w[:4] in enm or w[:3] in enm_tokens for w in t_kw if len(w) >= 4)
                         or ("http_flow" in ereason)
                         or ("state_flow" in ereason)
                         or ("reads state from" in ereason)
                         or ("table:" in ereason)
                     )
-                    sec_cap_direct = 165 if len(tasks) >= 3 else 210
-                    if (emitted_hops < max_hops_allowed or is_chop or is_monolith_call) and (sec_lines_now < 120 or (kw_direct and sec_lines_now < sec_cap_direct)) and espan <= 120:
+                    sec_cap_direct = 185 if len(tasks) >= 3 else 310
+                    if (emitted_hops < max_hops_allowed or is_chop or is_monolith_call) and (sec_lines_now < 140 or (kw_direct and sec_lines_now < sec_cap_direct)) and espan <= 120:
                         _add_node_slice(enid, ereason, ekw, sec, max_l=min(emax_l, 26 if is_chop else 22), max_g=0)
                         if is_monolith_call:
                             monolith_call_wins += 1
@@ -1740,7 +1789,7 @@ class ProjectBrain:
                             emitted_hops += 1
                     else:
                         sig_str = f" `{end_node['signature']}`" if end_node.get("signature") else ""
-                        ptr = f"- `{erel} :: {end_node.get('name')}` (L{end_node.get('line_start', 1)}-L{end_node.get('line_end', 1)}){sig_str} — {ereason}"
+                        ptr = f"- `{erel} :: {_node_display_name(end_node)}` (L{end_node.get('line_start', 1)}-L{end_node.get('line_end', 1)}){sig_str} — {ereason}"
                         if ptr not in hop_pointers:
                             hop_pointers.append(ptr)
                 if hop_pointers:
@@ -1918,7 +1967,7 @@ class ProjectBrain:
                         nid = fn_id(rp, sym["name"], sym.get("parent_class")) if kind == "fn" else cls_id(rp, sym["name"])
                         _add_node_slice(nid, f"secondary match in {rp} (Task {idx})", t_kw, symptom_sec, max_l=24, max_g=6)
                         ptrs = [
-                            f"`{s['name']}` (L{s.get('line_start', 1)}-L{s.get('line_end', 1)})"
+                            f"`{_node_display_name(s)}` (L{s.get('line_start', 1)}-L{s.get('line_end', 1)})"
                             for _, _, s in scored[:4]
                         ]
                         line_ptr = f"- `{rp}` :: " + ", ".join(ptrs)
@@ -2530,29 +2579,36 @@ class ProjectBrain:
         parent_cls = (fn.get("parent_class") or "").lower()
         parent_tokens = set(_tokenize_symbol(parent_cls)) if parent_cls else set()
         is_lifecycle_method = name_lower in (
-            "push", "pop", "open", "close", "dispatch", "handle", "send",
+            "push", "pop", "open", "close", "dispatch", "handle", "send", "invoke",
             "execute", "run", "process", "resolve", "build", "register", "record", "load", "save",
+            "convert", "validate", "parse", "merge", "extract", "init_poolmanager", "resolve_command",
         )
         doc_lower = (fn.get("docstring") or "").lower()
         calls_lower = {c.lower() for c in fn.get("calls", [])}
         body_tokens = set(fn.get("body_tokens", []))
         fn_s = fn.get("line_start", 1)
         fn_e = fn.get("line_end", fn_s)
+        fn_span = max(1, fn_e - fn_s)
         score = 0.0
         matched_kws = 0
         id_or_call_hits = 0
         for kw in keywords:
             idf = self._idf.get(kw, 1.0) * (local_idf.get(kw, 1.0) if local_idf else 1.0)
             kw_stem = re.sub(r"(?:ed|ing|es|s)$", "", kw) if len(kw) >= 4 else kw
+            if len(kw_stem) >= 4 and kw_stem[-1] == kw_stem[-2] and kw_stem[-1] in "pbgtdmnr":
+                kw_stem = kw_stem[:-1]
             if len(kw_stem) < 3:
                 kw_stem = kw
+            kw_e = (kw_stem + "e") if (len(kw_stem) >= 4 and kw.endswith(("ed", "ing")) and not kw_stem.endswith("e")) else ""
             kw_root = re.sub(r"(?:ers|ors|er|or)$", "e", kw) if kw.endswith(("handler", "handlers", "serializer", "serializers", "dispatcher", "dispatchers", "loader", "loaders", "parser", "parsers", "manager", "managers", "router", "routers", "producer", "producers", "consumer", "consumers")) else re.sub(r"(?:ers|ors|er|or)$", "", kw_stem)
             if len(kw_root) < 4:
                 kw_root = kw_stem
+            if kw in ("handled", "handling", "work", "works", "working", "across"):
+                idf *= 0.22
             name_weight = 0.8 if kw in ("file", "files", "path", "paths", "data", "item", "items", "node", "nodes") else 2.6
             sig_tokens = set(re.findall(r"[a-z0-9]+", (fn.get("signature") or "").lower()))
             hit = False
-            if kw == name_lower or kw_stem == name_lower:
+            if kw == name_lower or kw_stem == name_lower or (kw_e and kw_e == name_lower):
                 score += 4.2 * idf
                 hit = True
                 id_or_call_hits += 1
@@ -2560,7 +2616,9 @@ class ProjectBrain:
                 kw in name_tokens
                 or kw in name_lower
                 or (len(kw_stem) >= 3 and (kw_stem in name_tokens or kw_stem in name_lower))
+                or (kw_e and (kw_e in name_tokens or kw_e in name_lower))
                 or (len(kw_root) >= 4 and (kw_root in name_tokens or kw_root in name_lower))
+                or (len(kw_stem) >= 6 and any(len(nt) >= 5 and kw_stem.startswith(nt) for nt in name_tokens))
             ):
                 score += name_weight * idf
                 hit = True
@@ -2574,37 +2632,61 @@ class ProjectBrain:
                     kw in parent_tokens
                     or kw == parent_cls
                     or (len(kw_stem) >= 3 and (kw_stem in parent_tokens or kw_stem in parent_cls))
+                    or (len(kw_stem) >= 6 and any(len(pt) >= 4 and kw_stem.startswith(pt) for pt in parent_tokens))
                 )
             ):
                 score += (2.4 if is_lifecycle_method else 1.35) * idf
                 hit = True
                 id_or_call_hits += 1
-            elif kw in sig_tokens or (len(kw_stem) >= 3 and kw_stem in sig_tokens):
+            elif kw in sig_tokens or (len(kw_stem) >= 3 and kw_stem in sig_tokens) or (kw_e and kw_e in sig_tokens):
                 score += 2.0 * idf
                 hit = True
                 id_or_call_hits += 1
             elif any(
                 kw in c
                 or (len(kw_stem) >= 4 and kw_stem in c)
+                or (kw_e and kw_e in c)
                 or (len(kw_root) >= 4 and kw_root in c)
                 for c in calls_lower
             ):
                 score += 1.45 * idf
                 hit = True
                 id_or_call_hits += 1
-            elif kw in doc_lower or (len(kw_stem) >= 4 and kw_stem in doc_lower):
+            elif kw in doc_lower or (len(kw_stem) >= 4 and kw_stem in doc_lower) or (kw_e and kw_e in doc_lower):
                 score += 1.15 * idf
                 hit = True
-            elif kw in body_tokens or any(len(kw_stem) >= 4 and kw_stem in bt for bt in body_tokens):
+            elif kw in body_tokens or any(len(kw_stem) >= 4 and kw_stem in bt for bt in body_tokens) or (kw_e and kw_e in body_tokens):
                 score += 0.75 * idf
                 hit = True
             if hit:
                 matched_kws += 1
         if (
-            name_lower.startswith(("has_", "is_", "can_", "should_"))
-            and not any(qk.startswith(("has", "is", "can", "should", "check")) for qk in keywords)
+            name_lower.startswith(("has_", "is_", "can_"))
+            and not any(qk.startswith(("has", "is", "can", "check")) for qk in keywords)
         ):
             score *= 0.52
+        if fn.get("is_nested") and name_lower not in keywords:
+            score *= 0.35
+        if name_lower in ("__init__", "constructor") and not any(
+            qk in ("init", "__init__", "constructor", "create", "new", "instantiate", "setup", "default", "defaults")
+            for qk in keywords
+        ):
+            score *= 0.48
+        if any(qk in ("dispatch", "dispatched", "subcommand", "subcommands", "route", "routed") for qk in keywords):
+            if name_lower in ("invoke", "resolve_command", "dispatch", "handle", "full_dispatch_request", "dispatch_request"):
+                score *= 1.45
+            elif "decorator" in body_tokens and name_lower in (parent_cls, "command", "group", "errorhandler", "route"):
+                score *= 0.52
+            elif fn_span <= 4 and len(calls_lower) <= 1:
+                score *= 0.55
+        if any(qk in ("parse", "parsed", "parsing", "parser") for qk in keywords):
+            if "parse" in name_lower or name_lower in ("consume_value", "process_value"):
+                score *= 1.38
+            elif name_lower.startswith(("format_", "get_help")) and not any(qk in ("format", "help") for qk in keywords):
+                score *= 0.52
+        if any(qk in ("across", "between", "merge", "merged", "combine", "combined") for qk in keywords) and id_or_call_hits >= 1:
+            if name_tokens & {"merge", "combine", "sync"}:
+                score *= 1.65
         if name_lower.startswith("test_") and not (set(keywords) & _TEST_QUERY_TERMS):
             score *= 0.45
         if id_or_call_hits >= 2:
@@ -4395,7 +4477,11 @@ class ProjectBrain:
     @staticmethod
     def _name_in(obj: str, captured: set) -> bool:
         o = obj.lower()
-        return any(o == c.lower() or o == c.lower().rsplit(".", 1)[-1] for c in captured)
+        o_bare = o.rsplit(".", 1)[-1]
+        return any(
+            o == c.lower() or o_bare == c.lower() or o == c.lower().rsplit(".", 1)[-1]
+            for c in captured
+        )
 
     def _match_subjects(self, subject: str, kind: str) -> list[dict]:
         s = subject.lower()
@@ -4456,8 +4542,9 @@ class ProjectBrain:
         return set()
 
     def _support_evidence(self, m: dict, relation: str, obj: str, info: dict) -> dict:
-        rank = {"exact": 3, "qualified": 2, "import_resolved": 1, "candidate": 0}
+        rank = {"exact": 3, "qualified": 2, "import_resolved": 1, "dynamic_dispatch": 0, "candidate": 0}
         o = obj.lower()
+        o_bare = o.rsplit(".", 1)[-1]
         found = None
         if self._graph:
             for ei in self._graph._adj.get(m["node_id"], []):
@@ -4466,13 +4553,44 @@ class ProjectBrain:
                     continue
                 tgt = self._graph.nodes.get(edge["dst"], {})
                 tname = (tgt.get("name") or tgt.get("path") or "").lower()
-                if not (o == tname or o == tname.rsplit(".", 1)[-1]):
+                tparent = (tgt.get("parent_class") or "").lower()
+                tqual = f"{tparent}.{tname}" if tparent else tname
+                if not (o == tqual or o == tname or o == tname.rsplit(".", 1)[-1] or o_bare == tname):
                     continue
-                if found is None or rank.get(edge["confidence"], 0) > rank.get(found["confidence"], 0):
+                e_conf = edge["confidence"]
+                e_reason = edge.get("reason", "")
+                if relation == "calls" and m["kind"] == "fn" and ("." in o or tparent):
+                    ent = m["entity"]
+                    caller_cls = (ent.get("parent_class") or "").lower()
+                    q_calls = {k.lower(): v for k, v in (ent.get("qualified_calls") or {}).items()}
+                    req_recv = o.rsplit(".", 1)[0] if "." in o else tparent
+                    matching_recvs = [
+                        k[: -(len(o_bare) + 1)]
+                        for k in q_calls
+                        if k.endswith("." + o_bare)
+                    ]
+                    if matching_recvs:
+                        caller_bases = {caller_cls}
+                        for cls_d in info.get("classes", []):
+                            if (cls_d.get("name") or "").lower() == caller_cls:
+                                caller_bases.update(b.lower() for b in cls_d.get("bases", []))
+                        static_recv = any(
+                            r_u == req_recv
+                            or (r_u in ("self", "cls", "this", "super()") and req_recv in caller_bases)
+                            for r_u in matching_recvs
+                        )
+                        if not static_recv:
+                            e_conf = "dynamic_dispatch"
+                            e_reason = (
+                                f"{m['label']} calls '.{o_bare}' on dynamic receiver "
+                                f"'{matching_recvs[0]}' (line {edge.get('line')}; candidate: {tqual or obj}) — "
+                                "receiver type cannot be resolved statically."
+                            )
+                if found is None or rank.get(e_conf, 0) > rank.get(found["confidence"], 0):
                     found = {
                         "node_id": m["node_id"], "file": m["rel_path"],
-                        "target": edge["dst"], "confidence": edge["confidence"],
-                        "line": edge.get("line"), "reason": edge.get("reason", ""),
+                        "target": edge["dst"], "confidence": e_conf,
+                        "line": edge.get("line"), "reason": e_reason,
                     }
         if found and found["confidence"] in _STRONG:
             return found
@@ -5712,8 +5830,17 @@ def _tokenize_symbol(name: str) -> list[str]:
         if not part:
             continue
         if part.islower() or part.isupper():
-            if len(part) > 1:
-                tokens.append(part.lower())
+            p_low = part.lower()
+            if len(p_low) > 1:
+                tokens.append(p_low)
+                if len(p_low) >= 7:
+                    for sfx in _COMPOUND_SUFFIXES:
+                        if p_low.endswith(sfx) and len(p_low) - len(sfx) >= 3:
+                            pref = p_low[: -len(sfx)]
+                            sfx_s = sfx[:-1] if sfx.endswith("s") else sfx
+                            tokens.append(pref)
+                            tokens.append(sfx_s)
+                            break
         else:
             for s in _CAMEL_SPLIT_RE.sub(" ", part).split():
                 if len(s) > 1:
@@ -5731,6 +5858,7 @@ _COMPOUND_SUFFIXES = (
     "validators", "validator", "decorators", "decorator", "exceptions", "exception",
     "blueprints", "blueprint", "sessions", "session", "globals", "global",
     "signals", "signal", "views", "view", "clients", "client", "runners", "runner",
+    "commands", "command", "files", "file", "pools", "pool", "headers", "header",
 )
 
 
@@ -5741,7 +5869,9 @@ def _extract_keywords(prompt: str) -> list[str]:
         expanded.append(token)
         if "-" in token:
             expanded.extend(token.split("-"))
-        elif len(token) >= 7 and "_" not in token and "/" not in token and "." not in token:
+        if "." in token and not token.startswith("."):
+            expanded.extend(p for p in token.split(".") if len(p) >= 2)
+        if len(token) >= 7 and "_" not in token and "/" not in token and "." not in token:
             for sfx in _COMPOUND_SUFFIXES:
                 if token.endswith(sfx) and len(token) - len(sfx) >= 3:
                     prefix = token[: -len(sfx)]

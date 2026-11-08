@@ -28,3 +28,14 @@ FUTURE_ROADMAP.md
 projectbrain_recommendations.md
 projectbrain/AGENT_CONTEXT_RUNTIME.md
 .agents/
+
+Dasari_Johan_Abhishek_Resume.html
+Dasari_Johan_Abhishek_Resume.pdf
+ARCHITECTURE_AND_SETUP.md
+projectbrain-prompt.md
+projectbrain/PROJECTBRAIN_NOTES.md
+projectbrain/.pytest-patcher/
+projectbrain/.pytest-tmp/
+projectbrain/.projectbrain.db
+projectbrain/.projectbrain.db-shm
+projectbrain/.projectbrain.db-wal

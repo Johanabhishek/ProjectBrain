@@ -573,6 +573,7 @@ def _js_const_map_and_leading_docs(root) -> tuple[dict[str, str], dict[int, str]
     for idx, child in enumerate(children):
         if idx > 0 and children[idx - 1].type == "comment":
             comment_txt = _text(children[idx - 1]).strip("/* \t\r\n")
+            comment_txt = re.sub(r"(?m)^\s*\*\s?", " ", comment_txt)
             leading_docs[_line(child)] = _collapse_ws(comment_txt)[:200]
         decl = child
         if child.type == "export_statement":
@@ -663,11 +664,44 @@ def _parse_python(root) -> dict:
         })
 
     # Phase 2 — all functions
+    root_span = max(1, _end_line(root) - _line(root))
     caps = _captures(_PY, _PY_FUNC, root)
-    for func_node in caps.get("func", []):
+    raw_py_funcs = caps.get("func", [])
+    # Identify non-overload definitions so @typing.overload stubs don't duplicate real methods
+    non_overload_keys: set[tuple[str | None, str]] = set()
+    for fn_n in raw_py_funcs:
+        nm_n = fn_n.child_by_field_name("name")
+        if not nm_n:
+            continue
+        p_cls = method_to_class.get(fn_n.start_point)
+        is_ovl = False
+        if fn_n.parent and fn_n.parent.type == "decorated_definition":
+            for dec_c in fn_n.parent.children:
+                if dec_c.type == "decorator" and re.search(r"\boverload\b", _text(dec_c)):
+                    is_ovl = True
+                    break
+        if not is_ovl:
+            non_overload_keys.add((p_cls, _text(nm_n)))
+
+    for func_node in raw_py_funcs:
         name_node = func_node.child_by_field_name("name")
         if not name_node:
             continue
+        fn_nm_str = _text(name_node)
+        parent_cls = method_to_class.get(func_node.start_point)
+        if func_node.parent and func_node.parent.type == "decorated_definition":
+            if any(
+                dec_c.type == "decorator" and re.search(r"\boverload\b", _text(dec_c))
+                for dec_c in func_node.parent.children
+            ) and (parent_cls, fn_nm_str) in non_overload_keys:
+                continue
+        is_nested_fn = False
+        anc = func_node.parent
+        while anc is not None and anc != root:
+            if anc.type == "function_definition" and (_end_line(anc) - _line(anc)) <= root_span * 0.8:
+                is_nested_fn = True
+                break
+            anc = anc.parent
         callee_matches = _matches(_PY, _PY_CALLS, func_node)
         calls = []
         call_sites = {}
@@ -694,10 +728,9 @@ def _parse_python(root) -> dict:
                     if qual not in qualified_calls or line < qualified_calls[qual]:
                         qualified_calls[qual] = line
         sig, params, ret_type = _py_func_signature(func_node)
-        parent_cls = method_to_class.get(func_node.start_point)
         is_meth = parent_cls is not None
         entry = {
-            "name": _text(name_node),
+            "name": fn_nm_str,
             "line_start": _line(func_node),
             "line_end": _end_line(func_node),
             "signature": sig,
@@ -716,6 +749,8 @@ def _parse_python(root) -> dict:
         if is_meth:
             entry["is_method"] = True
             entry["parent_class"] = parent_cls
+        if is_nested_fn:
+            entry["is_nested"] = True
         functions.append(entry)
 
     imports, import_bindings = _py_extract_imports_and_bindings(root)
@@ -999,7 +1034,7 @@ def _js_named_exports(root, lang: Language) -> list[str]:
 
 
 def _js_import_bindings(root) -> dict[str, dict]:
-    """Extract JS/TS symbol-level import bindings: `import { a, b as c } from './mod'`."""
+    """Extract JS/TS symbol-level import bindings (`import { a } from './mod'` and CommonJS `require('./mod')`)."""
     bindings: dict[str, dict] = {}
     for node in root.children:
         if node.type == "import_statement":
@@ -1032,13 +1067,109 @@ def _js_import_bindings(root) -> dict[str, dict]:
                             for ns_c in sub.children:
                                 if ns_c.type == "identifier":
                                     bindings[_text(ns_c)] = {"module": mod, "symbol": "*"}
+        elif node.type in ("lexical_declaration", "variable_declaration"):
+            for sub in node.children:
+                if sub.type != "variable_declarator":
+                    continue
+                name_n = sub.child_by_field_name("name")
+                val_n = sub.child_by_field_name("value")
+                if not (name_n and val_n):
+                    continue
+                val_txt = _collapse_ws(_text(val_n))
+                m_req = re.match(r"^require\(\s*['\"]([^'\"]+)['\"]\s*\)(?:\.([A-Za-z_$][A-Za-z0-9_$]*))?$", val_txt)
+                if not m_req:
+                    continue
+                mod, prop = m_req.group(1), m_req.group(2)
+                if name_n.type == "identifier":
+                    local = _text(name_n)
+                    bindings[local] = {"module": mod, "symbol": prop or "*"}
+                elif name_n.type == "object_pattern":
+                    for pat_c in name_n.children:
+                        if pat_c.type == "shorthand_property_identifier_pattern":
+                            sym = _text(pat_c)
+                            bindings[sym] = {"module": mod, "symbol": sym}
+                        elif pat_c.type == "pair_pattern":
+                            k_n = pat_c.child_by_field_name("key")
+                            v_n = pat_c.child_by_field_name("value")
+                            if k_n and v_n and v_n.type == "identifier":
+                                bindings[_text(v_n)] = {"module": mod, "symbol": _text(k_n)}
     return bindings
+
+
+def _parse_js_lhs_target(lhs_text: str, rhs_node) -> tuple[str | None, str | None, bool]:
+    """Resolve a JS assignment LHS (e.g. `res.send`, `View.prototype.lookup`, `exports.foo`)
+    into `(parent_class, fn_name, is_export)`."""
+    t = lhs_text.strip()
+    if not t or "[" in t or "(" in t:
+        return None, None, False
+    if t in ("module.exports", "exports"):
+        if rhs_node.type in ("function_expression", "generator_function"):
+            nm_n = rhs_node.child_by_field_name("name")
+            if nm_n:
+                return None, _text(nm_n), True
+        return None, None, False
+    if t.startswith("module.exports."):
+        rem = t[len("module.exports."):]
+        if "." not in rem:
+            return None, rem, True
+        obj_p, meth_p = rem.rsplit(".", 1)
+        return obj_p.rsplit(".", 1)[-1], meth_p, True
+    if t.startswith("exports."):
+        rem = t[len("exports."):]
+        if "." not in rem:
+            return None, rem, True
+        obj_p, meth_p = rem.rsplit(".", 1)
+        return obj_p.rsplit(".", 1)[-1], meth_p, True
+    if ".prototype." in t:
+        cls_p, meth_p = t.rsplit(".prototype.", 1)
+        if "." not in meth_p:
+            return cls_p.rsplit(".", 1)[-1], meth_p, False
+        return None, None, False
+    if "." in t:
+        obj_p, meth_p = t.rsplit(".", 1)
+        if obj_p not in ("this", "self", "window", "global", "globalThis") and meth_p:
+            return obj_p.rsplit(".", 1)[-1], meth_p, False
+    return None, None, False
 
 
 def _parse_js(root, lang: Language) -> dict:
     functions, classes, imports, exports, routes = [], [], [], [], []
     method_to_class: dict[tuple, str] = {}
     js_consts, leading_docs = _js_const_map_and_leading_docs(root)
+    root_span = max(1, _end_line(root) - _line(root))
+
+    def _extract_js_callees(fn_node) -> tuple[list[str], dict[str, int], dict[str, list[int]], dict[str, int]]:
+        callee_matches = list(_matches(lang, _JS_CALLS, fn_node))
+        if lang in (_TSX, _JS):
+            for m_jsx in _matches(lang, _JSX_CALLS, fn_node):
+                c_nodes = m_jsx[1].get("callee", [])
+                if c_nodes and _text(c_nodes[0])[:1].isupper():
+                    callee_matches.append(m_jsx)
+        calls: list[str] = []
+        call_sites: dict[str, int] = {}
+        call_sites_all: dict[str, list[int]] = {}
+        qualified_calls: dict[str, int] = {}
+        for _, mc in callee_matches:
+            callee_nodes = mc.get("callee", [])
+            receiver_nodes = mc.get("receiver", [])
+            if callee_nodes:
+                callee_node = callee_nodes[0]
+                callee_text = _text(callee_node)
+                line = _line(callee_node)
+                if callee_text not in calls:
+                    calls.append(callee_text)
+                if callee_text not in call_sites or line < call_sites[callee_text]:
+                    call_sites[callee_text] = line
+                s_list = call_sites_all.setdefault(callee_text, [])
+                if line not in s_list and len(s_list) < 8:
+                    s_list.append(line)
+                    s_list.sort()
+                if receiver_nodes:
+                    receiver_text = _text(receiver_nodes[0])
+                    qual = f"{receiver_text}.{callee_text}"
+                    if qual not in qualified_calls or line < qualified_calls[qual]:
+                        qualified_calls[qual] = line
+        return calls, call_sites, call_sites_all, qualified_calls
 
     # Phase 1 — classes first
     caps = _captures(lang, _JS_CLASS, root)
@@ -1078,48 +1209,29 @@ def _parse_js(root, lang: Language) -> dict:
         if iface["name"] not in existing_cls_names:
             classes.append(iface)
 
-    # Phase 2 — all functions
+    # Phase 2 — standard declarations, arrow declarators, and class methods
     caps = _captures(lang, _JS_FUNC, root)
+    seen_fn_keys: set[tuple[str | None, str, int]] = set()
     for func_node in caps.get("func", []):
         name_node = func_node.child_by_field_name("name")
         if not name_node:
             continue
         fn_name = _text(name_node)
-        callee_matches = list(_matches(lang, _JS_CALLS, func_node))
-        if lang in (_TSX, _JS):
-            for m_jsx in _matches(lang, _JSX_CALLS, func_node):
-                c_nodes = m_jsx[1].get("callee", [])
-                if c_nodes and _text(c_nodes[0])[:1].isupper():
-                    callee_matches.append(m_jsx)
-        calls = []
-        call_sites = {}
-        call_sites_all: dict[str, list[int]] = {}
-        qualified_calls = {}
-        for _, mc in callee_matches:
-            callee_nodes = mc.get("callee", [])
-            receiver_nodes = mc.get("receiver", [])
-            if callee_nodes:
-                callee_node = callee_nodes[0]
-                callee_text = _text(callee_node)
-                line = _line(callee_node)
-                if callee_text not in calls:
-                    calls.append(callee_text)
-                if callee_text not in call_sites or line < call_sites[callee_text]:
-                    call_sites[callee_text] = line
-                s_list = call_sites_all.setdefault(callee_text, [])
-                if line not in s_list and len(s_list) < 8:
-                    s_list.append(line)
-                    s_list.sort()
-                if receiver_nodes:
-                    receiver_text = _text(receiver_nodes[0])
-                    qual = f"{receiver_text}.{callee_text}"
-                    if qual not in qualified_calls or line < qualified_calls[qual]:
-                        qualified_calls[qual] = line
+        is_nested_fn = False
+        anc = func_node.parent
+        while anc is not None and anc != root:
+            if anc.type in ("function_declaration", "function_expression", "arrow_function", "method_definition"):
+                if (_end_line(anc) - _line(anc)) <= root_span * 0.8:
+                    is_nested_fn = True
+                    break
+            anc = anc.parent
+        calls, call_sites, call_sites_all, qualified_calls = _extract_js_callees(func_node)
         sig, params, ret_type = _js_func_signature(func_node, fn_name)
         l_start = _line(func_node)
         doc = leading_docs.get(l_start)
         parent_cls = method_to_class.get(func_node.start_point)
         is_meth = parent_cls is not None
+        seen_fn_keys.add((parent_cls, fn_name, l_start))
         entry = {
             "name": fn_name,
             "line_start": l_start,
@@ -1140,7 +1252,141 @@ def _parse_js(root, lang: Language) -> dict:
         if is_meth:
             entry["is_method"] = True
             entry["parent_class"] = parent_cls
+        if is_nested_fn:
+            entry["is_nested"] = True
         functions.append(entry)
+
+    # Phase 2b — CommonJS / prototype / object method assignments (`res.send = function...`,
+    # `exports.foo = ...`, `View.prototype.lookup = ...`) and `defineGetter(obj, 'prop', fn)`
+    assigned_exports: list[str] = []
+    proto_methods_by_cls: dict[str, list[str]] = {}
+    for stmt in root.children:
+        expr = stmt.children[0] if (stmt.type == "expression_statement" and stmt.children) else stmt
+        if expr.type == "assignment_expression":
+            lhs_list = []
+            curr = expr
+            while curr is not None and curr.type == "assignment_expression":
+                l_n = curr.child_by_field_name("left")
+                if l_n is not None:
+                    lhs_list.append(l_n)
+                curr = curr.child_by_field_name("right")
+            rhs_n = curr
+            if rhs_n is None:
+                continue
+            if rhs_n.type == "identifier":
+                for l_n in lhs_list:
+                    lt = _collapse_ws(_text(l_n))
+                    if lt in ("module.exports", "exports"):
+                        assigned_exports.append(_text(rhs_n))
+                    elif lt.startswith(("module.exports.", "exports.")):
+                        assigned_exports.append(lt.split(".", 2)[-1])
+                continue
+            if rhs_n.type not in ("function_expression", "arrow_function", "generator_function"):
+                continue
+            l_start = _line(stmt)
+            l_end = _end_line(stmt)
+            doc = leading_docs.get(l_start)
+            calls, call_sites, call_sites_all, qualified_calls = _extract_js_callees(rhs_n)
+            body_toks = _extract_body_tokens(rhs_n, js_consts)
+            ast_h = _ast_hash(_text(rhs_n))
+            for l_n in lhs_list:
+                p_cls, f_nm, is_exp = _parse_js_lhs_target(_collapse_ws(_text(l_n)), rhs_n)
+                if not f_nm:
+                    continue
+                if is_exp:
+                    assigned_exports.append(f_nm)
+                if (p_cls, f_nm, l_start) in seen_fn_keys:
+                    continue
+                seen_fn_keys.add((p_cls, f_nm, l_start))
+                q_display = f"{p_cls}.{f_nm}" if p_cls else f_nm
+                sig, params, ret_type = _js_func_signature(rhs_n, q_display)
+                is_meth = p_cls is not None
+                if p_cls:
+                    proto_methods_by_cls.setdefault(p_cls, []).append(f_nm)
+                entry = {
+                    "name": f_nm,
+                    "line_start": l_start,
+                    "line_end": l_end,
+                    "signature": sig,
+                    "params": params,
+                    "return_type": ret_type,
+                    "arity_spec": extract_arity_spec(params, is_method=is_meth, is_python=False),
+                    "docstring": doc,
+                    "body_tokens": body_toks,
+                    "calls": calls,
+                    "call_sites": call_sites,
+                    "call_sites_all": call_sites_all,
+                    "qualified_calls": qualified_calls,
+                    "interface_hash": _ast_hash(sig),
+                    "ast_hash": ast_h,
+                }
+                if is_meth:
+                    entry["is_method"] = True
+                    entry["parent_class"] = p_cls
+                functions.append(entry)
+        elif expr.type == "call_expression":
+            fn_n = expr.child_by_field_name("function")
+            args_n = expr.child_by_field_name("arguments")
+            if not (fn_n and args_n):
+                continue
+            fn_callee = _collapse_ws(_text(fn_n))
+            if fn_callee not in ("defineGetter", "Object.defineProperty"):
+                continue
+            arg_items = [c for c in args_n.children if c.type not in ("(", ")", ",")]
+            if len(arg_items) < 3:
+                continue
+            obj_arg, prop_arg, val_arg = arg_items[0], arg_items[1], arg_items[2]
+            if obj_arg.type not in ("identifier", "member_expression") or prop_arg.type != "string":
+                continue
+            p_cls = _text(obj_arg).rsplit(".", 1)[-1]
+            f_nm = _text(prop_arg).strip("'\"`")
+            target_fn = val_arg if val_arg.type in ("function_expression", "arrow_function") else None
+            if target_fn is None and val_arg.type == "object":
+                for sub_c in val_arg.children:
+                    if sub_c.type == "pair":
+                        v_c = sub_c.child_by_field_name("value")
+                        if v_c and v_c.type in ("function_expression", "arrow_function"):
+                            target_fn = v_c
+                            break
+                    elif sub_c.type == "method_definition":
+                        target_fn = sub_c
+                        break
+            if target_fn is None or not f_nm:
+                continue
+            l_start = _line(stmt)
+            l_end = _end_line(stmt)
+            if (p_cls, f_nm, l_start) in seen_fn_keys:
+                continue
+            seen_fn_keys.add((p_cls, f_nm, l_start))
+            doc = leading_docs.get(l_start)
+            calls, call_sites, call_sites_all, qualified_calls = _extract_js_callees(target_fn)
+            sig, params, ret_type = _js_func_signature(target_fn, f"{p_cls}.{f_nm}")
+            proto_methods_by_cls.setdefault(p_cls, []).append(f_nm)
+            functions.append({
+                "name": f_nm,
+                "line_start": l_start,
+                "line_end": l_end,
+                "signature": sig,
+                "params": params,
+                "return_type": ret_type,
+                "arity_spec": extract_arity_spec(params, is_method=True, is_python=False),
+                "docstring": doc,
+                "body_tokens": _extract_body_tokens(target_fn, js_consts),
+                "calls": calls,
+                "call_sites": call_sites,
+                "call_sites_all": call_sites_all,
+                "qualified_calls": qualified_calls,
+                "interface_hash": _ast_hash(sig),
+                "ast_hash": _ast_hash(_text(target_fn)),
+                "is_method": True,
+                "parent_class": p_cls,
+            })
+
+    for cls_obj in classes:
+        extra_m = proto_methods_by_cls.get(cls_obj["name"], [])
+        for em in extra_m:
+            if em not in cls_obj["methods"]:
+                cls_obj["methods"].append(em)
 
     caps = _captures(lang, _JS_IMPORT, root)
     imports = list({_text(n) for n in caps.get("mod", [])})
@@ -1149,6 +1395,7 @@ def _parse_js(root, lang: Language) -> dict:
     caps = _captures(lang, _JS_EXPORT, root)
     exports = list({_text(n) for n in caps.get("name", [])})
     exports.extend(_js_named_exports(root, lang))
+    exports.extend(assigned_exports)
     exports = list(set(exports))
 
     for _, mc in _matches(lang, _JS_ROUTE, root):
