@@ -347,7 +347,7 @@ def _py_class_fields(body_node) -> list[str]:
                             fields.append(f"{lhs}: {_collapse_ws(_text(typ))}")
                         elif right:
                             rhs = _collapse_ws(_text(right))
-                            if len(rhs) <= 50:
+                            if len(rhs) <= 95:
                                 fields.append(f"{lhs} = {rhs}")
                             else:
                                 fields.append(lhs)
@@ -363,7 +363,7 @@ def _py_class_fields(body_node) -> list[str]:
             ann_text = _collapse_ws(_text(child))
             if len(ann_text) <= 80:
                 fields.append(ann_text)
-    return fields[:25]
+    return fields[:60]
 
 
 def _py_bases(cls_node) -> list[str]:
@@ -383,7 +383,7 @@ def _py_bases(cls_node) -> list[str]:
 
 
 def _flask_methods(arg_list_node) -> list[str]:
-    """Extract methods=[...] from a Flask @app.route(...) argument_list."""
+    """Extract methods=[...] or methods=(...) from a Flask @app.route(...) argument_list."""
     for child in arg_list_node.children:
         if child.type != "keyword_argument":
             continue
@@ -391,7 +391,7 @@ def _flask_methods(arg_list_node) -> list[str]:
         if not name_node or _text(name_node) != "methods":
             continue
         value_node = child.child_by_field_name("value")
-        if not value_node or value_node.type != "list":
+        if not value_node or value_node.type not in ("list", "tuple", "set"):
             continue
         methods = []
         for item in value_node.children:
@@ -506,18 +506,30 @@ def _extract_body_tokens(func_node, const_map: dict[str, str] | None = None) -> 
     combined = " ".join(extra_texts)
     out: list[str] = []
     seen: set[str] = set()
-    # Pass 1: prioritize PascalCase / camelCase / snake_case code identifiers so docstrings don't crowd them out
+    # Pass 1: prioritize PascalCase / camelCase / snake_case code identifiers and string config keys
+    for s_key in re.findall(r"['\"]([A-Za-z_][A-Za-z0-9_.\-]{2,40})['\"]", raw_text):
+        if "_" in s_key or s_key.isupper() or any(c.isupper() for c in s_key[1:]):
+            sk_low = s_key.lower()
+            sk_parts = [sk_low, sk_low.replace("_", "")] + [
+                p.lower()
+                for p in re.sub(r"([a-z])([A-Z])", r"\1 \2", s_key).replace("_", " ").replace("-", " ").replace(".", " ").split()
+            ]
+            for p in sk_parts:
+                if len(p) >= 3 and p not in _BODY_NOISE and p not in seen:
+                    seen.add(p)
+                    out.append(p)
     for ident in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", raw_text):
         if "_" in ident or any(c.isupper() for c in ident[1:]) or (ident[0].isupper() and any(c.islower() for c in ident[1:])):
+            raw_low = ident.lower().strip("_")
             clean_id = ident.replace("_", "").lower()
-            parts = [clean_id] + [p.lower() for p in re.sub(r"([a-z])([A-Z])", r"\1 \2", ident).replace("_", " ").split()]
+            parts = [raw_low, clean_id] + [p.lower() for p in re.sub(r"([a-z])([A-Z])", r"\1 \2", ident).replace("_", " ").split()]
             for p in parts:
                 if len(p) >= 3 and p not in _BODY_NOISE and p not in seen:
                     seen.add(p)
                     out.append(p)
-                    if len(out) >= 90:
+                    if len(out) >= 100:
                         break
-        if len(out) >= 90:
+        if len(out) >= 100:
             break
     # Pass 2: general lexical words up to 140 total tokens
     words = re.findall(r"[a-zA-Z]{3,}", combined)

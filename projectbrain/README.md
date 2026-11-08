@@ -1,4 +1,4 @@
-# ProjectBrain (`projectbrain-mcp` v0.8.4)
+# ProjectBrain (`projectbrain-mcp` v0.8.5)
 
 [![PyPI](https://img.shields.io/pypi/v/projectbrain-mcp.svg)](https://pypi.org/project/projectbrain-mcp/)
 [![License: MIT](https://img.shields.io/badge/License: MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -11,9 +11,9 @@ Instead of forcing AI coding agents to explore repositories by running dozens of
 ### What It Actually Does
 
 1. **One-Turn Code Dossiers (`projectbrain dossier` / `brain_dossier`):**
-   - Given a bug report, stack trace, or feature prompt, ProjectBrain ranks relevant symbols using sub-identifier BM25 + call/import graph traversal, automatically bridges passive schema/DTO files to their executable consumers, and returns exact statement/function code slices plus 1-hop caller/callee signatures in a single read.
-2. **Surgical Symbol & Line Slicing (`projectbrain slice` / `brain_slice`):**
-   - Slices exact functions, classes, methods, or line ranges (`file.py:ClassName.method` or `file.py:120-160`) across multiple files in a single call, with fuzzy symbol/path suggestions when an agent guesses an incomplete name.
+   - Given a bug report, stack trace, or feature prompt, ProjectBrain ranks relevant symbols using sub-identifier BM25 + call/import/state-flow graph traversal, automatically bridges passive schema/DTO and class/module config declarations (`ConfigAttribute`, `ImmutableDict`, `SCREAMING_SNAKE_CASE` constants) to their executable consumers, and returns exact code slices plus 1-hop caller/callee signatures in a single read.
+2. **Multi-Dimensional Program Slicing (`projectbrain slice` / `brain_slice`):**
+   - Slices exact functions, classes, methods, or line ranges (`file.py:ClassName.method` or `file.py:120-160`) across multiple files in a single call. When slicing large functions around a target variable or call, computes an AST/PDG slice across three orthogonal dimensions: **backward data-dependence (`def -> use`)**, **forward data-dependence (`def -> use`)**, and **upward control-dependence guards (`if`/`try`/`for`/`with`)**, collapsing unrelated filler lines while preserving governing logic.
 3. **AST Symbol-Anchored Patching (`projectbrain patch` / `brain_patch`):**
    - Applies surgical edits (`@replace_body <Symbol>`, `@add_method <ClassName>`, `@replace <Symbol>`, `@sub L<n>`) validated against Tree-sitter + language syntax compilers and caller arity contracts before touching disk, with automatic rollback on syntax errors.
 4. **`.gitignore`-Compliant Polyglot Indexing (29 File Extensions):**
@@ -40,10 +40,10 @@ pip install projectbrain-mcp
 projectbrain --path /path/to/your/repo init --hooks
 ```
 
-**What `projectbrain init --hooks` does safely:**
+**What `projectbrain init` does safely (`--ide auto` by default):**
 1. **Builds the SQLite Code Graph Index:** Writes `.projectbrain.db` (WAL mode), honoring `.gitignore`.
 2. **Updates `.gitignore`:** Appends ephemeral `.projectbrain*` cache patterns if not already present.
-3. **Merges MCP Configs:** Safely merges `projectbrain` into `.mcp.json`, `.cursor/mcp.json`, and `.vscode/mcp.json` without overwriting other MCP servers.
+3. **Writes Minimal Root Config by Default (`--ide auto`):** Creates `.mcp.json` and `AGENTS.md` at the repo root, and only touches `.cursor/`, `.vscode/`, or `.claude/` if those IDE directories already exist in your repo (pass `--ide all` to generate configs for all IDEs).
 4. **Appends Agent Rules Non-Destructively:** Uses `<!-- projectbrain:start --> ... <!-- projectbrain:end -->` section markers in `AGENTS.md`, `CLAUDE.md`, `.cursor/rules/projectbrain.mdc`, and deep-merges `.claude/settings.local.json` `PreToolUse` hooks so existing team instructions and settings are never overwritten.
 
 ### Step 3: MCP Server Configuration

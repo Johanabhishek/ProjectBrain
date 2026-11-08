@@ -21,7 +21,13 @@ import os
 import sys
 import threading
 
-from mcp.server.fastmcp import FastMCP
+try:
+    from mcp.server.fastmcp import FastMCP
+except ImportError:
+    try:
+        from fastmcp import FastMCP  # type: ignore[no-redef]
+    except ImportError:
+        from mcp.server import FastMCP  # type: ignore[attr-defined,no-redef]
 
 from .brain import ProjectBrain
 

@@ -47,6 +47,224 @@ _JSX_NOISE_PAT = re.compile(
     re.IGNORECASE,
 )
 
+_PDG_NOISE_VARS = {
+    "self", "cls", "this", "true", "false", "none", "null", "undefined",
+    "err", "error", "e", "ex", "exc", "i", "j", "k", "x", "v", "fn",
+    "str", "int", "float", "bool", "list", "dict", "set", "tuple", "len",
+    "range", " enumerate", "isinstance", "getattr", "setattr", "hasattr",
+    "type", "super", "print", "return", "await", "async", "const", "let", "var",
+}
+
+
+def compute_multidim_program_slice(
+    selected_lines: list[str],
+    line_start: int,
+    focus_terms: list[str] | None = None,
+    ext: str = ".py",
+) -> dict:
+    """Compute a Multi-Dimensional Program Dependence Graph (PDG) slice over `selected_lines`.
+
+    Traces three orthogonal program-slicing dimensions around statements matching `focus_terms`:
+      1. Dimension Z_bwd (Backward Data-Dependence Slice): `def -> use` chains locating prior
+         statements in the function that define/mutate variables consumed at criterion lines.
+      2. Dimension Z_fwd (Forward Data-Dependence Slice): `def -> use` chains locating downstream
+         statements that read, validate, branch on, or return variables defined at criterion lines.
+      3. Dimension C_guard (Upward Control-Dependence Slice): Enclosing `if`/`elif`/`else`,
+         `try`/`except`/`finally`, `for`/`while`, `with`, or `switch`/`case` guard headers
+         governing the criterion and data-dependent statements.
+    """
+    n = len(selected_lines)
+    terms = [t.lower() for t in (focus_terms or []) if len(t) >= 3]
+    if n == 0 or not terms:
+        return {
+            "seed_lines": set(),
+            "backward_def_lines": set(),
+            "forward_use_lines": set(),
+            "control_guard_lines": set(),
+            "traced_vars": [],
+        }
+
+    defs: list[set[str]] = [set() for _ in range(n)]
+    uses: list[set[str]] = [set() for _ in range(n)]
+    control_parent: dict[int, int] = {}
+
+    parsed_py_ast = False
+    if ext == ".py":
+        import textwrap
+        try:
+            dedented = textwrap.dedent("\n".join(selected_lines))
+            tree = ast.parse(dedented)
+            parent_map: dict[ast.AST, ast.AST] = {}
+            for node in ast.walk(tree):
+                for ch in ast.iter_child_nodes(node):
+                    parent_map[ch] = node
+            _CTRL_TYPES = (
+                ast.If, ast.For, ast.AsyncFor, ast.While,
+                ast.With, ast.AsyncWith, ast.Try, ast.ExceptHandler,
+            )
+            for node in ast.walk(tree):
+                lineno = getattr(node, "lineno", None)
+                if lineno is None or not (1 <= lineno <= n):
+                    continue
+                idx0 = lineno - 1
+                if isinstance(node, ast.Name):
+                    v_low = node.id.lower()
+                    if len(v_low) >= 2 and v_low not in _PDG_NOISE_VARS:
+                        if isinstance(node.ctx, ast.Store):
+                            defs[idx0].add(v_low)
+                        elif isinstance(node.ctx, ast.Load):
+                            uses[idx0].add(v_low)
+                elif isinstance(node, ast.Attribute):
+                    attr_low = node.attr.lower()
+                    if len(attr_low) >= 3 and attr_low not in _PDG_NOISE_VARS:
+                        if isinstance(node.ctx, ast.Store):
+                            defs[idx0].add(attr_low)
+                        elif isinstance(node.ctx, ast.Load):
+                            uses[idx0].add(attr_low)
+                elif isinstance(node, ast.ExceptHandler) and node.name:
+                    eh_low = node.name.lower()
+                    if len(eh_low) >= 2 and eh_low not in _PDG_NOISE_VARS:
+                        defs[idx0].add(eh_low)
+                elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+                    s_val = node.value.strip()
+                    if 3 <= len(s_val) <= 40 and re.match(r"^[A-Za-z_][A-Za-z0-9_.\-]*$", s_val):
+                        uses[idx0].add(s_val.lower())
+                if isinstance(node, ast.stmt) and idx0 not in control_parent:
+                    curr = parent_map.get(node)
+                    while curr is not None:
+                        if isinstance(curr, _CTRL_TYPES):
+                            p_ln = getattr(curr, "lineno", 0) - 1
+                            if 0 <= p_ln < idx0:
+                                control_parent[idx0] = p_ln
+                                break
+                        curr = parent_map.get(curr)
+            parsed_py_ast = True
+        except SyntaxError:
+            parsed_py_ast = False
+
+    if not parsed_py_ast:
+        # Polyglot statement-level def/use & indentation/brace control-dependence analyzer
+        ctrl_stack: list[tuple[int, int]] = []  # (indent_len, line_idx0)
+        _CTRL_HEADER_PAT = re.compile(
+            r"^\s*(?:\}\s*)?(?:if|elif|else\s+if|else|for|while|try|except|catch|finally|with|switch|case)\b"
+        )
+        for i, raw in enumerate(selected_lines):
+            st = raw.strip()
+            if not st or st.startswith(("#", "//", "/*")):
+                continue
+            ind = len(raw) - len(raw.lstrip())
+            while ctrl_stack and ctrl_stack[-1][0] >= ind and not st.startswith(("elif", "else", "except", "catch", "finally", "} else", "} catch")):
+                ctrl_stack.pop()
+            if ctrl_stack and ctrl_stack[-1][1] < i:
+                control_parent[i] = ctrl_stack[-1][1]
+            if _CTRL_HEADER_PAT.match(raw) and (st.endswith((":", "{")) or "case " in st):
+                ctrl_stack.append((ind, i))
+
+            # Extract LHS defs
+            m_js_decl = re.match(r"^\s*(?:export\s+)?(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=", raw)
+            if m_js_decl:
+                v_nm = m_js_decl.group(1).lower()
+                if len(v_nm) >= 2 and v_nm not in _PDG_NOISE_VARS:
+                    defs[i].add(v_nm)
+            m_js_destr = re.match(r"^\s*(?:const|let|var)\s+[\{\[]([^\}\]]+)[\}\]]\s*=", raw)
+            if m_js_destr:
+                for part in m_js_destr.group(1).split(","):
+                    v_nm = part.split(":")[-1].split("=")[0].strip().lower()
+                    if re.match(r"^[a-z_$][\w$]*$", v_nm) and len(v_nm) >= 2 and v_nm not in _PDG_NOISE_VARS:
+                        defs[i].add(v_nm)
+            m_py_lhs = re.match(r"^\s*([a-zA-Z_]\w*(?:\s*,\s*[a-zA-Z_]\w*)*)\s*(?::\s*[^=]+)?=\s*[^=]", raw)
+            if m_py_lhs:
+                for part in m_py_lhs.group(1).split(","):
+                    v_nm = part.strip().lower()
+                    if len(v_nm) >= 2 and v_nm not in _PDG_NOISE_VARS:
+                        defs[i].add(v_nm)
+                rhs_part = raw.split("=", 1)[1]
+            else:
+                rhs_part = raw
+            for id_m in re.findall(r"\b([A-Za-z_][A-Za-z0-9_]{2,})\b", rhs_part):
+                id_low = id_m.lower()
+                if id_low not in _PDG_NOISE_VARS and id_low not in defs[i]:
+                    uses[i].add(id_low)
+            for sk_m in re.findall(r"['\"]([A-Za-z_][A-Za-z0-9_.\-]{2,40})['\"]", rhs_part):
+                uses[i].add(sk_m.lower())
+
+    # Identify slicing criterion seed lines
+    seed_lines: set[int] = set()
+    for i, raw in enumerate(selected_lines):
+        st = raw.strip()
+        if not st or st.startswith(("#", "//")):
+            continue
+        low = st.lower()
+        row_syms = defs[i] | uses[i]
+        if any(t in row_syms or t in low for t in terms):
+            seed_lines.add(i)
+
+    backward_def_lines: set[int] = set()
+    forward_use_lines: set[int] = set()
+    control_guard_lines: set[int] = set()
+    traced_vars: list[str] = []
+
+    # 1. Backward Data-Dependence Slicing (use -> preceding def, up to 2 hops)
+    frontier_bwd = set(seed_lines)
+    for _hop in range(2):
+        next_bwd: set[int] = set()
+        for idx in sorted(frontier_bwd):
+            for v in uses[idx]:
+                for prev in range(idx - 1, -1, -1):
+                    if v in defs[prev]:
+                        if prev not in seed_lines and prev not in backward_def_lines:
+                            backward_def_lines.add(prev)
+                            next_bwd.add(prev)
+                        if v not in traced_vars:
+                            traced_vars.append(v)
+                        break
+        frontier_bwd = next_bwd
+        if not frontier_bwd:
+            break
+
+    # 2. Forward Data-Dependence Slicing (def -> downstream use/return/branch, up to 2 hops)
+    frontier_fwd = set(seed_lines) | backward_def_lines
+    for _hop in range(2):
+        next_fwd: set[int] = set()
+        for idx in sorted(frontier_fwd):
+            for v in defs[idx]:
+                hits_for_v = 0
+                for nxt in range(idx + 1, n):
+                    if v in uses[nxt]:
+                        if nxt not in seed_lines and nxt not in forward_use_lines:
+                            forward_use_lines.add(nxt)
+                            next_fwd.add(nxt)
+                        if v not in traced_vars:
+                            traced_vars.append(v)
+                        hits_for_v += 1
+                        if hits_for_v >= 4:
+                            break
+                    if v in defs[nxt] and v not in uses[nxt]:
+                        break
+        frontier_fwd = next_fwd
+        if not frontier_fwd:
+            break
+
+    # 3. Upward Control-Dependence Slicing (include enclosing if/try/except/for/with headers)
+    active_lines = seed_lines | backward_def_lines | forward_use_lines
+    for idx in list(active_lines):
+        curr = control_parent.get(idx)
+        depth = 0
+        while curr is not None and depth < 3:
+            if curr not in seed_lines:
+                control_guard_lines.add(curr)
+            curr = control_parent.get(curr)
+            depth += 1
+
+    return {
+        "seed_lines": seed_lines,
+        "backward_def_lines": backward_def_lines,
+        "forward_use_lines": forward_use_lines,
+        "control_guard_lines": control_guard_lines,
+        "traced_vars": traced_vars[:12],
+    }
+
+
 def slice_lines(
     root: Path,
     rel_path: str,
@@ -60,10 +278,10 @@ def slice_lines(
     """Read [line_start..line_end] (1-indexed, inclusive) from root/rel_path,
     prefixed with line numbers.
 
-    When the range exceeds `max_lines`, performs smart focus-window folding
-    (keeping the signature header + pinned causal/contract lines + high-signal
-    windows matching `focus_terms`, calls, timers, and control flow, while
-    collapsing boilerplate/JSX gaps) and injects delta-p=1 inline annotations.
+    When the range exceeds `max_lines`, performs Multi-Dimensional Program Slicing
+    (tracing AST backward `def -> use` data dependencies, forward `def -> use`
+    consumers, and upward control-flow guards) combined with smart focus-window
+    folding and delta-p=1 inline annotations.
     """
     full_path = root / rel_path
     try:
@@ -71,9 +289,6 @@ def slice_lines(
     except OSError:
         from .store import SQLiteIndexStore
         blob_txt = SQLiteIndexStore(root / ".projectbrain.db").get_source_blob(rel_path)
-        if not blob_txt:
-            return ""
-        lines = blob_txt.splitlines()
         if not blob_txt:
             return ""
         lines = blob_txt.splitlines()
@@ -98,8 +313,17 @@ def slice_lines(
             _emit_kept_line(i, out_short)
         return "\n".join(out_short)
 
-    # Smart Focus-Window Folding for long functions / React monoliths
+    # Multi-Dimensional Program Dependence Slicing (Backward Data + Forward Data + Control Guards)
     terms = list(dict.fromkeys(t.lower() for t in (focus_terms or []) if len(t) >= 3))
+    pdg_slice = compute_multidim_program_slice(
+        selected,
+        line_start,
+        terms,
+        ext=Path(rel_path).suffix.lower(),
+    )
+    bwd_def_set = pdg_slice["backward_def_lines"]
+    fwd_use_set = pdg_slice["forward_use_lines"]
+    ctrl_guard_set = pdg_slice["control_guard_lines"]
     keep = [False] * total_len
 
     # Always keep the first head_n lines (signature + initial guardrails) and last tail_n lines
@@ -121,6 +345,15 @@ def slice_lines(
             for nb in (p_idx - 1, p_idx + 1):
                 if 0 <= nb < total_len and sum(1 for k in keep if k) < max_lines - 2:
                     keep[nb] = True
+    # Pin enclosing AST control-dependence guards and primary backward/forward data-dependence lines
+    pdg_budget = max(4, max_lines // 3)
+    pdg_pinned = 0
+    for g_idx in sorted(ctrl_guard_set) + sorted(bwd_def_set) + sorted(fwd_use_set):
+        if pdg_pinned >= pdg_budget or sum(1 for k in keep if k) >= max_lines - 4:
+            break
+        if 0 <= g_idx < total_len and not keep[g_idx]:
+            keep[g_idx] = True
+            pdg_pinned += 1
     # Compute term frequency inside the function to discount ubiquitous local variable names
     low_lines = [ln.lower() for ln in selected]
     term_weights: dict[str, float] = {}
@@ -129,7 +362,7 @@ def slice_lines(
         df = sum(1 for low in low_lines if t in low)
         term_weights[t] = 0.6 if df > freq_cap else 2.5
 
-    # Score remaining lines by keyword matches and high-signal control/timing patterns
+    # Score remaining lines by keyword matches, PDG data/control dependence, and control/timing patterns
     _CONSOLE_PAT = re.compile(r"^\s*console\.(log|warn|error|info|debug)\b")
     line_scores = [0.0] * total_len
     for i, line in enumerate(selected):
@@ -152,6 +385,12 @@ def slice_lines(
             if t in low:
                 # Discount matches on pure English prose lines inside template strings or CSS noise
                 sc += (term_weights[t] if not is_style_noise else 0.4) if is_code_like else 0.2
+        if i in bwd_def_set:
+            sc += 6.5
+        if i in fwd_use_set:
+            sc += 6.0
+        if i in ctrl_guard_set:
+            sc += 5.5
         if _IMPORTANT_CODE_PAT.search(line):
             sc += 5.0
         if _UPPER_CONST_PAT.search(line) and is_code_like:
@@ -1498,6 +1737,25 @@ def extract_4d_coordinate_matrix(
             i += 1
             continue
 
+        # 1b. Module-level or Class-level Config / Descriptor / Constant STATE declarations
+        m_st_decl = re.match(
+            r"^([A-Z][A-Z0-9_]{2,}|[a-z_][a-z0-9_]*)\s*(?::\s*[^=]+)?=\s*(ImmutableDict\b|ConfigAttribute\b|environ_property\b|Field\b|Column\b|mapped_column\b|\{)",
+            st,
+        )
+        if m_st_decl and len(lines[i]) - len(lines[i].lstrip()) <= 4:
+            attr_nm = m_st_decl.group(1)
+            rhs_kind = m_st_decl.group(2)
+            if attr_nm.isupper() or "config" in attr_nm.lower() or rhs_kind in ("ImmutableDict", "ConfigAttribute", "environ_property", "Field", "Column", "mapped_column"):
+                if "{" in st and "}" not in st:
+                    end_i = _find_balanced_end(lines, i, "{", "}", max_scan=90)
+                elif "(" in st and ")" not in st:
+                    end_i = _find_balanced_end(lines, i, "(", ")", max_scan=90)
+                else:
+                    end_i = i
+                raw_blocks.append(("STATE", f"state:{attr_nm}", lnum, end_i + 1))
+                i = end_i + 1
+                continue
+
         # 2. Reactive EFFECT / Memo / Callback blocks
         m_eff = re.search(r"\b(useEffect|useLayoutEffect|useMemo|useCallback)\s*\(", st)
         if m_eff:
@@ -1715,20 +1973,28 @@ def extract_4d_coordinate_matrix(
             tbl = m_sql_r.group(1)
             if tbl not in z_write and tbl not in z_read:
                 z_read.append(tbl)
-        # Key-Value Storage, Dict/Session/Cache/Env State, and Event Channels (Python & JS/TS)
+        # Key-Value Storage, Dict/Config/Session/Cache/Env State, and Event Channels (Python & JS/TS)
+        if role == "STATE" and scope.startswith("state:"):
+            st_attr = scope.split(":", 1)[1]
+            if st_attr not in z_write:
+                z_write.append(st_attr)
+            for m_cfg_k in re.finditer(r"['\"]([A-Z][A-Z0-9_]{2,40})['\"]", chunk):
+                cfg_k = m_cfg_k.group(1)
+                if cfg_k not in z_write:
+                    z_write.append(cfg_k)
         for m_kv in re.finditer(
-            r"(?:getItem|setItem|removeItem|[a-zA-Z_]\w*\.(?:get|set|put|write|update|delete|setItem|getItem)|os\.getenv)\(\s*['\"]([a-zA-Z0-9_.\-:]{2,40})['\"]",
+            r"(?:getItem|setItem|removeItem|[a-zA-Z_][\w.]*\.(?:get|set|put|write|update|delete|setdefault|pop|setItem|getItem)|os\.getenv|getattr|setattr|ConfigAttribute)\(\s*['\"]([a-zA-Z0-9_.\-:]{2,40})['\"]",
             chunk,
         ):
             k_name = m_kv.group(1)
             full_m = m_kv.group(0)
-            if any(w in full_m for w in (".set", "setItem", "removeItem", ".put", ".write", ".update", ".delete")):
+            if any(w in full_m for w in (".set", "setItem", "removeItem", ".put", ".write", ".update", ".delete", "setattr", "ConfigAttribute")):
                 if k_name not in z_write:
                     z_write.append(k_name)
             elif k_name not in z_read:
                 z_read.append(k_name)
         for m_dk in re.finditer(
-            r"\b(?:state|store|session|cache|db|ledger|context|os\.environ)\[\s*['\"]([^'\"]{2,40})['\"]\s*\](\s*=[^=])?",
+            r"\b(?:[a-zA-Z_][\w.]*)\[\s*['\"]([a-zA-Z_][a-zA-Z0-9_.\-:]{2,40})['\"]\s*\](\s*=[^=])?",
             chunk,
         ):
             k_name = m_dk.group(1)
@@ -1747,8 +2013,8 @@ def extract_4d_coordinate_matrix(
             ev_key = f"evt:{m_ev_r.group(1)}"
             if ev_key not in z_read:
                 z_read.append(ev_key)
-        # Python self.<attr> reads
-        for m_py_r in re.finditer(r"\bself\.([a-zA-Z_]\w*)\b(?!\s*\()", chunk):
+        # Python self.<attr> / app.<attr> / current_app.<attr> / config.<attr> reads
+        for m_py_r in re.finditer(r"\b(?:self|cls|app|current_app|config|settings|request|session|g)\.([a-zA-Z_]\w*)\b(?!\s*\()", chunk):
             attr = m_py_r.group(1)
             if not attr.startswith("_") and attr not in z_write and attr not in z_read:
                 z_read.append(attr)
@@ -1860,8 +2126,13 @@ def extract_4d_coordinate_matrix(
             if expected_res_keys:
                 hc_entry["expected_keys"] = expected_res_keys[:8]
             http_calls.append(hc_entry)
+        _http_client_rx = (
+            r"\b(?:requests|httpx)\.(get|post|put|delete|patch)\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?[`'\"](?:\$\{[^}]+\})?(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]"
+            if ext.lower() == ".py"
+            else r"\b(?:axios|api|client|http)\.(get|post|put|delete|patch)\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?[`'\"](?:\$\{[^}]+\})?(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]"
+        )
         for m_ax in re.finditer(
-            r"\b(?:axios|api|client|http)\.(get|post|put|delete|patch)\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?[`'\"](?:\$\{[^}]+\})?(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]",
+            _http_client_rx,
             chunk,
             re.IGNORECASE,
         ):

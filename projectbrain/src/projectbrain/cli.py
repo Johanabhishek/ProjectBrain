@@ -207,7 +207,7 @@ def _run_init(
     root_path: Path,
     write_mcp: bool = True,
     write_rules: bool = True,
-    ide: str = "all",
+    ide: str = "auto",
     write_hooks: bool = False,
 ) -> dict:
     """One-command setup: index repo, update .gitignore, wire MCP config, and write agent rules."""
@@ -216,6 +216,10 @@ def _run_init(
 
     actions: list[str] = ["indexed_repository"]
     resolved_root = str(root_path.resolve())
+    has_cursor = (root_path / ".cursor").exists()
+    has_vscode = (root_path / ".vscode").exists()
+    has_antigravity = (root_path / ".agents").exists()
+    has_claude = (root_path / ".claude").exists() or (root_path / "CLAUDE.md").exists()
 
     # 1. Update .gitignore to ignore cache & graph files while keeping memory.json tracked
     gitignore = root_path / ".gitignore"
@@ -246,19 +250,19 @@ def _run_init(
         )
         actions.append("created_.gitignore")
 
-    # 2. Write MCP configurations (.mcp.json, .cursor/mcp.json, .vscode/mcp.json)
+    # 2. Write MCP configurations (.mcp.json, and IDE-specific mcp.json when requested or detected)
     if write_mcp:
         stdio_cfg = {
             "command": "projectbrain-mcp",
             "args": [resolved_root],
         }
-        if ide in ("all", "claude", "antigravity"):
+        if ide in ("auto", "all", "claude", "antigravity"):
             _write_or_merge_json(root_path / ".mcp.json", "mcpServers", "projectbrain", stdio_cfg)
             actions.append("configured_.mcp.json")
-        if ide in ("all", "cursor"):
+        if ide in ("all", "cursor") or (ide == "auto" and has_cursor):
             _write_or_merge_json(root_path / ".cursor" / "mcp.json", "mcpServers", "projectbrain", stdio_cfg)
             actions.append("configured_.cursor/mcp.json")
-        if ide in ("all", "vscode"):
+        if ide in ("all", "vscode") or (ide == "auto" and has_vscode):
             vscode_cfg = {
                 "type": "stdio",
                 "command": "projectbrain-mcp",
@@ -267,21 +271,21 @@ def _run_init(
             _write_or_merge_json(root_path / ".vscode" / "mcp.json", "servers", "projectbrain", vscode_cfg)
             actions.append("configured_.vscode/mcp.json")
 
-    # 3. Write Agent Rule files across IDEs (Antigravity, Claude Code, Cursor, VS Code Copilot/Cline)
+    # 3. Write Agent Rule files (AGENTS.md by default; IDE-specific rule files when requested or detected)
     if write_rules:
         _write_or_append_rule(root_path / "AGENTS.md", _AGENT_RULE_CONTENT)
         actions.append("wrote_AGENTS.md")
 
-        if ide in ("all", "antigravity"):
+        if ide in ("all", "antigravity") or (ide == "auto" and has_antigravity):
             rule_file = root_path / ".agents" / "rules" / "projectbrain.md"
             _write_or_append_rule(rule_file, _AGENT_RULE_CONTENT)
             actions.append("wrote_.agents/rules/projectbrain.md")
 
-        if ide in ("all", "claude"):
+        if ide in ("all", "claude") or (ide == "auto" and has_claude):
             _write_or_append_rule(root_path / "CLAUDE.md", _AGENT_RULE_CONTENT)
             actions.append("wrote_CLAUDE.md")
 
-        if ide in ("all", "cursor"):
+        if ide in ("all", "cursor") or (ide == "auto" and has_cursor):
             cursor_rule = root_path / ".cursor" / "rules" / "projectbrain.mdc"
             cursor_rule.parent.mkdir(parents=True, exist_ok=True)
             if cursor_rule.exists():
@@ -290,7 +294,7 @@ def _run_init(
                 cursor_rule.write_text(_CURSOR_MDC_FRONTMATTER + _AGENT_RULE_CONTENT, encoding="utf-8")
             actions.append("wrote_.cursor/rules/projectbrain.mdc")
 
-        if ide in ("all", "vscode"):
+        if ide in ("all", "vscode") or (ide == "auto" and has_vscode):
             _write_or_append_rule(root_path / ".github" / "copilot-instructions.md", _AGENT_RULE_CONTENT)
             _write_or_append_rule(root_path / ".clinerules", _AGENT_RULE_CONTENT)
             actions.append("wrote_.github/copilot-instructions.md_and_.clinerules")
@@ -345,9 +349,9 @@ def main(argv: list[str] | None = None) -> int:
     init_parser.add_argument("--hooks", action="store_true", help="Write PreToolUse guard hooks (.claude/settings.local.json)")
     init_parser.add_argument(
         "--ide",
-        choices=["all", "antigravity", "claude", "cursor", "vscode"],
-        default="all",
-        help="Target IDE/agent environment to configure (default: all)",
+        choices=["auto", "all", "antigravity", "claude", "cursor", "vscode"],
+        default="auto",
+        help="Target IDE/agent environment to configure (default: auto — writes .mcp.json + AGENTS.md + detected IDEs)",
     )
     sub.add_parser("index", help="Build and cache the index for the project")
 

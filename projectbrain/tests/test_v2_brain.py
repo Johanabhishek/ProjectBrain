@@ -185,15 +185,23 @@ def test_repo_memory_persistence_and_ast_staleness(tmp_project):
 
 
 def test_cli_init_creates_gitignore_mcp_and_agent_rules(tmp_project, capsys):
+    # 1. Default (--ide auto) creates minimal root files (.gitignore, .mcp.json, AGENTS.md) without IDE sprawl
     rc = cli.main(["--path", str(tmp_project), "init"])
     assert rc == 0
     out = json.loads(capsys.readouterr().out)
     assert out["status"] == "initialized"
+    assert out["ide"] == "auto"
     assert (tmp_project / ".gitignore").exists()
     assert ".projectbrain.json" in (tmp_project / ".gitignore").read_text(encoding="utf-8")
-    # Antigravity + Claude root MCP & rules
     assert (tmp_project / ".mcp.json").exists()
     assert (tmp_project / "AGENTS.md").exists()
+    assert not (tmp_project / ".cursor").exists()
+    assert not (tmp_project / ".vscode").exists()
+
+    # 2. Explicit --ide all creates all IDE configs & rules
+    rc_all = cli.main(["--path", str(tmp_project), "init", "--ide", "all"])
+    assert rc_all == 0
+    capsys.readouterr()
     assert (tmp_project / ".agents" / "rules" / "projectbrain.md").exists()
     assert (tmp_project / "CLAUDE.md").exists()
     # Cursor MCP & .mdc rule
@@ -204,3 +212,113 @@ def test_cli_init_creates_gitignore_mcp_and_agent_rules(tmp_project, capsys):
     assert "projectbrain" in vscode_mcp["servers"]
     assert (tmp_project / ".github" / "copilot-instructions.md").exists()
     assert (tmp_project / ".clinerules").exists()
+
+
+def test_multidim_program_slice_backward_forward_and_control_guards(tmp_path):
+    from projectbrain.slicer import compute_multidim_program_slice, slice_lines
+
+    # Construct a 62-line function where:
+    # - 0-idx 2 (L3) defines `signing_key = derive_key(raw_secret)` (backward data dependency of L35)
+    # - L4..L32 are unrelated metrics/logging lines
+    # - 0-idx 32 (L33) is an enclosing control guard `if request_authenticated:`
+    # - 0-idx 34 (L35) is the slicing criterion: `token_payload = sign_payload(data, signing_key)`
+    # - L36..L59 are unrelated telemetry lines
+    # - 0-idx 59 (L60) uses `token_payload`: `return verify_and_emit(token_payload)` (forward data dependency of L35)
+    lines = [
+        "def process_secure_token(raw_secret, data, request_authenticated):",
+        "    metrics_counter = 0",
+        "    signing_key = derive_key(raw_secret)",
+    ]
+    for i in range(4, 33):
+        lines.append(f"    metrics_counter += {i}")
+    lines.append("    if request_authenticated:")
+    lines.append("        audit_step = 1")
+    lines.append("        token_payload = sign_payload(data, signing_key)")
+    for i in range(36, 60):
+        lines.append(f"        audit_step += {i}")
+    lines.append("        return verify_and_emit(token_payload)")
+    lines.append("    return None")
+
+    pdg = compute_multidim_program_slice(
+        lines,
+        line_start=1,
+        focus_terms=["sign_payload"],
+    )
+    assert 34 in pdg["seed_lines"]
+    assert 2 in pdg["backward_def_lines"], "Backward PDG slice must trace signing_key back to L3 (idx 2)"
+    assert 59 in pdg["forward_use_lines"], "Forward PDG slice must trace token_payload forward to L60 (idx 59)"
+    assert 32 in pdg["control_guard_lines"], "Upward control-dependence slice must capture enclosing if-guard at L33 (idx 32)"
+
+    src_file = tmp_path / "auth_service.py"
+    src_file.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    sliced = slice_lines(
+        tmp_path,
+        "auth_service.py",
+        line_start=1,
+        line_end=len(lines),
+        max_lines=22,
+        focus_terms=["sign_payload"],
+    )
+    assert "signing_key = derive_key(raw_secret)" in sliced
+    assert "if request_authenticated:" in sliced
+    assert "token_payload = sign_payload(data, signing_key)" in sliced
+    assert "return verify_and_emit(token_payload)" in sliced
+    assert "expand: brain_slice" in sliced  # Unrelated telemetry lines were collapsed
+
+
+def test_flask_methods_tuple_and_secret_key_state_slicing(tmp_path):
+    (tmp_path / "src" / "flask_app").mkdir(parents=True)
+    (tmp_path / "tests").mkdir(parents=True)
+
+    app_py = tmp_path / "src" / "flask_app" / "app.py"
+    app_py.write_text(
+        "class ConfigAttribute:\n"
+        "    def __init__(self, name):\n"
+        "        self.name = name\n\n"
+        "class App:\n"
+        "    default_config = {\n"
+        '        "DEBUG": False,\n'
+        '        "SECRET_KEY": None,\n'
+        "    }\n"
+        '    secret_key = ConfigAttribute("SECRET_KEY")\n\n'
+        '    @bp.route("/<int:id>/update", methods=("GET", "POST"))\n'
+        "    def update(self, id):\n"
+        "        return id\n",
+        encoding="utf-8",
+    )
+
+    sessions_py = tmp_path / "src" / "flask_app" / "sessions.py"
+    sessions_py.write_text(
+        "def get_signing_serializer(app):\n"
+        "    if not app.secret_key:\n"
+        "        return None\n"
+        "    return [app.secret_key]\n",
+        encoding="utf-8",
+    )
+
+    test_py = tmp_path / "tests" / "test_basic.py"
+    test_py.write_text(
+        "def test_login(client):\n"
+        '    client.post("/<int:id>/update", data={"title": "x"})\n'
+        '    assert client.application.secret_key is None\n',
+        encoding="utf-8",
+    )
+
+    b = ProjectBrain(tmp_path)
+    b.index()
+
+    # 1. Verify tuple methods=("GET", "POST") extracted both GET and POST routes
+    app_info = b._index["src/flask_app/app.py"]
+    routes = {(r["method"], r["path"]) for r in app_info.get("routes", [])}
+    assert ("GET", "/<int:id>/update") in routes
+    assert ("POST", "/<int:id>/update") in routes
+
+    # 2. Verify SECRET_KEY query finds both ConfigAttribute("SECRET_KEY") and get_signing_serializer
+    #    without pulling in tests/test_basic.py or emitting false-positive contract warnings
+    dossier_res = b.compile_dossier("where is SECRET_KEY used")
+    dossier_md = dossier_res["markdown"]
+    assert 'ConfigAttribute("SECRET_KEY")' in dossier_md
+    assert "get_signing_serializer" in dossier_md
+    assert "tests/test_basic.py" not in dossier_md
+    assert "CONTRACT WARNING" not in dossier_md
+

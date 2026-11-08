@@ -201,6 +201,7 @@ STOPWORDS = {
     "in", "on", "at", "to", "for", "of", "and", "or", "but", "not",
     "why", "am", "getting", "get", "how", "what", "when", "where", "which",
     "this", "that", "it", "its", "with", "from", "by", "about", "into",
+    "used", "uses", "using",
 }
 
 
@@ -983,8 +984,107 @@ class ProjectBrain:
                             if re.search(r"\b" + re.escape(raw_nm) + r"\b", clean_task_for_search):
                                 explicit_nodes.append(nid)
 
+            # 1b. Multi-Dimensional Data/Config/Constant Slicing: if the task names an explicit
+            # SCREAMING_SNAKE_CASE or snake_case constant/config key (e.g. SECRET_KEY) that is a
+            # state/config channel rather than a function/class definition name, slice its
+            # declaration cells and consumer functions across production files.
+            explicit_data_keys: list[str] = []
+            for m_dk_tok in re.findall(r"\b([A-Z][A-Z0-9]+_[A-Z0-9_]+|[a-z][a-z0-9]*_[a-z0-9_]+)\b|`([A-Za-z_][A-Za-z0-9_]{3,})`", clean_task_for_search):
+                dk_cand = (m_dk_tok[0] or m_dk_tok[1]).strip()
+                if len(dk_cand) >= 5 and dk_cand.lower() not in STOPWORDS:
+                    if not any(
+                        (self._graph.nodes.get(en, {}).get("name") or "").lower() == dk_cand.lower()
+                        for en in explicit_nodes
+                    ):
+                        if dk_cand not in explicit_data_keys:
+                            explicit_data_keys.append(dk_cand)
+            explicit_state_files: set[str] = set()
+            if explicit_data_keys and not explicit_nodes and self._graph:
+                q_wants_tests_dk = bool(set(t_kw) & _TEST_QUERY_TERMS)
+                dk_fn_cands: list[tuple[float, str, str, str, bool]] = []
+                dk_state_slices: list[tuple[float, str, int, int, str]] = []
+                for dk in explicit_data_keys[:2]:
+                    dk_low = dk.lower()
+                    for rp_dk, info_dk in self._index.items():
+                        if not q_wants_tests_dk and (
+                            _is_test_file(rp_dk)
+                            or bool({p.lower() for p in Path(rp_dk).parts[:-1]} & DEPRIORITY_DIRS)
+                        ):
+                            continue
+                        if (
+                            dk_low not in self._token_sets.get(rp_dk, set())
+                            and dk_low not in self._body_token_sets.get(rp_dk, set())
+                            and dk_low not in self._blobs.get(rp_dk, "")
+                        ):
+                            continue
+                        raw_txt_dk = self._get_file_text(rp_dk) or ""
+                        if dk not in raw_txt_dk and dk_low not in raw_txt_dk.lower():
+                            continue
+                        flines_dk = raw_txt_dk.splitlines()
+                        # Check functions that directly read/write dk or dk_low
+                        beh_dk = self._behaviors.get(rp_dk, {})
+                        rts_dk = info_dk.get("routes", [])
+                        c4d_dk = info_dk.get("cells_4d", [])
+                        covered_dk_lines: set[int] = set()
+                        for fn_dk in info_dk.get("functions", []):
+                            ls_d, le_d = fn_dk.get("line_start", 1), fn_dk.get("line_end", 1)
+                            fn_txt_d = "\n".join(flines_dk[max(0, ls_d - 1) : min(len(flines_dk), le_d)])
+                            if dk in fn_txt_d or re.search(rf"\b{re.escape(dk_low)}\b", fn_txt_d.lower()):
+                                for cln in range(ls_d, le_d + 1):
+                                    covered_dk_lines.add(cln)
+                                sc_d = self._score_symbol_for_query(fn_dk, t_kw + [dk_low], beh_dk, rts_dk, c4d_dk)
+                                is_code_access = bool(
+                                    f".{dk_low}" in fn_txt_d.lower()
+                                    or f'"{dk}"' in fn_txt_d
+                                    or f"'{dk}'" in fn_txt_d
+                                    or re.search(rf"(?:self|app|config|settings|cls)\.{re.escape(dk_low)}\b", fn_txt_d.lower())
+                                )
+                                if is_code_access:
+                                    sc_d += 10.0
+                                nid_d = fn_id(rp_dk, fn_dk["name"], fn_dk.get("parent_class"))
+                                dk_fn_cands.append((sc_d, nid_d, rp_dk, dk, is_code_access))
+                        # Also check class/module-level declarations (outside functions) where dk is defined/configured
+                        for ln_i, ln_str in enumerate(flines_dk, start=1):
+                            if ln_i in covered_dk_lines:
+                                continue
+                            if dk in ln_str or re.search(rf"\b{re.escape(dk_low)}\b\s*(?::\s*[^=]+)?=", ln_str.lower()):
+                                st_ln = ln_str.strip()
+                                if st_ln.startswith(("#", "//", "*", '"""', "'''")):
+                                    continue
+                                is_dict_kv = bool(re.match(rf"^['\"]{re.escape(dk)}['\"]\s*:", st_ln))
+                                if st_ln.startswith(('"', "'")) and not is_dict_kv:
+                                    continue
+                                is_decl = ("=" in ln_str) or is_dict_kv
+                                sc_st = (11.0 if "=" in ln_str else 10.0) if is_decl else 5.0
+                                w_s = max(1, ln_i - 2)
+                                w_e = min(len(flines_dk), ln_i + 6)
+                                dk_state_slices.append((sc_st, rp_dk, w_s, w_e, f"defines/configures `{dk}` @L{ln_i}"))
+                dk_state_slices.sort(key=lambda x: x[0], reverse=True)
+                for _, rp_st, ws_st, we_st, rsn_st in dk_state_slices[:3]:
+                    if any(sr == rp_st and ss <= ws_st and we_st <= se for sr, ss, se in seen_spans):
+                        continue
+                    primary_files.add(rp_st)
+                    explicit_state_files.add(rp_st)
+                    seen_spans.append((rp_st, ws_st, we_st))
+                    st_code = slice_lines(self.root, rp_st, ws_st, we_st, max_lines=14, focus_terms=t_kw)
+                    if st_code:
+                        matched_4d_cells_count += 1
+                        emitted_by_file.setdefault(rp_st, []).extend(extract_emitted_intervals(st_code))
+                        sec.append(f"### [{rp_st} (L{ws_st}-L{we_st}) — {rsn_st}]")
+                        sec.append(st_code)
+                has_code_dk = any(x[4] for x in dk_fn_cands)
+                if has_code_dk:
+                    dk_fn_cands = [x for x in dk_fn_cands if x[4]]
+                dk_fn_cands.sort(key=lambda x: x[0], reverse=True)
+                for _, nid_d, rp_d, dk_nm, _ in dk_fn_cands[:3]:
+                    primary_files.add(rp_d)
+                    explicit_state_files.add(rp_d)
+                    _add_node_slice(nid_d, f"reads/uses `{dk_nm}` in {rp_d}", t_kw + [dk_nm.lower()], sec, max_l=54, max_g=6)
+                    if nid_d not in explicit_nodes:
+                        explicit_nodes.append(nid_d)
+
             # Count explicit matches per file so secondary giant components don't hijack primary focus
-            exp_by_file: dict[str, list[str]] = {}
+            exp_by_file: dict[str, list[str]] = {rp_s: [f"state:{rp_s}"] for rp_s in explicit_state_files}
             for enid in explicit_nodes:
                 if self._graph and self._graph.nodes.get(enid, {}).get("type") in ("fn", "cls"):
                     erel = self._graph.nodes[enid].get("rel_path", "")
@@ -1206,7 +1306,7 @@ class ProjectBrain:
                         ):
                             continue
                         dedup_scored.append(item)
-                    top_k = 1 if (had_initial_explicit or file_rank > 0 or len(tasks) >= 3) else 2
+                    top_k = 1 if (had_initial_explicit or file_rank > 1 or len(tasks) >= 3) else 2
                     multi_file_budget = (len(tasks) >= 3 and len(ranked) >= 3)
                     for rank_idx, (sc, kind, sym) in enumerate(dedup_scored[:top_k]):
                         nid = fn_id(rp, sym["name"], sym.get("parent_class")) if kind == "fn" else cls_id(rp, sym["name"])
@@ -1215,6 +1315,7 @@ class ProjectBrain:
                         rank_max_g = 6 if multi_file_budget else (16 if file_rank == 0 else 8)
                         _add_node_slice(nid, f"top match in {rp}", t_kw, sec, max_l=rank_max_l, max_g=rank_max_g)
                         if (not had_executable_explicit or rp in explicit_task_files) and nid not in explicit_nodes and len(explicit_nodes) < 6:
+                            explicit_nodes.append(nid)
                             added_for_sym = 0
                             for ei_c in self._graph._radj.get(nid, []):
                                 ec = self._graph.edges[ei_c]
@@ -1268,8 +1369,9 @@ class ProjectBrain:
                             continue
                         chain_lines.append(f"- `{seed_id}` -[{e1['type']} (L{e1.get('line', '?')})]-> `{dst1}`")
                         dst1_name = (dst1_nd.get("name") or "").lower()
+                        dst1_toks = set(_tokenize_symbol(dst1_name))
                         dst1_in_deg = len(self._graph._radj.get(dst1, []))
-                        dst1_kw_overlap = any(w in dst1_name or w[:4] in dst1_name for w in t_kw if len(w) >= 4)
+                        dst1_kw_overlap = any(w in dst1_name or w[:4] in dst1_name or w[:3] in dst1_toks for w in t_kw if len(w) >= 4)
                         if dst1_in_deg >= 6 and not dst1_kw_overlap:
                             continue
                         h1_max_l = 14 if (dst1_in_deg >= 4 and not dst1_kw_overlap) else 42
@@ -1283,8 +1385,9 @@ class ProjectBrain:
                                 dst2_rel = dst2_nd.get("rel_path", "")
                                 chain_lines.append(f"  - `{dst1}` -[calls (L{e2.get('line', '?')})]-> `{dst2}`")
                                 dst2_name = (dst2_nd.get("name") or "").lower()
+                                dst2_toks = set(_tokenize_symbol(dst2_name))
                                 dst2_in_deg = len(self._graph._radj.get(dst2, []))
-                                dst2_kw_overlap = any(w in dst2_name or w[:4] in dst2_name for w in t_kw if len(w) >= 4)
+                                dst2_kw_overlap = any(w in dst2_name or w[:4] in dst2_name or w[:3] in dst2_toks for w in t_kw if len(w) >= 4)
                                 if dst2_in_deg >= 5 and not dst2_kw_overlap:
                                     continue
                                 if dst2_rel != dst1_rel:
@@ -1407,10 +1510,16 @@ class ProjectBrain:
                     for ei_sf in self._graph._adj.get(seed_id, []):
                         esf = self._graph.edges[ei_sf]
                         if esf["type"] in ("state_flow", "http_flow"):
+                            dst_rel = self._graph.nodes.get(esf["dst"], {}).get("rel_path", "")
+                            if not q_wants_tests_bwd and dst_rel and _is_test_file(dst_rel):
+                                continue
                             chain_lines.append(f"- `{seed_id}` -[{esf['type']}: {esf.get('reason', '')}]-> `{esf['dst']}`")
                     for ei_sfr in self._graph._radj.get(seed_id, []):
                         esfr = self._graph.edges[ei_sfr]
                         if esfr["type"] in ("state_flow", "http_flow"):
+                            src_rel = self._graph.nodes.get(esfr["src"], {}).get("rel_path", "")
+                            if not q_wants_tests_bwd and src_rel and _is_test_file(src_rel):
+                                continue
                             chain_lines.append(f"- `{esfr['src']}` -[{esfr['type']}: {esfr.get('reason', '')}]-> `{seed_id}`")
 
                 # Multiplex Personalized PageRank (PPR) + Causal Symptom Chop across 4-Layer Graph
@@ -1445,7 +1554,10 @@ class ProjectBrain:
                     if chop_nid not in existing_exp_ids and chop_nid not in seen_slices:
                         expanded_nodes.insert(0, (chop_nid, f"Causal Symptom Chop origin ({chop_sym})", t_kw, 32, 0))
                         existing_exp_ids.add(chop_nid)
-                for p_nid, p_prob, p_rsn in ppr_results[:4]:
+                for p_nid, p_prob, p_rsn in ppr_results[:6]:
+                    p_rel = self._graph.nodes.get(p_nid, {}).get("rel_path", "")
+                    if not q_wants_tests_bwd and p_rel and _is_test_file(p_rel):
+                        continue
                     if p_nid not in existing_exp_ids and p_nid not in seen_slices and (
                         "http_flow" in p_rsn or "table:" in p_rsn or p_prob >= 0.085
                     ):
@@ -1456,7 +1568,7 @@ class ProjectBrain:
                     sec.append("### Static AST Call, State-Channel & Interprocedural Flow Edges")
                     sec.extend(list(dict.fromkeys(chain_lines))[:12])
                 emitted_hops = 99 if (zoom and had_initial_explicit) else 0
-                max_hops_allowed = (2 if not had_initial_explicit else 1) if (zoom or monolith_4d_cells_count > 0 or len(filtered_explicit) >= 2) else 2
+                max_hops_allowed = (3 if not had_initial_explicit else 1) if (zoom or monolith_4d_cells_count > 0 or len(filtered_explicit) >= 2) else 3
 
                 # Submodular Marginal Information Gain per Unseen Token Optimizer
                 covered_features: set[str] = set()
@@ -1495,8 +1607,9 @@ class ProjectBrain:
 
                         # Compute marginal epistemic gain ?I(u | U_cov)
                         gain = 0.0
+                        nd_tokens = set(_tokenize_symbol(nd_nm))
                         for w in t_kw:
-                            if len(w) >= 4 and (w in nd_nm or w[:4] in nd_nm):
+                            if len(w) >= 4 and (w in nd_nm or w[:4] in nd_nm or w[:3] in nd_tokens):
                                 feat_k = f"kw:{w}"
                                 gain += (6.0 if feat_k not in covered_features else 1.5) * self._idf.get(w, 1.0)
                         for zw in nd_obj.get("local_z_write", []):
@@ -1508,7 +1621,9 @@ class ProjectBrain:
                         feat_file = f"file:{nd_rel}"
                         if nd_rel in top3_query_files:
                             gain += 5.0 if feat_file not in covered_features else 1.0
-                        if not c_rsn.startswith(("2-hop", "3-hop")):
+                        if c_rsn.startswith("called by "):
+                            gain += 6.5
+                        elif not c_rsn.startswith(("2-hop", "3-hop")):
                             gain += 3.5
                         if "http_flow" in c_rsn or "state_flow" in c_rsn:
                             gain += 4.5
@@ -1547,12 +1662,13 @@ class ProjectBrain:
                         continue
                     end_node = self._graph.nodes[enid]
                     enm = (end_node.get("name") or "").lower()
+                    enm_tokens = set(_tokenize_symbol(enm))
                     erel = end_node.get("rel_path", "")
                     espan = 12 if m_cl else (end_node.get("line_end", 1) - end_node.get("line_start", 1))
                     sec_lines_now = sum(len(x.splitlines()) for x in sec)
                     is_chop = "Causal Symptom Chop" in ereason
-                    kw_direct = is_chop or bool(m_cl) or any(w in enm or w[:4] in enm for w in t_kw if len(w) >= 4) or ("http_flow" in ereason) or ("table:" in ereason)
-                    sec_cap_direct = 220 if len(tasks) >= 3 else 310
+                    kw_direct = is_chop or bool(m_cl) or any(w in enm or w[:4] in enm or w[:3] in enm_tokens for w in t_kw if len(w) >= 4) or ("http_flow" in ereason) or ("table:" in ereason)
+                    sec_cap_direct = 220 if len(tasks) >= 3 else 360
                     if (emitted_hops < max_hops_allowed or is_chop or bool(m_cl)) and (sec_lines_now < 140 or (kw_direct and sec_lines_now < sec_cap_direct)) and espan <= 120:
                         _add_node_slice(enid, ereason, ekw, sec, max_l=min(emax_l, 30 if is_chop else 24), max_g=0)
                         if not is_chop and not m_cl:
@@ -2384,9 +2500,13 @@ class ProjectBrain:
                     apply_sql_alters_to_schema(sc_copy, ops)
         t_low = task.lower()
         q_terms = [t for t in self._expand_keywords_with_aliases(_extract_keywords(task)) if len(t) >= 4]
-        wants_all_repo_diag = (not strict_focus) and any(
+        q_wants_tests_diag = bool(set(q_terms) & _TEST_QUERY_TERMS)
+        is_explanatory_q = bool(re.match(r"^\s*(?:how|where|what|which)\b", t_low)) and not any(
+            w in t_low for w in ("bug", "bugs", "broken", "mismatch", "violation", "failing", "crash")
+        )
+        wants_all_repo_diag = (not strict_focus) and (not is_explanatory_q) and any(
             w in t_low
-            for w in ("bug", "bugs", "error", "fail", "db", "database", "sql", "sqlite", "postgres", "connect", "insert", "schema", "backend")
+            for w in ("bug", "bugs", "broken", "fail", "failing", "db", "database", "sql", "sqlite", "postgres", "connect", "insert", "schema", "mismatch", "violation")
         )
         ordered_files = sorted(
             self._index.keys(),
@@ -2414,6 +2534,11 @@ class ProjectBrain:
                         offending_nodes.append(nid)
         for rel in ordered_files:
             if not wants_all_repo_diag and rel not in focus_files:
+                continue
+            if not q_wants_tests_diag and (
+                _is_test_file(rel)
+                or (rel not in focus_files and bool({p.lower() for p in Path(rel).parts[:-1]} & DEPRIORITY_DIRS))
+            ):
                 continue
             cells = self._index[rel].get("cells_4d") or []
             # Prefer finest-grained cell per line
@@ -2682,6 +2807,7 @@ class ProjectBrain:
         name_tokens = set(_tokenize_symbol(cls.get("name", ""))) | {name_lower}
         doc_lower = (cls.get("docstring") or "").lower()
         methods_lower = {m.lower() for m in cls.get("methods", [])}
+        fields_lower = " ".join(cls.get("fields", [])).lower()
         score = 0.0
         for kw in keywords:
             idf = self._idf.get(kw, 1.0)
@@ -2689,6 +2815,8 @@ class ProjectBrain:
                 score += 4.0 * idf
             elif kw in name_tokens or kw in name_lower:
                 score += 2.5 * idf
+            elif kw in fields_lower:
+                score += 2.2 * idf
             elif kw in methods_lower:
                 score += 1.5 * idf
             elif kw in doc_lower:
@@ -3084,6 +3212,7 @@ class ProjectBrain:
         self._defn_sets = {}
         self._ast_hashes = {}
         self._z_write_sets = {}
+        self._z_read_sets: dict[str, set[str]] = {}
         self._cell_4d_tokens = {}
         self._const_aliases: dict[str, list[str]] = {}
         doc_freq: dict[str, int] = {}
@@ -3093,9 +3222,16 @@ class ProjectBrain:
                 for av in a_vals:
                     if av not in dst_list:
                         dst_list.append(av)
+            cls_field_names = [
+                f_str.split("=")[0].split(":")[0].strip()
+                for c in info.get("classes", [])
+                for f_str in c.get("fields", [])
+                if f_str.split("=")[0].split(":")[0].strip()
+            ]
             symbol_names = (
                 [f["name"] for f in info.get("functions", [])]
                 + [c["name"] for c in info.get("classes", [])]
+                + cls_field_names
                 + info.get("exports", [])
             )
             tokenized = []
@@ -3103,6 +3239,7 @@ class ProjectBrain:
                 tokenized.extend(_tokenize_symbol(name))
 
             z_write_toks: set[str] = set()
+            z_read_toks: set[str] = set()
             cell_4d_toks: set[str] = set()
             for cell in info.get("cells_4d", []):
                 for zw in cell.get("Z_write", []):
@@ -3114,6 +3251,7 @@ class ProjectBrain:
                             cell_4d_toks.add(sub_t)
                 for zr in cell.get("Z_read", []):
                     zr_l = zr.lower()
+                    z_read_toks.add(zr_l)
                     cell_4d_toks.add(zr_l)
                     for sub_t in _tokenize_symbol(zr):
                         if len(sub_t) >= 4:
@@ -3127,6 +3265,7 @@ class ProjectBrain:
                                 if len(sub_t) >= 4:
                                     cell_4d_toks.add(sub_t)
             self._z_write_sets[rel_path] = z_write_toks
+            self._z_read_sets[rel_path] = z_read_toks
             self._cell_4d_tokens[rel_path] = cell_4d_toks
 
             for f in info.get("functions", []):
@@ -3142,6 +3281,7 @@ class ProjectBrain:
                 rel_path,
                 *[f["name"] for f in info.get("functions", [])],
                 *[c["name"] for c in info.get("classes", [])],
+                *[f_str for c in info.get("classes", []) for f_str in c.get("fields", [])],
                 *[r["path"] for r in info.get("routes", [])],
                 *info.get("exports", []),
                 *tokenized,
@@ -3167,7 +3307,7 @@ class ProjectBrain:
             self._import_token_sets[rel_path] = imp_toks - file_tokens
             body_toks: set[str] = set()
             for f in info.get("functions", []):
-                for bt in f.get("body_tokens", [])[:40]:
+                for bt in f.get("body_tokens", []):
                     body_toks.add(bt.lower())
                 for cl in f.get("calls", []):
                     body_toks.add(cl.lower())
@@ -3430,6 +3570,7 @@ class ProjectBrain:
             dir_lower = "/".join(p_obj.parts[:-1]).lower()
             defns = self._defn_sets.get(rel_path, set())
             z_writes = self._z_write_sets.get(rel_path, set())
+            z_reads = getattr(self, "_z_read_sets", {}).get(rel_path, set())
             tokens = self._token_sets.get(rel_path, set())
             imp_tokens = imp_token_map.get(rel_path, set())
             body_tokens = self._body_token_sets.get(rel_path, set())
@@ -3458,7 +3599,7 @@ class ProjectBrain:
                     if kw in defns:
                         base_hit = 2.0
                         hit_own = True
-                    elif kw in z_writes:
+                    elif kw in z_writes or kw in z_reads:
                         base_hit = 1.5
                         hit_own = True
                     elif matched_token:
