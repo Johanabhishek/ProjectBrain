@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "projectbrain": {
+      "command": "projectbrain-mcp",
+      "args": [
+        "D:\\projects\\Brain\\.pytest-tmp\\test_cli_init_creates_gitignor0"
+      ]
+    }
+  }
+}

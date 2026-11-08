@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "updated_at": 1794145751.79,
+  "notes": [
+    {
+      "id": "mem_1_5751",
+      "target_id": "fn:services/discount.py:apply_discount",
+      "rel_path": "services/discount.py",
+      "note": "Discount codes must be uppercase and validated before tax.",
+      "ast_hash": "2c9eb93be79f",
+      "tags": [],
+      "created_at": 1794145751.79
+    }
+  ]
+}

@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "projectbrain-mcp"
-version = "0.8.6"
+version = "0.8.7"
 description = "Local SQLite Code Graph, Multi-Dimensional AST/PDG Slicer, and Syntax-Verified Symbol Patcher for AI Coding Agents"
 readme = "README.md"
 license = { text = "MIT" }
@@ -23,7 +23,7 @@ keywords = [
     "llm",
 ]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Intended Audience :: Developers",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3.10",

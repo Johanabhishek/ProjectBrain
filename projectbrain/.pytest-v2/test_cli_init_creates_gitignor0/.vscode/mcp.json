@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "projectbrain": {
+      "type": "stdio",
+      "command": "projectbrain-mcp",
+      "args": [
+        "D:\\projects\\Brain\\projectbrain\\.pytest-v2\\test_cli_init_creates_gitignor0"
+      ]
+    }
+  }
+}

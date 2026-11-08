@@ -1,0 +1,11 @@
+{
+  "servers": {
+    "projectbrain": {
+      "type": "stdio",
+      "command": "projectbrain-mcp",
+      "args": [
+        "D:\\projects\\Brain\\projectbrain\\.pytest-tmp\\test_codex_review_hardening_su0"
+      ]
+    }
+  }
+}

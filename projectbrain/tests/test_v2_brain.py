@@ -361,3 +361,80 @@ def test_skipped_minified_js_files_do_not_trigger_perpetual_rebuild_and_fast_col
     assert not b_cold._index, "Fast cold-start SQLite slice should not load the full repo _index into memory"
 
 
+def test_errorhandlers_compound_routing_pdg_banner_and_docstring_folding(tmp_path):
+    """Verify compound 'errorhandlers' query finds dispatch functions, folds long docstrings, and emits [PDG Slice: ...]."""
+    pkg = tmp_path / "src" / "flask"
+    pkg.mkdir(parents=True)
+
+    (pkg / "app.py").write_text(
+        "class Flask:\n"
+        "    def register_error_handler(self, code_or_exception, f):\n"
+        '        """Register a function to handle errors by code or exception.\n'
+        "        Line 2 of docstring.\n"
+        "        Line 3 of docstring.\n"
+        "        Line 4 of docstring.\n"
+        "        Line 5 of docstring.\n"
+        '        """\n'
+        "        exc_class, code = self._get_exc_class_and_code(code_or_exception)\n"
+        "        self.error_handler_spec[None][code][exc_class] = f\n\n"
+        "    def _find_error_handler(self, e, blueprints):\n"
+        '        """Return a registered error handler for an exception in MRO order.\n'
+        "        Extra doc 1.\n"
+        "        Extra doc 2.\n"
+        "        Extra doc 3.\n"
+        '        """\n'
+        "        exc_class, code = self._get_exc_class_and_code(type(e))\n"
+        "        handler_map = self.error_handler_spec.get(None, {}).get(code, {})\n"
+        "        for cls in exc_class.__mro__:\n"
+        "            handler = handler_map.get(cls)\n"
+        "            if handler is not None:\n"
+        "                return handler\n"
+        "        return None\n\n"
+        "    def handle_http_exception(self, e):\n"
+        '        """Handles an HTTP exception by routing to registered error handlers.\n'
+        "        Doc detail A.\n"
+        "        Doc detail B.\n"
+        "        Doc detail C.\n"
+        '        """\n'
+        "        if e.code is None:\n"
+        "            return e\n"
+        "        handler = self._find_error_handler(e, [])\n"
+        "        if handler is None:\n"
+        "            return e\n"
+        "        return self.ensure_sync(handler)(e)\n\n"
+        "    def handle_user_exception(self, e):\n"
+        '        """This method is called whenever an exception occurs that should be handled.\n'
+        "        Doc detail 1.\n"
+        "        Doc detail 2.\n"
+        "        Doc detail 3.\n"
+        '        """\n'
+        "        if isinstance(e, Exception) and hasattr(e, 'code'):\n"
+        "            return self.handle_http_exception(e)\n"
+        "        handler = self._find_error_handler(e, [])\n"
+        "        if handler is None:\n"
+        "            raise\n"
+        "        return self.ensure_sync(handler)(e)\n\n"
+        "    def teardown_appcontext(self, f):\n"
+        '        """Registers a function to be called when the application context ends.\n'
+        "        This runs even if an unhandled exception occurred after errorhandlers.\n"
+        "        Exceptions are passed in.\n"
+        '        """\n'
+        "        self.teardown_appcontext_funcs.append(f)\n"
+        "        return f\n",
+        encoding="utf-8",
+    )
+
+    b = ProjectBrain(tmp_path)
+    b.index()
+    res = b.compile_dossier(["how are exceptions routed to errorhandlers"])
+    md = res["markdown"]
+
+    assert "_find_error_handler" in md
+    assert "handle_http_exception" in md
+    assert "handle_user_exception" in md
+    assert "### [src/flask/app.py :: teardown_appcontext" not in md
+    assert "[PDG Slice:" in md
+    assert "docstring lines" in md
+
+
+

@@ -23,7 +23,7 @@ from .graph import CodeGraph, fn_id, cls_id, file_id, route_id
 from .intent import classify_intent, LOCATE_SYMBOL, LOCATE_ROUTE, UNDERSTAND_FLOW, IMPACT_ANALYSIS, ADD_FEATURE
 from .ledger import SavingsLedger
 from .memory import RepoMemory
-from .parsers import parse, parse_with_tree, apply_sql_alters_to_schema
+from .parsers import parse, parse_with_tree, apply_sql_alters_to_schema, compute_file_interface_hash
 from .patcher import apply_patch_spec
 from .session import SessionManager
 from .store import SQLiteIndexStore
@@ -734,22 +734,41 @@ class ProjectBrain:
         emitted_by_file: dict[str, list[tuple[int, int]]] = {}
         matched_4d_cells_count = 0
         monolith_4d_cells_count = 0
-        # Helper to add a file's module globals once (only when max_g > 0 so expanded callees don't prematurely lock out primary globals)
-        def _ensure_globals(rel_path: str, buf: list[str], max_g: int = 24) -> None:
+        # Helper to add a file's module globals once (only when relevant to query or TypeScript interfaces/globals-only module)
+        def _ensure_globals(rel_path: str, buf: list[str], max_g: int = 24, kw_list: list[str] | None = None) -> None:
             if zoom or max_g <= 0 or rel_path in seen_globals or rel_path not in self._index:
                 return
             seen_globals.add(rel_path)
-            glob_text = extract_file_globals_slice(self.root, rel_path, self._index[rel_path], max_lines=max_g)
-            if glob_text:
-                g_ivs = extract_emitted_intervals(glob_text)
-                if g_ivs:
-                    g_plan = self._ledger.plan_slice_intervals(rel_path, g_ivs[0][0], g_ivs[-1][1], commit=False)
-                    if not g_plan["unseen_intervals"]:
-                        buf.append(f"### [{rel_path} :: Module Constants — [Session Cache] Already delivered in this session (0 duplicate lines)]")
-                        return
-                emitted_by_file.setdefault(rel_path, []).extend(g_ivs)
-                buf.append(f"### [{rel_path} :: Module Constants, State & Bootstrap]")
-                buf.append(glob_text)
+            f_info = self._index[rel_path]
+            glob_text = extract_file_globals_slice(self.root, rel_path, f_info, max_lines=min(max_g, 16))
+            if not glob_text:
+                return
+            is_ts_iface = rel_path.endswith((".ts", ".tsx")) and ("interface " in glob_text or "type " in glob_text)
+            is_globals_module = len(f_info.get("functions", [])) == 0 and len(f_info.get("classes", [])) <= 1
+            non_imp_lines = [
+                ln.lower()
+                for ln in glob_text.splitlines()
+                if not ln.lstrip().startswith(("import ", "from ", "#", "//", "/*", "*", "export type "))
+            ]
+            non_imp_blob = "\n".join(non_imp_lines)
+            has_kw_global = bool(
+                kw_list
+                and any(
+                    len(w) >= 4 and self._idf.get(w, 1.0) >= 2.0 and w in non_imp_blob
+                    for w in kw_list
+                )
+            )
+            if not (is_ts_iface or is_globals_module or has_kw_global):
+                return
+            g_ivs = extract_emitted_intervals(glob_text)
+            if g_ivs:
+                g_plan = self._ledger.plan_slice_intervals(rel_path, g_ivs[0][0], g_ivs[-1][1], commit=False)
+                if not g_plan["unseen_intervals"]:
+                    buf.append(f"### [{rel_path} :: Module Constants — [Session Cache] Already delivered in this session (0 duplicate lines)]")
+                    return
+            emitted_by_file.setdefault(rel_path, []).extend(g_ivs)
+            buf.append(f"### [{rel_path} :: Module Constants, State & Bootstrap]")
+            buf.append(glob_text)
 
         # Helper to add a function/class slice once (skipping nested functions already covered by an outer slice)
         def _add_node_slice(node_id: str, reason: str, kw_list: list[str], buf: list[str], max_l: int = 44, max_g: int = 24) -> None:
@@ -781,7 +800,7 @@ class ProjectBrain:
                     return
             seen_slices.add(slice_key)
             seen_spans.append((rel, slice_s, slice_e))
-            _ensure_globals(rel, buf, max_g=max_g)
+            _ensure_globals(rel, buf, max_g=max_g, kw_list=kw_list)
             ast_calls: list[str] = []
             if (l_end - l_start) <= 450 and not is_caller_slice:
                 for f_entry in self._index[rel].get("functions", []):
@@ -840,7 +859,7 @@ class ProjectBrain:
                         f_lines = []
                     cells = extract_4d_coordinate_matrix(f_lines, slice_s, slice_e, ext=Path(rel).suffix) if f_lines else []
                 if cells:
-                    max_rows = 22 if (slice_e - slice_s) > 200 else 8
+                    max_rows = 22 if (slice_e - slice_s) > 200 else 1
                     top_cells, matrix_header = query_4d_coordinate_matrix(
                         cells,
                         focus_terms=kw_list + ast_calls,
@@ -1140,10 +1159,10 @@ class ProjectBrain:
                             for _, m_fn in m_scored[: (1 if len(tasks) >= 3 else 2)]:
                                 m_nid = fn_id(erel, m_fn["name"], cls_nm_e)
                                 filtered_explicit.append(m_nid)
-                                _add_node_slice(m_nid, f"top method on {cls_nm_e}", t_kw, sec, max_l=64, max_g=8)
+                                _add_node_slice(m_nid, f"top method on {cls_nm_e}", t_kw, sec, max_l=48, max_g=8)
                             continue
                     filtered_explicit.append(enid)
-                    _add_node_slice(enid, "explicitly referenced in task", t_kw, sec, max_l=95 if e_span <= 450 else 55, max_g=8)
+                    _add_node_slice(enid, "explicitly referenced in task", t_kw, sec, max_l=58 if e_span <= 450 else 44, max_g=8)
             if filtered_explicit:
                 explicit_nodes = filtered_explicit
             had_initial_explicit = bool(explicit_nodes)
@@ -1271,13 +1290,12 @@ class ProjectBrain:
                         if ef not in existing_ranked_paths:
                             ranked.append({"rel_path": ef, "score": top1_file_score})
                             existing_ranked_paths.add(ef)
+                rank0_top_sym_score = 0.0
                 for file_rank, r in enumerate(ranked):
                     rp = r["rel_path"]
                     min_ratio = 0.72 if file_rank == 1 else 0.52
                     if file_rank > 0 and rp not in explicit_task_files and r["score"] < top1_file_score * min_ratio:
                         continue
-                    step2_ranked_files.add(rp)
-                    primary_files.add(rp)
                     if (len(filtered_explicit) >= 2 or rp in exp_by_file) and rp in exp_by_file and rp not in explicit_task_files:
                         continue
                     if task_cls_ref_counts.get(rp, 0) >= 2 or (rp in exp_by_file and len(exp_by_file[rp]) >= 1):
@@ -1306,13 +1324,36 @@ class ProjectBrain:
                         ):
                             continue
                         dedup_scored.append(item)
+                    if file_rank == 0 and dedup_scored:
+                        rank0_top_sym_score = dedup_scored[0][0]
+                    elif (
+                        file_rank >= 2
+                        and rp not in explicit_task_files
+                        and rank0_top_sym_score > 0
+                        and (not dedup_scored or dedup_scored[0][0] < rank0_top_sym_score * 0.45)
+                    ):
+                        continue
+                    step2_ranked_files.add(rp)
+                    primary_files.add(rp)
                     top_k = 1 if (had_initial_explicit or file_rank > 1 or len(tasks) >= 3) else 2
+                    if not had_initial_explicit and len(tasks) == 1:
+                        if file_rank == 0:
+                            if len(dedup_scored) >= 4 and dedup_scored[3][0] >= dedup_scored[0][0] * 0.72:
+                                top_k = 4
+                            elif len(dedup_scored) >= 3 and dedup_scored[2][0] >= dedup_scored[0][0] * 0.48:
+                                top_k = 3
+                        elif file_rank <= 2 and len(dedup_scored) >= 2 and dedup_scored[1][0] >= dedup_scored[0][0] * 0.65:
+                            top_k = max(top_k, 2)
                     multi_file_budget = (len(tasks) >= 3 and len(ranked) >= 3)
                     for rank_idx, (sc, kind, sym) in enumerate(dedup_scored[:top_k]):
                         nid = fn_id(rp, sym["name"], sym.get("parent_class")) if kind == "fn" else cls_id(rp, sym["name"])
                         sym_span = sym.get("line_end", 1) - sym.get("line_start", 1)
-                        rank_max_l = (58 if multi_file_budget else (95 if sym_span <= 450 else 65)) if rank_idx == 0 else 44
-                        rank_max_g = 6 if multi_file_budget else (16 if file_rank == 0 else 8)
+                        rank_max_l = (
+                            (42 if multi_file_budget else (52 if sym_span <= 450 else 44))
+                            if rank_idx == 0
+                            else (30 if rank_idx == 1 else 24)
+                        )
+                        rank_max_g = 6 if multi_file_budget else (14 if file_rank == 0 else 8)
                         _add_node_slice(nid, f"top match in {rp}", t_kw, sec, max_l=rank_max_l, max_g=rank_max_g)
                         if (not had_executable_explicit or rp in explicit_task_files) and nid not in explicit_nodes and len(explicit_nodes) < 6:
                             explicit_nodes.append(nid)
@@ -1345,9 +1386,20 @@ class ProjectBrain:
                     seed_s = seed_nd.get("line_start", -1)
                     seed_e = seed_nd.get("line_end", -1)
 
-                    # Forward 1-2 hops (handles, calls) ordered strictly by BFS hop and cross-file priority
+                    # Forward 1-2 hops (handles, calls, state_flow) ordered strictly by BFS hop and cross-file priority
                     for ei in self._graph._adj.get(seed_id, []):
                         e1 = self._graph.edges[ei]
+                        if e1["type"] == "state_flow":
+                            dst1 = e1["dst"]
+                            dst1_nd = self._graph.nodes.get(dst1, {})
+                            dst1_rel = dst1_nd.get("rel_path", "")
+                            dst1_name = (dst1_nd.get("name") or "").lower()
+                            dst1_toks = set(_tokenize_symbol(dst1_name))
+                            if dst1_rel in top3_query_files and any(
+                                w in dst1_name or w[:4] in dst1_name or w[:3] in dst1_toks for w in t_kw if len(w) >= 4
+                            ):
+                                hop1_list.append((dst1, f"reads state from {seed_id.split(':')[-1]}", t_kw + [dst1_name], 26, 0))
+                            continue
                         if e1["type"] not in ("calls", "handles") or e1.get("confidence") not in ("exact", "import_resolved"):
                             continue
                         dst1 = e1["dst"]
@@ -1374,7 +1426,7 @@ class ProjectBrain:
                         dst1_kw_overlap = any(w in dst1_name or w[:4] in dst1_name or w[:3] in dst1_toks for w in t_kw if len(w) >= 4)
                         if dst1_in_deg >= 6 and not dst1_kw_overlap:
                             continue
-                        h1_max_l = 14 if (dst1_in_deg >= 4 and not dst1_kw_overlap) else 42
+                        h1_max_l = 12 if (dst1_in_deg >= 4 and not dst1_kw_overlap) else 26
                         hop1_list.append((dst1, f"called by {seed_id.split(':')[-1]}", t_kw + [dst1_name], h1_max_l, 0))
                         # 2nd hop forward
                         for ei2 in self._graph._adj.get(dst1, []):
@@ -1391,7 +1443,7 @@ class ProjectBrain:
                                 if dst2_in_deg >= 5 and not dst2_kw_overlap:
                                     continue
                                 if dst2_rel != dst1_rel:
-                                    hop2_cross.append((dst2, f"2-hop callee via {dst1.split(':')[-1]}", t_kw + [dst2_name], 26, 12 if seed_nd.get("type") == "route" else 0))
+                                    hop2_cross.append((dst2, f"2-hop callee via {dst1.split(':')[-1]}", t_kw + [dst2_name], 20, 10 if seed_nd.get("type") == "route" else 0))
                                     for ei3 in self._graph._adj.get(dst2, []):
                                         e3 = self._graph.edges[ei3]
                                         if e3["type"] == "calls" and e3.get("confidence") in ("exact", "import_resolved"):
@@ -1402,9 +1454,9 @@ class ProjectBrain:
                                             dst3_kw_overlap = any(w in dst3_name or w[:4] in dst3_name for w in t_kw if len(w) >= 4)
                                             chain_lines.append(f"    - `{dst2}` -[calls (L{e3.get('line', '?')})]-> `{dst3}`")
                                             if dst3_in_deg < 4 or dst3_kw_overlap:
-                                                hop3_list.append((dst3, f"3-hop callee via {dst2.split(':')[-1]}", t_kw, 20, 0))
+                                                hop3_list.append((dst3, f"3-hop callee via {dst2.split(':')[-1]}", t_kw, 16, 0))
                                 elif (dst2_nd.get("line_end", 0) - dst2_nd.get("line_start", 0)) >= 5:
-                                    hop2_same.append((dst2, f"2-hop callee via {dst1.split(':')[-1]}", t_kw + [dst2_name], 20, 0))
+                                    hop2_same.append((dst2, f"2-hop callee via {dst1.split(':')[-1]}", t_kw + [dst2_name], 16, 0))
 
                     fwd_expanded = hop1_list + hop2_cross + hop2_same + hop3_list
 
@@ -1655,6 +1707,7 @@ class ProjectBrain:
                         covered_features.add(f"ex:{ex.lower()}")
 
                 hop_pointers: list[str] = []
+                monolith_call_wins = 0
                 for enid, ereason, ekw, emax_l, emax_g in ordered_cands:
                     m_cl = re.search(r"@L(\d+)", ereason)
                     cand_key = f"{enid}@L{m_cl.group(1)}" if m_cl else enid
@@ -1664,14 +1717,26 @@ class ProjectBrain:
                     enm = (end_node.get("name") or "").lower()
                     enm_tokens = set(_tokenize_symbol(enm))
                     erel = end_node.get("rel_path", "")
-                    espan = 12 if m_cl else (end_node.get("line_end", 1) - end_node.get("line_start", 1))
+                    full_node_span = end_node.get("line_end", 1) - end_node.get("line_start", 1)
+                    is_monolith_call = bool(m_cl) and full_node_span > 120 and erel in primary_files and monolith_call_wins < 2
+                    espan = 12 if is_monolith_call else full_node_span
                     sec_lines_now = sum(len(x.splitlines()) for x in sec)
                     is_chop = "Causal Symptom Chop" in ereason
-                    kw_direct = is_chop or bool(m_cl) or any(w in enm or w[:4] in enm or w[:3] in enm_tokens for w in t_kw if len(w) >= 4) or ("http_flow" in ereason) or ("table:" in ereason)
-                    sec_cap_direct = 220 if len(tasks) >= 3 else 360
-                    if (emitted_hops < max_hops_allowed or is_chop or bool(m_cl)) and (sec_lines_now < 140 or (kw_direct and sec_lines_now < sec_cap_direct)) and espan <= 120:
-                        _add_node_slice(enid, ereason, ekw, sec, max_l=min(emax_l, 30 if is_chop else 24), max_g=0)
-                        if not is_chop and not m_cl:
+                    kw_direct = (
+                        is_chop
+                        or is_monolith_call
+                        or any(w in enm or w[:4] in enm or w[:3] in enm_tokens for w in t_kw if len(w) >= 4)
+                        or ("http_flow" in ereason)
+                        or ("state_flow" in ereason)
+                        or ("reads state from" in ereason)
+                        or ("table:" in ereason)
+                    )
+                    sec_cap_direct = 165 if len(tasks) >= 3 else 210
+                    if (emitted_hops < max_hops_allowed or is_chop or is_monolith_call) and (sec_lines_now < 120 or (kw_direct and sec_lines_now < sec_cap_direct)) and espan <= 120:
+                        _add_node_slice(enid, ereason, ekw, sec, max_l=min(emax_l, 26 if is_chop else 22), max_g=0)
+                        if is_monolith_call:
+                            monolith_call_wins += 1
+                        elif not is_chop:
                             emitted_hops += 1
                     else:
                         sig_str = f" `{end_node['signature']}`" if end_node.get("signature") else ""
@@ -1867,12 +1932,9 @@ class ProjectBrain:
             # 5d. Append compact output-token saving instructions for `projectbrain patch`
             current_lines_after = len("\n".join(md_sections).splitlines())
             if current_lines_after < 775:
-                md_sections.extend([
-                    "",
-                    "## Surgical AST Symbol Slicing & Anchor Patching (`projectbrain slice` / `patch`)",
-                    "> **Batched Multi-Slicing:** Pass multiple symbols or file ranges in ONE command (`projectbrain --path \"<repo>\" slice --summary file1:symA file2:1-350 file3:symB`) and if output > 180 lines, read `<repo>/.projectbrain_slice.md` in a single `read_file` call (`StartLine=1, EndLine=800`).",
-                    "> **AST Symbol Patching:** `@file <rel_path>` | `@replace_body <Symbol> ... @end` | `@add_method <Class> ... @end` | `@replace <Symbol> ... @end` | `@sub <Symbol> \\`<old>\\` -> \\`<new>\\`` | `@replace L<s-e> ... @end`",
-                ])
+                md_sections.append(
+                    "\n> **Tools:** `projectbrain slice --summary <file>:<symbol>` | `projectbrain patch` (`@file <rel_path>`, `@replace_body <Symbol> ... @end`, `@sub <Symbol> \\`<old>\\` -> \\`<new>\\``)"
+                )
 
         full_md = "\n".join(md_sections)
         target_file = Path(out_path) if out_path else (self.root / ".projectbrain_dossier.md")
@@ -2465,6 +2527,12 @@ class ProjectBrain:
     ) -> float:
         name_lower = fn.get("name", "").lower()
         name_tokens = set(_tokenize_symbol(fn.get("name", ""))) | {name_lower}
+        parent_cls = (fn.get("parent_class") or "").lower()
+        parent_tokens = set(_tokenize_symbol(parent_cls)) if parent_cls else set()
+        is_lifecycle_method = name_lower in (
+            "push", "pop", "open", "close", "dispatch", "handle", "send",
+            "execute", "run", "process", "resolve", "build", "register", "record", "load", "save",
+        )
         doc_lower = (fn.get("docstring") or "").lower()
         calls_lower = {c.lower() for c in fn.get("calls", [])}
         body_tokens = set(fn.get("body_tokens", []))
@@ -2472,37 +2540,80 @@ class ProjectBrain:
         fn_e = fn.get("line_end", fn_s)
         score = 0.0
         matched_kws = 0
+        id_or_call_hits = 0
         for kw in keywords:
             idf = self._idf.get(kw, 1.0) * (local_idf.get(kw, 1.0) if local_idf else 1.0)
             kw_stem = re.sub(r"(?:ed|ing|es|s)$", "", kw) if len(kw) >= 4 else kw
             if len(kw_stem) < 3:
                 kw_stem = kw
-            name_weight = 0.8 if kw in ("file", "files", "path", "paths", "data", "item", "items", "node", "nodes") else 2.5
+            kw_root = re.sub(r"(?:ers|ors|er|or)$", "e", kw) if kw.endswith(("handler", "handlers", "serializer", "serializers", "dispatcher", "dispatchers", "loader", "loaders", "parser", "parsers", "manager", "managers", "router", "routers", "producer", "producers", "consumer", "consumers")) else re.sub(r"(?:ers|ors|er|or)$", "", kw_stem)
+            if len(kw_root) < 4:
+                kw_root = kw_stem
+            name_weight = 0.8 if kw in ("file", "files", "path", "paths", "data", "item", "items", "node", "nodes") else 2.6
             sig_tokens = set(re.findall(r"[a-z0-9]+", (fn.get("signature") or "").lower()))
             hit = False
-            if kw == name_lower:
-                score += 4.0 * idf
+            if kw == name_lower or kw_stem == name_lower:
+                score += 4.2 * idf
                 hit = True
-            elif kw in name_tokens or kw in name_lower or (len(kw_stem) >= 3 and kw_stem in name_tokens):
+                id_or_call_hits += 1
+            elif (
+                kw in name_tokens
+                or kw in name_lower
+                or (len(kw_stem) >= 3 and (kw_stem in name_tokens or kw_stem in name_lower))
+                or (len(kw_root) >= 4 and (kw_root in name_tokens or kw_root in name_lower))
+            ):
                 score += name_weight * idf
                 hit = True
+                id_or_call_hits += 1
                 if kw in doc_lower or (len(kw_stem) >= 4 and kw_stem in doc_lower):
-                    score += 0.9 * idf
+                    score += 0.75 * idf
+            elif (
+                parent_tokens
+                and not name_lower.startswith("_")
+                and (
+                    kw in parent_tokens
+                    or kw == parent_cls
+                    or (len(kw_stem) >= 3 and (kw_stem in parent_tokens or kw_stem in parent_cls))
+                )
+            ):
+                score += (2.4 if is_lifecycle_method else 1.35) * idf
+                hit = True
+                id_or_call_hits += 1
             elif kw in sig_tokens or (len(kw_stem) >= 3 and kw_stem in sig_tokens):
                 score += 2.0 * idf
                 hit = True
-            elif kw in doc_lower or (len(kw_stem) >= 4 and kw_stem in doc_lower):
-                score += 1.4 * idf
+                id_or_call_hits += 1
+            elif any(
+                kw in c
+                or (len(kw_stem) >= 4 and kw_stem in c)
+                or (len(kw_root) >= 4 and kw_root in c)
+                for c in calls_lower
+            ):
+                score += 1.45 * idf
                 hit = True
-            elif any(kw in c or (len(kw_stem) >= 4 and kw_stem in c) for c in calls_lower):
-                score += 1.1 * idf
+                id_or_call_hits += 1
+            elif kw in doc_lower or (len(kw_stem) >= 4 and kw_stem in doc_lower):
+                score += 1.15 * idf
                 hit = True
             elif kw in body_tokens or any(len(kw_stem) >= 4 and kw_stem in bt for bt in body_tokens):
                 score += 0.75 * idf
                 hit = True
             if hit:
                 matched_kws += 1
-        if matched_kws >= 3:
+        if (
+            name_lower.startswith(("has_", "is_", "can_", "should_"))
+            and not any(qk.startswith(("has", "is", "can", "should", "check")) for qk in keywords)
+        ):
+            score *= 0.52
+        if name_lower.startswith("test_") and not (set(keywords) & _TEST_QUERY_TERMS):
+            score *= 0.45
+        if id_or_call_hits >= 2:
+            score *= 1.35 + 0.10 * min(3, id_or_call_hits - 2)
+        elif id_or_call_hits == 0 and len(keywords) >= 2:
+            # Discount functions that only matched prose in docstrings while their identifier,
+            # signature, and outgoing calls have zero overlap with the query keywords.
+            score *= 0.28
+        if matched_kws >= 3 and id_or_call_hits >= 1:
             score *= 1.0 + 0.12 * (matched_kws - 2)
         if cells_4d:
             inner_cells = [
@@ -3308,12 +3419,23 @@ class ProjectBrain:
         self._sync_interprocedural_effects()
         return True
 
-    def _sync_interprocedural_effects(self) -> None:
+    def _sync_interprocedural_effects(self, target_rels: set[str] | None = None) -> None:
         """Fold transitive_z_write and exit_contracts from CodeGraph fn nodes back into file search sets."""
         if not self._graph:
             return
         new_toks_by_file: dict[str, set[str]] = {}
-        for nid, nd in self._graph.nodes.items():
+        if target_rels is not None:
+            self._graph._ensure_registries()
+            candidate_nids = [
+                nid
+                for r in target_rels
+                for nid in self._graph._nodes_by_file.get(r, set())
+                if nid in self._graph.nodes
+            ]
+        else:
+            candidate_nids = list(self._graph.nodes.keys())
+        for nid in candidate_nids:
+            nd = self._graph.nodes[nid]
             if nd.get("type") != "fn":
                 continue
             rel = nd.get("rel_path", "")
@@ -3363,6 +3485,112 @@ class ProjectBrain:
             and "files" in data
         )
 
+    def _compute_file_blob(self, rel_path: str, info: dict) -> set[str]:
+        """Compute per-file searchable tokens, 4D cell sets, and AST hashes for a single file."""
+        for ak, a_vals in (info.get("const_aliases") or {}).items():
+            dst_list = self._const_aliases.setdefault(ak, [])
+            for av in a_vals:
+                if av not in dst_list:
+                    dst_list.append(av)
+        cls_field_names = [
+            f_str.split("=")[0].split(":")[0].strip()
+            for c in info.get("classes", [])
+            for f_str in c.get("fields", [])
+            if f_str.split("=")[0].split(":")[0].strip()
+        ]
+        symbol_names = (
+            [f["name"] for f in info.get("functions", [])]
+            + [c["name"] for c in info.get("classes", [])]
+            + cls_field_names
+            + info.get("exports", [])
+        )
+        tokenized = []
+        for name in symbol_names:
+            tokenized.extend(_tokenize_symbol(name))
+
+        z_write_toks: set[str] = set()
+        z_read_toks: set[str] = set()
+        cell_4d_toks: set[str] = set()
+        for cell in info.get("cells_4d", []):
+            for zw in cell.get("Z_write", []):
+                zw_l = zw.lower()
+                z_write_toks.add(zw_l)
+                cell_4d_toks.add(zw_l)
+                for sub_t in _tokenize_symbol(zw):
+                    if len(sub_t) >= 4:
+                        cell_4d_toks.add(sub_t)
+            for zr in cell.get("Z_read", []):
+                zr_l = zr.lower()
+                z_read_toks.add(zr_l)
+                cell_4d_toks.add(zr_l)
+                for sub_t in _tokenize_symbol(zr):
+                    if len(sub_t) >= 4:
+                        cell_4d_toks.add(sub_t)
+            x_sc = cell.get("X_scope", "")
+            if x_sc.startswith(("useEffect", "useLayoutEffect", "useMemo", "useCallback", "case:")):
+                for x_id in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", x_sc):
+                    if x_id not in ("useEffect", "useLayoutEffect", "useMemo", "useCallback", "case"):
+                        cell_4d_toks.add(x_id.lower())
+                        for sub_t in _tokenize_symbol(x_id):
+                            if len(sub_t) >= 4:
+                                cell_4d_toks.add(sub_t)
+        self._z_write_sets[rel_path] = z_write_toks
+        self._z_read_sets[rel_path] = z_read_toks
+        self._cell_4d_tokens[rel_path] = cell_4d_toks
+
+        for f in info.get("functions", []):
+            nid = fn_id(rel_path, f["name"], f.get("parent_class"))
+            if f.get("ast_hash"):
+                self._ast_hashes[nid] = f["ast_hash"]
+        for c in info.get("classes", []):
+            nid = cls_id(rel_path, c["name"])
+            if c.get("ast_hash"):
+                self._ast_hashes[nid] = c["ast_hash"]
+
+        own_parts = [
+            rel_path,
+            *[f["name"] for f in info.get("functions", [])],
+            *[c["name"] for c in info.get("classes", [])],
+            *[f_str for c in info.get("classes", []) for f_str in c.get("fields", [])],
+            *[r["path"] for r in info.get("routes", [])],
+            *info.get("exports", []),
+            *tokenized,
+            *sorted(cell_4d_toks),
+            *[f["docstring"] for f in info.get("functions", []) if f.get("docstring")],
+            *[c["docstring"] for c in info.get("classes", []) if c.get("docstring")],
+        ]
+        own_blob_str = " ".join(own_parts).lower()
+        imp_str = " ".join(info.get("imports", [])).lower()
+        self._blobs[rel_path] = (own_blob_str + " " + imp_str).strip()
+
+        file_tokens = set(re.findall(r"[a-z0-9_]+", own_blob_str)) | set(tokenized) | cell_4d_toks
+        for p_seg in re.split(r"[/._\-]", rel_path.lower()):
+            if p_seg:
+                file_tokens.add(p_seg)
+                file_tokens.update(_tokenize_symbol(p_seg))
+        self._token_sets[rel_path] = file_tokens
+        imp_toks: set[str] = set(re.findall(r"[a-z0-9_]+", imp_str))
+        for raw_imp in info.get("imports", []):
+            for seg in re.split(r"[/._\-]", raw_imp):
+                if seg:
+                    imp_toks.update(_tokenize_symbol(seg))
+        self._import_token_sets[rel_path] = imp_toks - file_tokens
+        body_toks: set[str] = set()
+        for f in info.get("functions", []):
+            for bt in f.get("body_tokens", []):
+                body_toks.add(bt.lower())
+            for cl in f.get("calls", []):
+                body_toks.add(cl.lower())
+                body_toks.update(_tokenize_symbol(cl))
+        self._body_token_sets[rel_path] = body_toks
+
+        self._defn_sets[rel_path] = {
+            tok
+            for name in symbol_names
+            for tok in ([name.lower()] + _tokenize_symbol(name))
+        } | {r["path"].lower() for r in info.get("routes", [])}
+        return file_tokens
+
     def _build_blobs(self) -> None:
         """Precompute searchable tokens, IDF weights, import maps, and AST hashes per file."""
         self._blobs = {}
@@ -3376,111 +3604,10 @@ class ProjectBrain:
         self._const_aliases: dict[str, list[str]] = {}
         doc_freq: dict[str, int] = {}
         for rel_path, info in self._index.items():
-            for ak, a_vals in (info.get("const_aliases") or {}).items():
-                dst_list = self._const_aliases.setdefault(ak, [])
-                for av in a_vals:
-                    if av not in dst_list:
-                        dst_list.append(av)
-            cls_field_names = [
-                f_str.split("=")[0].split(":")[0].strip()
-                for c in info.get("classes", [])
-                for f_str in c.get("fields", [])
-                if f_str.split("=")[0].split(":")[0].strip()
-            ]
-            symbol_names = (
-                [f["name"] for f in info.get("functions", [])]
-                + [c["name"] for c in info.get("classes", [])]
-                + cls_field_names
-                + info.get("exports", [])
-            )
-            tokenized = []
-            for name in symbol_names:
-                tokenized.extend(_tokenize_symbol(name))
-
-            z_write_toks: set[str] = set()
-            z_read_toks: set[str] = set()
-            cell_4d_toks: set[str] = set()
-            for cell in info.get("cells_4d", []):
-                for zw in cell.get("Z_write", []):
-                    zw_l = zw.lower()
-                    z_write_toks.add(zw_l)
-                    cell_4d_toks.add(zw_l)
-                    for sub_t in _tokenize_symbol(zw):
-                        if len(sub_t) >= 4:
-                            cell_4d_toks.add(sub_t)
-                for zr in cell.get("Z_read", []):
-                    zr_l = zr.lower()
-                    z_read_toks.add(zr_l)
-                    cell_4d_toks.add(zr_l)
-                    for sub_t in _tokenize_symbol(zr):
-                        if len(sub_t) >= 4:
-                            cell_4d_toks.add(sub_t)
-                x_sc = cell.get("X_scope", "")
-                if x_sc.startswith(("useEffect", "useLayoutEffect", "useMemo", "useCallback", "case:")):
-                    for x_id in re.findall(r"[a-zA-Z_][a-zA-Z0-9_]*", x_sc):
-                        if x_id not in ("useEffect", "useLayoutEffect", "useMemo", "useCallback", "case"):
-                            cell_4d_toks.add(x_id.lower())
-                            for sub_t in _tokenize_symbol(x_id):
-                                if len(sub_t) >= 4:
-                                    cell_4d_toks.add(sub_t)
-            self._z_write_sets[rel_path] = z_write_toks
-            self._z_read_sets[rel_path] = z_read_toks
-            self._cell_4d_tokens[rel_path] = cell_4d_toks
-
-            for f in info.get("functions", []):
-                nid = fn_id(rel_path, f["name"], f.get("parent_class"))
-                if f.get("ast_hash"):
-                    self._ast_hashes[nid] = f["ast_hash"]
-            for c in info.get("classes", []):
-                nid = cls_id(rel_path, c["name"])
-                if c.get("ast_hash"):
-                    self._ast_hashes[nid] = c["ast_hash"]
-
-            own_parts = [
-                rel_path,
-                *[f["name"] for f in info.get("functions", [])],
-                *[c["name"] for c in info.get("classes", [])],
-                *[f_str for c in info.get("classes", []) for f_str in c.get("fields", [])],
-                *[r["path"] for r in info.get("routes", [])],
-                *info.get("exports", []),
-                *tokenized,
-                *sorted(cell_4d_toks),
-                *[f["docstring"] for f in info.get("functions", []) if f.get("docstring")],
-                *[c["docstring"] for c in info.get("classes", []) if c.get("docstring")],
-            ]
-            own_blob_str = " ".join(own_parts).lower()
-            imp_str = " ".join(info.get("imports", [])).lower()
-            self._blobs[rel_path] = (own_blob_str + " " + imp_str).strip()
-
-            file_tokens = set(re.findall(r"[a-z0-9_]+", own_blob_str)) | set(tokenized) | cell_4d_toks
-            for p_seg in re.split(r"[/._\-]", rel_path.lower()):
-                if p_seg:
-                    file_tokens.add(p_seg)
-                    file_tokens.update(_tokenize_symbol(p_seg))
-            self._token_sets[rel_path] = file_tokens
-            imp_toks: set[str] = set(re.findall(r"[a-z0-9_]+", imp_str))
-            for raw_imp in info.get("imports", []):
-                for seg in re.split(r"[/._\-]", raw_imp):
-                    if seg:
-                        imp_toks.update(_tokenize_symbol(seg))
-            self._import_token_sets[rel_path] = imp_toks - file_tokens
-            body_toks: set[str] = set()
-            for f in info.get("functions", []):
-                for bt in f.get("body_tokens", []):
-                    body_toks.add(bt.lower())
-                for cl in f.get("calls", []):
-                    body_toks.add(cl.lower())
-                    body_toks.update(_tokenize_symbol(cl))
-            self._body_token_sets[rel_path] = body_toks
-
+            file_tokens = self._compute_file_blob(rel_path, info)
             for tok in file_tokens:
                 doc_freq[tok] = doc_freq.get(tok, 0) + 1
-
-            self._defn_sets[rel_path] = {
-                tok
-                for name in symbol_names
-                for tok in ([name.lower()] + _tokenize_symbol(name))
-            } | {r["path"].lower() for r in info.get("routes", [])}
+        self._doc_freq = doc_freq
         # Precompute BM25-style IDF weights so specific domain symbols outrank common words
         n_docs = max(len(self._index), 1)
         self._idf = {
@@ -3491,6 +3618,7 @@ class ProjectBrain:
         # Symbol-aware and file-aware import resolution
         file_set = set(self._index)
         module_index = resolve.build_python_module_index(self._index)
+        self._python_module_index = module_index
 
         self._import_targets = {}
         self._symbol_imports = {}
@@ -3516,6 +3644,84 @@ class ProjectBrain:
             self._behaviors[rel_path] = classify_file_functions(
                 info, is_jsx=(ext in _JSX_EXTS),
             )
+
+    def _update_blobs_incremental(self, changed_rels: set[str], deleted_rels: set[str], has_added_or_deleted: bool = False) -> None:
+        """Incrementally update per-file blobs, IDF, imports, and behaviors in O(delta) time."""
+        doc_freq = getattr(self, "_doc_freq", None)
+        if doc_freq is None:
+            self._build_blobs()
+            return
+        touched_tokens: set[str] = set()
+        affected_targets: set[str] = set()
+        for rel in deleted_rels | changed_rels:
+            old_toks = self._token_sets.pop(rel, set())
+            for tok in old_toks:
+                new_df = doc_freq.get(tok, 1) - 1
+                if new_df <= 0:
+                    doc_freq.pop(tok, None)
+                else:
+                    doc_freq[tok] = new_df
+                touched_tokens.add(tok)
+            self._blobs.pop(rel, None)
+            self._import_token_sets.pop(rel, None)
+            self._body_token_sets.pop(rel, None)
+            self._defn_sets.pop(rel, None)
+            self._z_write_sets.pop(rel, None)
+            self._z_read_sets.pop(rel, None)
+            self._cell_4d_tokens.pop(rel, None)
+            self._behaviors.pop(rel, None)
+            self._importer_counts.pop(rel, None)
+            old_targets = self._import_targets.pop(rel, [])
+            for old_t in old_targets:
+                affected_targets.add(old_t)
+                imp_list = self._imported_by.get(old_t)
+                if imp_list and rel in imp_list:
+                    imp_list.remove(rel)
+            self._symbol_imports.pop(rel, None)
+            if rel in deleted_rels:
+                self._imported_by.pop(rel, None)
+
+        _JSX_EXTS = {".tsx", ".jsx"}
+        file_set = set(self._index)
+        if has_added_or_deleted or not getattr(self, "_python_module_index", None):
+            self._python_module_index = resolve.build_python_module_index(self._index)
+        module_index = self._python_module_index
+
+        for rel in changed_rels:
+            info = self._index.get(rel)
+            if not info:
+                continue
+            new_toks = self._compute_file_blob(rel, info)
+            for tok in new_toks:
+                doc_freq[tok] = doc_freq.get(tok, 0) + 1
+                touched_tokens.add(tok)
+            targets, sym_map = resolve.resolve_file_imports_and_symbols(
+                rel, info, file_set, module_index,
+            )
+            self._import_targets[rel] = targets
+            self._symbol_imports[rel] = sym_map
+            for target in targets:
+                affected_targets.add(target)
+                imp_list = self._imported_by.setdefault(target, [])
+                if rel not in imp_list:
+                    imp_list.append(rel)
+            ext = Path(rel).suffix.lower()
+            self._behaviors[rel] = classify_file_functions(
+                info, is_jsx=(ext in _JSX_EXTS),
+            )
+            self._importer_counts[rel] = len(self._imported_by.get(rel, []))
+
+        for t in affected_targets:
+            if t in self._index:
+                self._importer_counts[t] = len(self._imported_by.get(t, []))
+
+        n_docs = max(len(self._index), 1)
+        for tok in touched_tokens:
+            df = doc_freq.get(tok, 0)
+            if df <= 0:
+                self._idf.pop(tok, None)
+            else:
+                self._idf[tok] = math.log(1.0 + (n_docs - df + 0.5) / (df + 0.5)) + 1.0
 
     def _graph_boost(self, base_scores: dict[str, float], top_n: int) -> dict[str, float]:
         """Expand keyword hits through graph edges for graph-boosted ranking."""
@@ -3551,8 +3757,8 @@ class ProjectBrain:
     def is_stale(self) -> bool:
         """Cheap staleness check: stat() every relevant file, no reads/parsing."""
         current = {
-            str(path.relative_to(self.root)).replace("\\", "/"): path.stat().st_mtime
-            for path in self._walk()
+            rel: mtime
+            for rel, _, mtime in self._walk_entries()
         }
         if not current and self._index and self._db_store.db_path.exists():
             return False
@@ -3566,10 +3772,10 @@ class ProjectBrain:
         if not self._index:
             return self.index()
 
-        current_files: dict[str, Path] = {}
-        for path in self._walk():
-            rel = str(path.relative_to(self.root)).replace("\\", "/")
-            current_files[rel] = path
+        current_files: dict[str, tuple[str, float]] = {
+            rel: (abs_path, mtime)
+            for rel, abs_path, mtime in self._walk_entries()
+        }
 
         old_keys = set(self._index.keys()) | set(self._skipped.keys())
         new_keys = set(current_files.keys())
@@ -3578,15 +3784,10 @@ class ProjectBrain:
         deleted = old_keys - new_keys
         potentially_modified = set(self._index.keys()) & new_keys
 
-        modified: set[str] = set()
-        for rel in potentially_modified:
-            path = current_files[rel]
-            try:
-                mtime = path.stat().st_mtime
-            except OSError:
-                continue
-            if mtime != self._index[rel].get("mtime"):
-                modified.add(rel)
+        modified: set[str] = {
+            rel for rel in potentially_modified
+            if current_files[rel][1] != self._index[rel].get("mtime")
+        }
 
         if not added and not deleted and not modified:
             return {
@@ -3596,9 +3797,12 @@ class ProjectBrain:
             }
 
         deleted_indexed: set[str] = set()
+        skipped_changed = False
         for rel in deleted:
             if rel in self._index:
                 deleted_indexed.add(rel)
+            if rel in self._skipped:
+                skipped_changed = True
             self._index.pop(rel, None)
             self._sizes.pop(rel, None)
             self._skipped.pop(rel, None)
@@ -3609,17 +3813,19 @@ class ProjectBrain:
         indexed_added = 0
         indexed_modified = 0
         for rel in added | modified:
-            path = current_files[rel]
+            path = Path(current_files[rel][0])
             ext = path.suffix.lower()
             self._source_cache.pop(rel, None)
             self._ledger.invalidate_file(rel)
             was_in_index = rel in self._index
-            old_iface_hash = (self._index.get(rel) or {}).get("interface_hash")
+            old_info = self._index.get(rel) or {}
+            old_iface_hash = compute_file_interface_hash(old_info) if old_info else None
 
             try:
                 source = path.read_text(encoding="utf-8", errors="ignore")
             except OSError as e:
                 self._skipped[rel] = f"read_error:{e.__class__.__name__}"
+                skipped_changed = True
                 if was_in_index:
                     self._index.pop(rel, None)
                     deleted_indexed.add(rel)
@@ -3628,13 +3834,16 @@ class ProjectBrain:
 
             if _is_minified(source):
                 self._skipped[rel] = "minified_or_generated"
+                skipped_changed = True
                 if was_in_index:
                     self._index.pop(rel, None)
                     deleted_indexed.add(rel)
                 all_interfaces_unchanged = False
                 continue
 
-            self._skipped.pop(rel, None)
+            if rel in self._skipped:
+                self._skipped.pop(rel, None)
+                skipped_changed = True
             st = path.stat()
             info, ts_tree = parse_with_tree(source, ext)
             info.setdefault("routes", []).extend(frameworks.infer_file_based_routes(rel, info))
@@ -3657,33 +3866,68 @@ class ProjectBrain:
         # If newly added files were all skipped (minified/vendored) and no indexed file changed,
         # persist the updated skipped table without rebuilding blobs or the graph.
         if indexed_added == 0 and indexed_modified == 0 and not deleted_indexed:
-            self._db_store.update_skipped_only(self._skipped)
+            if skipped_changed:
+                self._db_store.update_skipped_only(self._skipped)
             return {
                 "status": "up_to_date",
                 "added": 0, "modified": 0, "deleted": 0,
                 "total_files": len(self._index),
             }
 
-        self._build_blobs()
-        self._graph = CodeGraph.build(
-            self._index,
-            import_targets=self._import_targets,
-            symbol_imports=self._symbol_imports,
-        )
-        self._sync_interprocedural_effects()
-        self._db_store.apply_incremental(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "parser_version": PARSER_VERSION,
-                "graph_version": GRAPH_VERSION,
-                "root": str(self.root),
-            },
-            {r: self._index[r] for r in (added | modified) if r in self._index},
-            self._sizes,
-            deleted_indexed,
-            self._skipped,
-            graph_json=None if all_interfaces_unchanged else self._graph.to_dict(),
-        )
+        changed_indexed = {r for r in (added | modified) if r in self._index}
+        if self._graph is not None and len(changed_indexed | deleted_indexed) <= 30:
+            self._update_blobs_incremental(
+                changed_indexed,
+                deleted_indexed,
+                has_added_or_deleted=bool(indexed_added or deleted_indexed),
+            )
+            graph_delta = self._graph.update_files(
+                changed_indexed,
+                deleted_indexed,
+                self._index,
+                import_targets=self._import_targets,
+                symbol_imports=self._symbol_imports,
+                imported_by=self._imported_by,
+                interfaces_unchanged=all_interfaces_unchanged,
+            )
+            self._sync_interprocedural_effects(target_rels=set(graph_delta["affected_rels"]))
+            self._db_store.apply_incremental(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "parser_version": PARSER_VERSION,
+                    "graph_version": GRAPH_VERSION,
+                    "root": str(self.root),
+                },
+                {r: self._index[r] for r in changed_indexed},
+                self._sizes,
+                deleted_indexed,
+                self._skipped,
+                graph_json=None,
+                graph_delta=graph_delta,
+                skipped_changed=skipped_changed,
+            )
+        else:
+            self._build_blobs()
+            self._graph = CodeGraph.build(
+                self._index,
+                import_targets=self._import_targets,
+                symbol_imports=self._symbol_imports,
+            )
+            self._sync_interprocedural_effects()
+            self._db_store.apply_incremental(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "parser_version": PARSER_VERSION,
+                    "graph_version": GRAPH_VERSION,
+                    "root": str(self.root),
+                },
+                {r: self._index[r] for r in changed_indexed},
+                self._sizes,
+                deleted_indexed,
+                self._skipped,
+                graph_json=None if all_interfaces_unchanged else self._graph.to_dict(),
+                skipped_changed=skipped_changed,
+            )
         for legacy in (self._cache_path, self._graph_path):
             if legacy.exists():
                 legacy.unlink(missing_ok=True)
@@ -5181,52 +5425,135 @@ class ProjectBrain:
                 ignored = not is_neg
         return ignored
 
-    def _walk(self):
-        # Collect root .gitignore and .git/info/exclude rules, plus nested .gitignore files
+    def _walk_entries(self) -> list[tuple[str, str, float]]:
+        """Fast os.scandir traversal returning (rel_posix, abs_path_str, mtime)."""
+        gi_cache: dict[tuple[str, float, str], list[tuple[bool, bool, str, re.Pattern]]] = getattr(
+            self, "_gi_rules_cache", {}
+        )
+        self._gi_rules_cache = gi_cache
+        eval_cache: dict[tuple[tuple, str, bool], bool] = getattr(self, "_gi_eval_cache", {})
+        if len(eval_cache) > 100_000:
+            eval_cache.clear()
+        self._gi_eval_cache = eval_cache
+
+        def _get_cached_gi(gi_path: Path, mtime: float, base_rel: str):
+            key = (str(gi_path), mtime, base_rel)
+            if key not in gi_cache:
+                gi_cache[key] = self._load_gitignore_rules(gi_path, base_rel)
+            return gi_cache[key]
+
         root_rules: list[tuple[bool, bool, str, re.Pattern]] = []
+        root_key_parts: list[tuple[str, float]] = []
         root_gi = self.root / ".gitignore"
-        if root_gi.is_file():
-            root_rules.extend(self._load_gitignore_rules(root_gi, ""))
+        try:
+            st = root_gi.stat()
+            root_rules.extend(_get_cached_gi(root_gi, st.st_mtime, ""))
+            root_key_parts.append((str(root_gi), st.st_mtime))
+        except OSError:
+            pass
         git_exclude = self.root / ".git" / "info" / "exclude"
-        if git_exclude.is_file():
-            root_rules.extend(self._load_gitignore_rules(git_exclude, ""))
+        try:
+            st = git_exclude.stat()
+            root_rules.extend(_get_cached_gi(git_exclude, st.st_mtime, ""))
+            root_key_parts.append((str(git_exclude), st.st_mtime))
+        except OSError:
+            pass
 
-        nested_rules_by_dir: dict[str, list[tuple[bool, bool, str, re.Pattern]]] = {"": root_rules}
+        skip_suffixes_tuple = tuple(SKIP_SUFFIXES)
+        results: list[tuple[str, str, float]] = []
 
-        for dirpath, dirs, files in os.walk(self.root, topdown=True):
-            dp = Path(dirpath)
-            rel_dir = "" if dp == self.root else str(dp.relative_to(self.root)).replace("\\", "/")
-            parent_dir = "/".join(rel_dir.split("/")[:-1]) if "/" in rel_dir else ""
-            active_rules = list(nested_rules_by_dir.get(parent_dir, root_rules) if rel_dir else root_rules)
-            if rel_dir and (dp / ".gitignore").is_file():
-                active_rules.extend(self._load_gitignore_rules(dp / ".gitignore", rel_dir))
-            nested_rules_by_dir[rel_dir] = active_rules
+        def _scan_dir(
+            dir_abs: str,
+            rel_dir: str,
+            active_rules: list[tuple[bool, bool, str, re.Pattern]],
+            rules_key: tuple[tuple[str, float], ...],
+        ) -> None:
+            try:
+                with os.scandir(dir_abs) as it:
+                    entries = list(it)
+            except OSError:
+                return
+
+            dir_entries: list[os.DirEntry] = []
+            file_entries: list[os.DirEntry] = []
+            gi_entry: os.DirEntry | None = None
+
+            for entry in entries:
+                try:
+                    if entry.is_dir(follow_symlinks=False):
+                        dir_entries.append(entry)
+                    elif entry.is_file(follow_symlinks=False):
+                        file_entries.append(entry)
+                        if rel_dir and entry.name == ".gitignore":
+                            gi_entry = entry
+                except OSError:
+                    continue
+
+            if gi_entry is not None:
+                try:
+                    gi_mtime = gi_entry.stat(follow_symlinks=False).st_mtime
+                    extra = _get_cached_gi(Path(gi_entry.path), gi_mtime, rel_dir)
+                    if extra:
+                        active_rules = list(active_rules) + extra
+                        rules_key = rules_key + ((gi_entry.path, gi_mtime),)
+                except OSError:
+                    pass
+
             has_negations = any(r[0] for r in active_rules)
+            dir_entries.sort(key=lambda e: e.name)
+            file_entries.sort(key=lambda e: e.name)
 
-            filtered_dirs = []
-            for d in dirs:
+            kept_dirs: list[tuple[str, str]] = []
+            for d_entry in dir_entries:
+                d = d_entry.name
                 if d in SKIP_DIRS or d.startswith((".pytest", ".mypy", ".ruff", ".tox", ".nox")) or d == "target":
                     continue
-                cand = dp / d
-                if cand != self.root and (cand / "src" / "projectbrain" / "brain.py").exists():
+                if d == "projectbrain" and os.path.exists(
+                    os.path.join(d_entry.path, "src", "projectbrain", "brain.py")
+                ):
                     continue
                 d_rel = f"{rel_dir}/{d}" if rel_dir else d
-                if active_rules and self._matches_gitignore(d_rel, True, active_rules) and not has_negations:
-                    continue
-                filtered_dirs.append(d)
-            dirs[:] = sorted(filtered_dirs)
-            for fname in sorted(files):
-                if fname in SKIP_FILES:
-                    continue
-                if any(fname.endswith(s) for s in SKIP_SUFFIXES):
+                if active_rules and not has_negations:
+                    ckey = (rules_key, d_rel, True)
+                    ignored = eval_cache.get(ckey)
+                    if ignored is None:
+                        ignored = self._matches_gitignore(d_rel, True, active_rules)
+                        eval_cache[ckey] = ignored
+                    if ignored:
+                        continue
+                kept_dirs.append((d_entry.path, d_rel))
+
+            for f_entry in file_entries:
+                fname = f_entry.name
+                if fname in SKIP_FILES or fname.endswith(skip_suffixes_tuple):
                     continue
                 ext = os.path.splitext(fname)[1].lower()
                 if ext not in PARSED_EXTS:
                     continue
                 f_rel = f"{rel_dir}/{fname}" if rel_dir else fname
-                if active_rules and self._matches_gitignore(f_rel, False, active_rules):
+                if active_rules:
+                    ckey = (rules_key, f_rel, False)
+                    ignored = eval_cache.get(ckey)
+                    if ignored is None:
+                        ignored = self._matches_gitignore(f_rel, False, active_rules)
+                        eval_cache[ckey] = ignored
+                    if ignored:
+                        continue
+                try:
+                    mtime = f_entry.stat(follow_symlinks=False).st_mtime
+                except OSError:
                     continue
-                yield dp / fname
+                results.append((f_rel, f_entry.path, mtime))
+
+            for sub_abs, sub_rel in kept_dirs:
+                _scan_dir(sub_abs, sub_rel, active_rules, rules_key)
+
+        _scan_dir(str(self.root), "", root_rules, tuple(root_key_parts))
+        return results
+
+    def _walk(self):
+        for _, abs_path, _ in self._walk_entries():
+            yield Path(abs_path)
 def _extract_balanced_call_args(snippet: str, fn_name: str) -> list[str] | None:
     """Extract top-level argument strings for `fn_name(...)` respecting nested `()`, `[]`, `{}`, and quotes."""
     m = re.search(rf"\b{re.escape(fn_name)}\s*\(", snippet)
@@ -5329,6 +5656,18 @@ def _tokenize_symbol(name: str) -> list[str]:
     return [t.lower() for t in tokens if len(t) > 1]
 
 
+_COMPOUND_SUFFIXES = (
+    "handlers", "handler", "contexts", "context", "requests", "request",
+    "responses", "response", "dispatchers", "dispatcher", "routers", "router",
+    "loaders", "loader", "parsers", "parser", "builders", "builder",
+    "wrappers", "wrapper", "helpers", "helper", "managers", "manager",
+    "callbacks", "callback", "listeners", "listener", "middlewares", "middleware",
+    "validators", "validator", "decorators", "decorator", "exceptions", "exception",
+    "blueprints", "blueprint", "sessions", "session", "globals", "global",
+    "signals", "signal", "views", "view", "clients", "client", "runners", "runner",
+)
+
+
 def _extract_keywords(prompt: str) -> list[str]:
     tokens = re.findall(r"[a-zA-Z0-9_/.-]+", prompt.lower())
     expanded: list[str] = []
@@ -5336,6 +5675,17 @@ def _extract_keywords(prompt: str) -> list[str]:
         expanded.append(token)
         if "-" in token:
             expanded.extend(token.split("-"))
+        elif len(token) >= 7 and "_" not in token and "/" not in token and "." not in token:
+            for sfx in _COMPOUND_SUFFIXES:
+                if token.endswith(sfx) and len(token) - len(sfx) >= 3:
+                    prefix = token[: -len(sfx)]
+                    sfx_sing = sfx[:-1] if sfx.endswith("s") else sfx
+                    expanded.append(f"{prefix}_{sfx_sing}")
+                    expanded.append(prefix)
+                    expanded.append(sfx)
+                    if sfx_sing != sfx:
+                        expanded.append(sfx_sing)
+                    break
     seen: set[str] = set()
     result: list[str] = []
     for w in expanded:

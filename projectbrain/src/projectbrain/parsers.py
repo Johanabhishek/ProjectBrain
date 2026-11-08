@@ -221,7 +221,8 @@ def _get_compiled_query(lang: Language, pattern: str) -> Query:
 
 
 def _captures(lang: Language, pattern: str, root) -> dict:
-    return QueryCursor(_get_compiled_query(lang, pattern)).captures(root)
+    raw = QueryCursor(_get_compiled_query(lang, pattern)).captures(root)
+    return {k: sorted(v, key=lambda n: n.start_byte) for k, v in raw.items()}
 
 
 def _matches(lang: Language, pattern: str, root):
@@ -1518,16 +1519,25 @@ def compute_file_interface_hash(info: dict) -> str:
     incremental indexing can short-circuit global import and graph resolution.
     """
     parts: list[str] = []
-    for fn in info.get("functions", []):
-        parts.append(f"fn:{fn.get('parent_class', '')}.{fn.get('name', '')}:{fn.get('interface_hash', fn.get('signature', ''))}")
-    for cls in info.get("classes", []):
-        parts.append(f"cls:{cls.get('name', '')}:{cls.get('interface_hash', cls.get('signature', ''))}")
+    for fn_part in sorted(
+        f"fn:{fn.get('parent_class', '')}.{fn.get('name', '')}:{fn.get('interface_hash', fn.get('signature', ''))}"
+        for fn in info.get("functions", [])
+    ):
+        parts.append(fn_part)
+    for cls_part in sorted(
+        f"cls:{cls.get('name', '')}:{cls.get('interface_hash', cls.get('signature', ''))}"
+        for cls in info.get("classes", [])
+    ):
+        parts.append(cls_part)
     for imp in sorted(info.get("imports", [])):
         parts.append(f"imp:{imp}")
     for exp in sorted(info.get("exports", [])):
         parts.append(f"exp:{exp}")
-    for rt in info.get("routes", []):
-        parts.append(f"rt:{rt.get('method', '')}:{rt.get('full_path', rt.get('path', ''))}:{rt.get('handler', '')}")
+    for rt_part in sorted(
+        f"rt:{rt.get('method', '')}:{rt.get('full_path', rt.get('path', ''))}:{rt.get('handler', '')}"
+        for rt in info.get("routes", [])
+    ):
+        parts.append(rt_part)
     for tbl in sorted((info.get("sql_schemas") or {}).keys()):
         sc = info["sql_schemas"][tbl]
         parts.append(f"sql:{tbl}:{','.join(sc.get('required_cols', []))}:{','.join(sc.get('all_cols', []))}")

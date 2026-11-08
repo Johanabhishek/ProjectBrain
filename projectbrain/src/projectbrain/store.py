@@ -327,7 +327,9 @@ class SQLiteIndexStore:
         sizes: dict[str, int],
         deleted_rels: set[str],
         skipped: dict[str, str],
-        graph_json: str | None = None,
+        graph_json: str | dict | None = None,
+        graph_delta: dict | None = None,
+        skipped_changed: bool = True,
     ) -> None:
         if not self.db_path.exists():
             return
@@ -388,7 +390,36 @@ class SQLiteIndexStore:
                            VALUES (?, ?, ?, ?, ?, ?);""",
                         fts_rows,
                     )
-                if graph_json is not None:
+                if graph_delta is not None:
+                    rem_rels = graph_delta.get("removed_rels", [])
+                    rem_nids = graph_delta.get("removed_node_ids", [])
+                    reb_sids = graph_delta.get("rebuild_src_ids", [])
+                    if rem_rels:
+                        conn.executemany("DELETE FROM graph_nodes WHERE rel_path = ?;", [(r,) for r in rem_rels])
+                    if rem_nids:
+                        conn.executemany("DELETE FROM graph_nodes WHERE node_id = ?;", [(n,) for n in rem_nids])
+                        conn.executemany("DELETE FROM edges WHERE dst_id = ?;", [(n,) for n in rem_nids])
+                    if reb_sids:
+                        conn.executemany("DELETE FROM edges WHERE src_id = ?;", [(s,) for s in reb_sids])
+                    node_rows, edge_rows = self._extract_node_and_edge_rows({
+                        "nodes": graph_delta.get("upserted_nodes", {}),
+                        "edges": graph_delta.get("new_edges", []),
+                    })
+                    if node_rows:
+                        conn.executemany(
+                            """INSERT OR REPLACE INTO graph_nodes
+                               (node_id, node_type, rel_path, name, props_json)
+                               VALUES (?, ?, ?, ?, ?);""",
+                            node_rows,
+                        )
+                    if edge_rows:
+                        conn.executemany(
+                            """INSERT OR REPLACE INTO edges
+                               (src_id, dst_id, edge_type, confidence, line, reason)
+                               VALUES (?, ?, ?, ?, ?, ?);""",
+                            edge_rows,
+                        )
+                elif graph_json is not None:
                     conn.execute("DELETE FROM graph_nodes;")
                     conn.execute("DELETE FROM edges;")
                     node_rows, edge_rows = self._extract_node_and_edge_rows(graph_json)
@@ -406,12 +437,13 @@ class SQLiteIndexStore:
                                VALUES (?, ?, ?, ?, ?, ?);""",
                             edge_rows,
                         )
-                conn.execute("DELETE FROM skipped;")
-                if skipped:
-                    conn.executemany(
-                        "INSERT INTO skipped (rel_path, reason) VALUES (?, ?);",
-                        list(skipped.items()),
-                    )
+                if skipped_changed:
+                    conn.execute("DELETE FROM skipped;")
+                    if skipped:
+                        conn.executemany(
+                            "INSERT INTO skipped (rel_path, reason) VALUES (?, ?);",
+                            list(skipped.items()),
+                        )
         finally:
             conn.close()
 

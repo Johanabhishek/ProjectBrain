@@ -1,4 +1,4 @@
-# ProjectBrain (`projectbrain-mcp` v0.8.6)
+# ProjectBrain (`projectbrain-mcp` v0.8.7)
 
 [![PyPI](https://img.shields.io/pypi/v/projectbrain-mcp.svg)](https://pypi.org/project/projectbrain-mcp/)
 [![License: MIT](https://img.shields.io/badge/License: MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -47,7 +47,7 @@ ProjectBrain indexes 29 file extensions across three explicit capability tiers:
 ### 1. Install
 
 ```bash
-pip install "projectbrain-mcp>=0.8.6"
+pip install "projectbrain-mcp>=0.8.7"
 ```
 
 ### 2. Initialize a Repository (Minimal & Non-Destructive)
@@ -102,7 +102,7 @@ python eval/run_eval.py
 # 2. 200-file polyglot scale, incremental Salsa early-cutoff, FTS5, and recursive CTE latency benchmark
 python eval/bench_scale.py
 
-# 3. Full unit, integration, security, and regression test suite (197 tests)
+# 3. Full unit, integration, security, and regression test suite (198 tests)
 pytest projectbrain/tests -q
 ```
 
@@ -115,16 +115,27 @@ pytest projectbrain/tests -q
 | **Closed-World Claim Verification (`eval/claim_tasks.json`)** | Exact Verdict Accuracy (22 tasks) | **`22 / 22 (100%)`** | `SUPPORTED` / `REFUTED` / `UNKNOWN` accuracy (`0` false supports, `0` false refutations; returns `UNKNOWN` on syntax-broken files) |
 | **Self-Dogfooding & Zero-ID Slicing** | Symbol Recall (7 tasks) | **`7 / 7 (100% Recall)`** | Natural-language prompts with zero function names leaked |
 
-### What Changed in `v0.8.5` – `v0.8.6` (From `pallets/flask` & `django/django` Sandbox Reviews)
+### External Repository Benchmarks (`pallets/flask` & `django/django`, `v0.8.7`)
 
-1. **Fixed Perpetual Graph Rebuild on Skipped/Vendored Files (`I-02`):**
-   - Previously, files skipped as minified/vendored (e.g., 60 vendored `.js` files in Django) were recorded in `_skipped` but omitted from `is_stale()` and `incremental_index()` known-file sets, causing every warm query on Django to treat them as 60 newly added files and rebuild/re-serialize the entire graph. `is_stale()` and `incremental_index()` now track `_skipped` alongside `_index`, reducing unchanged warm `incremental_index()` checks to `0` added files (`up_to_date` in `< 100ms`).
-2. **Fast Cold-Start SQLite Slicing & Zero-Copy Graph Persistence (`I-03`):**
-   - `projectbrain slice <Symbol>` now queries the indexed `symbols` and `files` tables in `.projectbrain.db` directly before loading the full repository graph into memory, and `CodeGraph` persistence passes in-memory dictionaries directly to SQLite instead of round-tripping through `json.dumps(..., indent=2)` -> `json.loads()`.
-   - Capped 3-hop `effect_provenance` dictionaries and replaced $O(N_{\text{calls}} \times N_{\text{candidates}})$ candidate scans in `CodeGraph.build()` with $O(1)$ `(file, symbol)` + $O(|\text{imports}|)$ lookups.
-3. **AST/PDG Multi-Dimensional Program Slicing & Config/State Indexing (`I-05`):**
-   - Implemented [`compute_multidim_program_slice`](src/projectbrain/slicer.py) (tracing backward `def -> use`, forward `def -> use`, and upward control-flow guards) and indexed class/module-level config declarations (`ConfigAttribute`, `ImmutableDict`, constants) so queries like `"where is SECRET_KEY used"` and `"how are exceptions routed to error handlers"` on `pallets/flask` return the complete chain (`ConfigAttribute("SECRET_KEY")`, `get_signing_serializer`, `_get_exc_class_and_code`, `_find_error_handler`) with zero test/example noise.
-4. **Flask Tuple Route Methods & Scoped Contract Checks (`I-04`):**
-   - `_flask_methods` now parses `tuple` and `set` literals (`methods=("GET", "POST")`), and `.py` pytest `client.post(...)` calls are no longer mistaken for frontend HTTP calls.
-5. **Pinned `mcp>=1.2.0,<2.0.0`, Minimal `init --ide auto`, and Root `pyproject.toml` Fix (`I-01`, `I-06`, `I-07`):**
-   - Pinned `mcp>=1.2.0,<2.0.0` so `mcp.server.fastmcp` is always present, changed `projectbrain init` default to `--ide auto`, and pointed the root `pyproject.toml` at `projectbrain/src`.
+| Benchmark | `v0.8.4` | `v0.8.6` | `v0.8.7` |
+| :--- | :---: | :---: | :---: |
+| **`pallets/flask` (6 Architectural Questions) — Target Function Slice Recall** | `9 / 19` (`47.4%`) | `12 / 19` (`63.2%`) | **`19 / 19` (`100%`, `21 / 21` full set)** |
+| **`pallets/flask` (6 Architectural Questions) — Total Dossier Output** | `68.0 KB` | `113.0 KB` | **`57.3 KB` (`-49.3%` vs `v0.8.6`)** |
+| **`pallets/flask` (6 Architectural Questions) — Cost per Correct Hit** | `7.6 KB` | `9.4 KB` | **`2.73 KB` (`3.01 KB` on 19-fn subset)** |
+| **`django/django` (`3,051` files) — Single-File Edit `incremental_index()` Latency** | ~7,000 ms (global rebuild) | ~7,000 ms (global rebuild) | **`~500–970 ms` (`O(Δ)` graph + SQLite delta)** |
+
+### What Changed in `v0.8.5` – `v0.8.7` (From `pallets/flask` & `django/django` Sandbox Reviews)
+
+1. **Dossier Token Budget, Docstring Folding, and Visible PDG Provenance (`v0.8.7`):**
+   - Folded multi-line Python docstrings (`> 3` lines) in dossier slices before budgeting `max_lines`, replaced verbose Markdown 6D tables and file skeletons with compact 1-line summaries on secondary files, and wired [`compute_multidim_program_slice`](src/projectbrain/slicer.py) directly into `compile_dossier()` with explicit `# [PDG Slice: seeds=L.. | bwd_defs=L.. | fwd_uses=L.. | guards=L.. | vars=...]` headers.
+   - Across the 6-question `pallets/flask` benchmark, target function slice recall improved from `12 / 19` (`v0.8.6`) to **`19 / 19` (`21 / 21`)** while total dossier size dropped **49.3%** (`113 KB` -> **`57.28 KB`**, **`2.73 KB` per hit**).
+2. **Compound Domain Term Splitting & State-Flow Dispatch Bridging (`v0.8.7`):**
+   - `_extract_keywords()` now splits glued compound identifiers (`"errorhandlers"` -> `["errorhandlers", "error_handler", "error", "handlers", "handler"]`) and stems agentive nouns (`"handler"` -> `"handle"`), discounts docstring-only matches (`teardown_appcontext`), and bridges `state_flow` writers (`register_error_handler`) to readers (`_find_error_handler`) and their callers (`handle_user_exception`, `handle_http_exception`).
+3. **$O(\Delta)$ Incremental Graph & SQLite Updates (`v0.8.7`):**
+   - `incremental_index()` now updates `_blobs`, `CodeGraph` (`update_files`), and SQLite (`apply_incremental` with `graph_delta`) incrementally for only the modified files, and sorts Tree-sitter 0.23+ capture nodes deterministically so `salsa_early_cutoff` triggers reliably on body-only edits (cutting single-file edit latency on `django/django` from `~7.0 s` to `< 1.0 s`).
+4. **Fixed Perpetual Graph Rebuild on Skipped/Vendored Files (`I-02`):**
+   - `is_stale()` and `incremental_index()` track `_skipped` alongside `_index`, preventing vendored/minified files from triggering repeated re-indexing.
+5. **Fast Cold-Start SQLite Slicing & Zero-Copy Graph Persistence (`I-03`):**
+   - `projectbrain slice <Symbol>` queries indexed `symbols` and `files` tables in `.projectbrain.db` directly before loading the full repository graph into memory.
+6. **Flask Tuple Route Methods, Scoped Contract Checks, and Pinned `mcp` (`I-01`, `I-04`, `I-06`, `I-07`):**
+   - `_flask_methods` parses `tuple` and `set` literals (`methods=("GET", "POST")`), `.py` pytest `client.post(...)` calls are excluded from frontend HTTP contract checks, `mcp>=1.2.0,<2.0.0` is pinned, and the PyPI classifier is set to `Development Status :: 4 - Beta`.

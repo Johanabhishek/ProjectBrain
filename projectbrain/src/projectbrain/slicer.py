@@ -56,6 +56,76 @@ _PDG_NOISE_VARS = {
 }
 
 
+def _detect_leading_docstring(selected_lines: list[str]) -> tuple[int, int, int] | None:
+    """Detect a leading multi-line docstring or JSDoc comment near the top of `selected_lines`.
+
+    Returns `(doc_start_idx0, fold_start_idx0, doc_end_idx0)` (0-based inclusive indices)
+    where `fold_start_idx0 .. doc_end_idx0` can be folded while keeping the opening
+    1-line summary at `doc_start_idx0` (and `doc_start_idx0 + 1` if opening line is bare `\"\"\"`).
+    """
+    n = len(selected_lines)
+    if n < 4:
+        return None
+    idx = 0
+    in_sig = False
+    paren_depth = 0
+    while idx < min(n, 18):
+        st = selected_lines[idx].strip()
+        if not st or st.startswith(("#", "//")):
+            idx += 1
+            continue
+        if st.startswith("@") and not in_sig:
+            idx += 1
+            continue
+        if not in_sig and re.match(r"^(?:async\s+def|def|class|export\s+(?:default\s+)?(?:async\s+)?function|function)\b", st):
+            in_sig = True
+        if in_sig:
+            paren_depth += st.count("(") - st.count(")")
+            idx += 1
+            if paren_depth <= 0 and (st.endswith(":") or st.endswith("{")):
+                in_sig = False
+                break
+            continue
+        break
+
+    while idx < min(n, 20) and not selected_lines[idx].strip():
+        idx += 1
+    if idx >= n:
+        return None
+
+    first_st = selected_lines[idx].strip()
+    # Python triple-quoted docstring
+    m_py = re.match(r"^[rRuUfFbB]{0,2}(\"\"\"|\'\'\')", first_st)
+    if m_py:
+        q = m_py.group(1)
+        after_open = first_st[m_py.end():]
+        if q in after_open:
+            return None  # Single-line docstring
+        doc_start = idx
+        for j in range(idx + 1, n):
+            if q in selected_lines[j]:
+                doc_end = j
+                # Keep the first summary line of the docstring
+                fold_start = doc_start + 1 if after_open.strip() else doc_start + 2
+                if doc_end - fold_start + 1 >= 2:
+                    return (doc_start, fold_start, doc_end)
+                return None
+        return None
+
+    # JSDoc / C-style block comment
+    if first_st.startswith("/*") and "*/" not in first_st:
+        doc_start = idx
+        after_open = first_st[2:].lstrip("*").strip()
+        for j in range(idx + 1, n):
+            if "*/" in selected_lines[j]:
+                doc_end = j
+                fold_start = doc_start + 1 if after_open else doc_start + 2
+                if doc_end - fold_start + 1 >= 2:
+                    return (doc_start, fold_start, doc_end)
+                return None
+    return None
+
+
 def compute_multidim_program_slice(
     selected_lines: list[str],
     line_start: int,
@@ -75,7 +145,7 @@ def compute_multidim_program_slice(
     """
     n = len(selected_lines)
     terms = [t.lower() for t in (focus_terms or []) if len(t) >= 3]
-    if n == 0 or not terms:
+    if n == 0:
         return {
             "seed_lines": set(),
             "backward_def_lines": set(),
@@ -87,6 +157,14 @@ def compute_multidim_program_slice(
     defs: list[set[str]] = [set() for _ in range(n)]
     uses: list[set[str]] = [set() for _ in range(n)]
     control_parent: dict[int, int] = {}
+    docstring_lines: set[int] = set()
+    sig_lines: set[int] = set()
+    sink_lines: set[int] = set()
+
+    doc_bounds = _detect_leading_docstring(selected_lines)
+    if doc_bounds is not None:
+        for d_i in range(doc_bounds[0], doc_bounds[2] + 1):
+            docstring_lines.add(d_i)
 
     parsed_py_ast = False
     if ext == ".py":
@@ -98,6 +176,15 @@ def compute_multidim_program_slice(
             for node in ast.walk(tree):
                 for ch in ast.iter_child_nodes(node):
                     parent_map[ch] = node
+                if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                    fn_ln = getattr(node, "lineno", 1) - 1
+                    if fn_ln <= 4:
+                        sig_lines.add(fn_ln)
+                    if node.body and isinstance(node.body[0], ast.Expr) and isinstance(node.body[0].value, ast.Constant) and isinstance(node.body[0].value.value, str):
+                        ds_s = getattr(node.body[0], "lineno", 1) - 1
+                        ds_e = getattr(node.body[0], "end_lineno", ds_s + 1) - 1
+                        for d_i in range(max(0, ds_s), min(n, ds_e + 1)):
+                            docstring_lines.add(d_i)
             _CTRL_TYPES = (
                 ast.If, ast.For, ast.AsyncFor, ast.While,
                 ast.With, ast.AsyncWith, ast.Try, ast.ExceptHandler,
@@ -107,7 +194,14 @@ def compute_multidim_program_slice(
                 if lineno is None or not (1 <= lineno <= n):
                     continue
                 idx0 = lineno - 1
-                if isinstance(node, ast.Name):
+                if idx0 in docstring_lines:
+                    continue
+                if isinstance(node, ast.arg):
+                    a_low = node.arg.lower()
+                    if len(a_low) >= 2 and a_low not in _PDG_NOISE_VARS:
+                        defs[idx0].add(a_low)
+                        sig_lines.add(idx0)
+                elif isinstance(node, ast.Name):
                     v_low = node.id.lower()
                     if len(v_low) >= 2 and v_low not in _PDG_NOISE_VARS:
                         if isinstance(node.ctx, ast.Store):
@@ -125,6 +219,8 @@ def compute_multidim_program_slice(
                     eh_low = node.name.lower()
                     if len(eh_low) >= 2 and eh_low not in _PDG_NOISE_VARS:
                         defs[idx0].add(eh_low)
+                elif isinstance(node, (ast.Return, ast.Raise, ast.Yield, ast.YieldFrom)):
+                    sink_lines.add(idx0)
                 elif isinstance(node, ast.Constant) and isinstance(node.value, str):
                     s_val = node.value.strip()
                     if 3 <= len(s_val) <= 40 and re.match(r"^[A-Za-z_][A-Za-z0-9_.\-]*$", s_val):
@@ -149,9 +245,15 @@ def compute_multidim_program_slice(
             r"^\s*(?:\}\s*)?(?:if|elif|else\s+if|else|for|while|try|except|catch|finally|with|switch|case)\b"
         )
         for i, raw in enumerate(selected_lines):
+            if i in docstring_lines:
+                continue
             st = raw.strip()
             if not st or st.startswith(("#", "//", "/*")):
                 continue
+            if i == 0 and re.match(r"^(?:async\s+def|def|class|export|function)\b", st):
+                sig_lines.add(i)
+            if re.match(r"^(?:return|raise|throw|yield)\b", st):
+                sink_lines.add(i)
             ind = len(raw) - len(raw.lstrip())
             while ctrl_stack and ctrl_stack[-1][0] >= ind and not st.startswith(("elif", "else", "except", "catch", "finally", "} else", "} catch")):
                 ctrl_stack.pop()
@@ -188,16 +290,21 @@ def compute_multidim_program_slice(
             for sk_m in re.findall(r"['\"]([A-Za-z_][A-Za-z0-9_.\-]{2,40})['\"]", rhs_part):
                 uses[i].add(sk_m.lower())
 
-    # Identify slicing criterion seed lines
+    # Identify slicing criterion seed lines (excluding docstring prose and bare signature headers)
     seed_lines: set[int] = set()
-    for i, raw in enumerate(selected_lines):
-        st = raw.strip()
-        if not st or st.startswith(("#", "//")):
-            continue
-        low = st.lower()
-        row_syms = defs[i] | uses[i]
-        if any(t in row_syms or t in low for t in terms):
-            seed_lines.add(i)
+    if terms:
+        for i, raw in enumerate(selected_lines):
+            if i in docstring_lines or i in sig_lines:
+                continue
+            st = raw.strip()
+            if not st or st.startswith(("#", "//")):
+                continue
+            low = st.lower()
+            row_syms = defs[i] | uses[i]
+            if any(t in row_syms or t in low for t in terms):
+                seed_lines.add(i)
+    if not seed_lines and sink_lines:
+        seed_lines = set(sink_lines)
 
     backward_def_lines: set[int] = set()
     forward_use_lines: set[int] = set()
@@ -212,7 +319,7 @@ def compute_multidim_program_slice(
             for v in uses[idx]:
                 for prev in range(idx - 1, -1, -1):
                     if v in defs[prev]:
-                        if prev not in seed_lines and prev not in backward_def_lines:
+                        if prev not in seed_lines and prev not in backward_def_lines and prev not in sig_lines:
                             backward_def_lines.add(prev)
                             next_bwd.add(prev)
                         if v not in traced_vars:
@@ -262,7 +369,42 @@ def compute_multidim_program_slice(
         "forward_use_lines": forward_use_lines,
         "control_guard_lines": control_guard_lines,
         "traced_vars": traced_vars[:12],
+        "docstring_bounds": doc_bounds,
     }
+
+
+def _format_pdg_slice_banner(
+    pdg_slice: dict,
+    start_idx: int,
+    keep: list[bool] | None = None,
+) -> str:
+    """Format a single-line provenance header showing PDG backward/forward/guard lines."""
+    def _to_lns(idx_set: set[int]) -> list[int]:
+        return [
+            start_idx + i + 1
+            for i in sorted(idx_set)
+            if keep is None or (0 <= i < len(keep) and keep[i])
+        ]
+
+    bwd_lns = _to_lns(pdg_slice.get("backward_def_lines", set()))
+    fwd_lns = _to_lns(pdg_slice.get("forward_use_lines", set()))
+    grd_lns = _to_lns(pdg_slice.get("control_guard_lines", set()))
+    if not (bwd_lns or fwd_lns or grd_lns):
+        return ""
+    seed_lns = _to_lns(pdg_slice.get("seed_lines", set()))
+    parts: list[str] = []
+    if seed_lns:
+        parts.append("seeds=" + ",".join(f"L{x}" for x in seed_lns[:4]))
+    if bwd_lns:
+        parts.append("bwd_defs=" + ",".join(f"L{x}" for x in bwd_lns[:4]))
+    if fwd_lns:
+        parts.append("fwd_uses=" + ",".join(f"L{x}" for x in fwd_lns[:4]))
+    if grd_lns:
+        parts.append("guards=" + ",".join(f"L{x}" for x in grd_lns[:4]))
+    tvars = pdg_slice.get("traced_vars", [])
+    if tvars:
+        parts.append("vars=" + ",".join(tvars[:5]))
+    return f"# [PDG Slice: {' | '.join(parts)}]"
 
 
 def slice_lines(
@@ -274,14 +416,14 @@ def slice_lines(
     focus_terms: list[str] | None = None,
     pin_lines: set[int] | list[int] | None = None,
     inline_annotations: dict[int, list[str]] | None = None,
+    fold_docstrings: bool = True,
 ) -> str:
     """Read [line_start..line_end] (1-indexed, inclusive) from root/rel_path,
     prefixed with line numbers.
 
-    When the range exceeds `max_lines`, performs Multi-Dimensional Program Slicing
-    (tracing AST backward `def -> use` data dependencies, forward `def -> use`
-    consumers, and upward control-flow guards) combined with smart focus-window
-    folding and delta-p=1 inline annotations.
+    Performs Multi-Dimensional Program Slicing (tracing AST backward `def -> use`
+    data dependencies, forward `def -> use` consumers, and upward control-flow
+    guards), automatic multi-line docstring folding, and smart focus-window folding.
     """
     full_path = root / rel_path
     try:
@@ -296,6 +438,8 @@ def slice_lines(
     end_idx = min(line_end, len(lines))
     selected = lines[start_idx:end_idx]
     total_len = len(selected)
+    if total_len == 0:
+        return ""
 
     def _emit_kept_line(idx_0: int, out_list: list[str]) -> None:
         actual_ln = start_idx + idx_0 + 1
@@ -307,65 +451,102 @@ def slice_lines(
                 out_list.append(f"   ! | {ind}{ann_msg}")
         out_list.append(f"{actual_ln:4d} | {raw_line}")
 
-    if total_len <= max_lines:
+    terms = list(dict.fromkeys(t.lower() for t in (focus_terms or []) if len(t) >= 3))
+    doc_bounds = _detect_leading_docstring(selected) if (fold_docstrings and (focus_terms is not None or total_len > max_lines)) else None
+    doc_fold_set: set[int] = set(range(doc_bounds[1], doc_bounds[2] + 1)) if doc_bounds is not None else set()
+    exec_len = total_len - len(doc_fold_set)
+
+    pdg_slice = (
+        compute_multidim_program_slice(
+            selected,
+            line_start,
+            terms,
+            ext=Path(rel_path).suffix.lower(),
+        )
+        if (terms or exec_len > max_lines) and exec_len >= 6
+        else {
+            "seed_lines": set(),
+            "backward_def_lines": set(),
+            "forward_use_lines": set(),
+            "control_guard_lines": set(),
+            "traced_vars": [],
+        }
+    )
+
+    if exec_len <= max_lines:
         out_short: list[str] = []
-        for i in range(total_len):
-            _emit_kept_line(i, out_short)
+        pdg_banner = _format_pdg_slice_banner(pdg_slice, start_idx) if (focus_terms is not None and exec_len >= 8) else ""
+        if pdg_banner:
+            out_short.append(pdg_banner)
+        i = 0
+        while i < total_len:
+            if i in doc_fold_set:
+                f_s = start_idx + doc_bounds[1] + 1  # type: ignore[index]
+                f_e = start_idx + doc_bounds[2] + 1  # type: ignore[index]
+                out_short.append(f" ... | [folded {len(doc_fold_set)} docstring lines L{f_s}-L{f_e}]")
+                i = doc_bounds[2] + 1  # type: ignore[index]
+            else:
+                _emit_kept_line(i, out_short)
+                i += 1
         return "\n".join(out_short)
 
-    # Multi-Dimensional Program Dependence Slicing (Backward Data + Forward Data + Control Guards)
-    terms = list(dict.fromkeys(t.lower() for t in (focus_terms or []) if len(t) >= 3))
-    pdg_slice = compute_multidim_program_slice(
-        selected,
-        line_start,
-        terms,
-        ext=Path(rel_path).suffix.lower(),
-    )
     bwd_def_set = pdg_slice["backward_def_lines"]
     fwd_use_set = pdg_slice["forward_use_lines"]
     ctrl_guard_set = pdg_slice["control_guard_lines"]
     keep = [False] * total_len
 
-    # Always keep the first head_n lines (signature + initial guardrails) and last tail_n lines
+    # Always keep the first head_exec non-docstring lines (signature + 1st docstring summary line + initial guardrails) and last tail_n lines
     pinned_in_range = [
         pln for pln in sorted(set(pin_lines or ()))
         if line_start <= pln <= line_end
     ]
-    head_n = min(10 if len(pinned_in_range) >= 4 else 15, max(5, max_lines // 4))
-    tail_n = min(4, max(2, max_lines // 12))
-    for i in range(head_n):
+    head_exec_target = min(5 if len(pinned_in_range) >= 4 else 6, max(3, max_lines // 5))
+    tail_n = min(3, max(2, max_lines // 12))
+    kept_head_exec = 0
+    head_end_idx = 0
+    for i in range(total_len):
+        if i in doc_fold_set:
+            continue
         keep[i] = True
+        kept_head_exec += 1
+        head_end_idx = i + 1
+        if kept_head_exec >= head_exec_target:
+            break
     for i in range(max(0, total_len - tail_n), total_len):
-        keep[i] = True
+        if i not in doc_fold_set:
+            keep[i] = True
     # Causal-Spine & Violation-Site Unfolding: pin exact AST violation / bridge lines first
     for pln in pinned_in_range:
         p_idx = pln - start_idx - 1
-        if 0 <= p_idx < total_len:
+        if 0 <= p_idx < total_len and p_idx not in doc_fold_set:
             keep[p_idx] = True
             for nb in (p_idx - 1, p_idx + 1):
-                if 0 <= nb < total_len and sum(1 for k in keep if k) < max_lines - 2:
+                if 0 <= nb < total_len and nb not in doc_fold_set and sum(1 for k in keep if k) < max_lines - 2:
                     keep[nb] = True
     # Pin enclosing AST control-dependence guards and primary backward/forward data-dependence lines
-    pdg_budget = max(4, max_lines // 3)
+    pdg_budget = max(5, max_lines // 2)
     pdg_pinned = 0
-    for g_idx in sorted(ctrl_guard_set) + sorted(bwd_def_set) + sorted(fwd_use_set):
-        if pdg_pinned >= pdg_budget or sum(1 for k in keep if k) >= max_lines - 4:
+    for g_idx in sorted(ctrl_guard_set) + sorted(bwd_def_set) + sorted(fwd_use_set) + sorted(pdg_slice["seed_lines"]):
+        if pdg_pinned >= pdg_budget or sum(1 for k in keep if k) >= max_lines - 3:
             break
-        if 0 <= g_idx < total_len and not keep[g_idx]:
+        if 0 <= g_idx < total_len and g_idx not in doc_fold_set and not keep[g_idx]:
             keep[g_idx] = True
             pdg_pinned += 1
     # Compute term frequency inside the function to discount ubiquitous local variable names
     low_lines = [ln.lower() for ln in selected]
     term_weights: dict[str, float] = {}
-    freq_cap = max(6, total_len // 6)
+    freq_cap = max(6, exec_len // 6)
     for t in terms:
-        df = sum(1 for low in low_lines if t in low)
+        df = sum(1 for idx_l, low in enumerate(low_lines) if idx_l not in doc_fold_set and t in low)
         term_weights[t] = 0.6 if df > freq_cap else 2.5
 
     # Score remaining lines by keyword matches, PDG data/control dependence, and control/timing patterns
     _CONSOLE_PAT = re.compile(r"^\s*console\.(log|warn|error|info|debug)\b")
     line_scores = [0.0] * total_len
     for i, line in enumerate(selected):
+        if i in doc_fold_set:
+            line_scores[i] = -99.0
+            continue
         stripped = line.strip()
         if not stripped or stripped.startswith("//") or stripped.startswith("#"):
             continue
@@ -406,14 +587,14 @@ def slice_lines(
         if is_style_noise and not is_jsx_handler and sc <= 2.0:
             sc = -1.5
         line_scores[i] = sc
-    # Smooth scores over a +/- 2 line window (weighting the center line highest so isolated statements aren't penalized by surrounding comments/blank lines)
+    # Smooth scores over a +/- 2 line window
     window_scores: list[tuple[float, int]] = []
-    for i in range(head_n, total_len - tail_n):
-        if line_scores[i] >= 1.0:
+    for i in range(head_end_idx, total_len - tail_n):
+        if i not in doc_fold_set and line_scores[i] >= 1.0:
             neighbors = sum(
                 max(0.0, line_scores[j])
                 for j in range(max(0, i - 2), min(total_len, i + 3))
-                if j != i
+                if j != i and j not in doc_fold_set
             )
             w_sc = line_scores[i] + 0.35 * neighbors
             window_scores.append((w_sc, i))
@@ -423,9 +604,9 @@ def slice_lines(
     for _, center in window_scores:
         if kept_count >= max_lines:
             break
-        radius = 2 if total_len < 500 else 3
+        radius = 1 if max_lines <= 32 else (2 if total_len < 500 else 3)
         for j in range(max(0, center - radius), min(total_len, center + radius + 1)):
-            if not keep[j] and line_scores[j] >= -0.5:
+            if j not in doc_fold_set and not keep[j] and line_scores[j] >= -0.5:
                 keep[j] = True
                 kept_count += 1
                 if kept_count >= max_lines:
@@ -433,28 +614,42 @@ def slice_lines(
 
     # If few focus windows matched inside the function, fill remaining budget with non-noise code lines
     if kept_count < max_lines // 2:
-        for i in range(min(total_len, max_lines - tail_n)):
+        for i in range(total_len - tail_n):
             if kept_count >= max_lines:
                 break
-            if not keep[i] and line_scores[i] >= 0.0:
+            if i not in doc_fold_set and not keep[i] and line_scores[i] >= 0.0:
                 keep[i] = True
                 kept_count += 1
-    # Merge small 1-3 line gaps between kept blocks
+    # Merge small 1-2 line gaps between kept code blocks (never unfolding docstring lines)
     last_kept = -1
     for i in range(total_len):
         if keep[i]:
-            if last_kept >= 0 and 0 < (i - last_kept - 1) <= 3 and kept_count + (i - last_kept - 1) <= max_lines + 6:
+            gap_sz = i - last_kept - 1
+            if (
+                last_kept >= 0
+                and 0 < gap_sz <= 2
+                and kept_count + gap_sz <= max_lines + 3
+                and all(g not in doc_fold_set for g in range(last_kept + 1, i))
+            ):
                 for g in range(last_kept + 1, i):
                     keep[g] = True
                     kept_count += 1
             last_kept = i
 
     formatted: list[str] = []
+    pdg_banner = _format_pdg_slice_banner(pdg_slice, start_idx, keep=keep)
+    if pdg_banner:
+        formatted.append(pdg_banner)
     i = 0
     while i < total_len:
         if keep[i]:
             _emit_kept_line(i, formatted)
             i += 1
+        elif doc_bounds is not None and i == doc_bounds[1]:
+            f_s = start_idx + doc_bounds[1] + 1
+            f_e = start_idx + doc_bounds[2] + 1
+            formatted.append(f" ... | [folded {len(doc_fold_set)} docstring lines L{f_s}-L{f_e}]")
+            i = doc_bounds[2] + 1
         else:
             gap_start = i
             while i < total_len and not keep[i]:
@@ -2404,6 +2599,14 @@ def query_4d_coordinate_matrix(
             if len(display_cells) >= max_table_rows:
                 break
     display_cells.sort(key=lambda c: c["line_start"])
+
+    if max_table_rows <= 2 and display_cells:
+        c0 = display_cells[0]
+        zw0 = f" ΔZ:[{','.join(c0['Z_write'][:2])}]" if c0["Z_write"] else ""
+        zr0 = f" ?Z:[{','.join(c0['Z_read'][:2])}]" if c0.get("Z_read") and not zw0 else ""
+        wc0 = f" W:[{','.join(c0['W_calls'][:3])}]" if c0["W_calls"] else ""
+        ex0 = f" E:[{','.join(c0.get('E_exit', [])[:2])}]" if c0.get("E_exit") else ""
+        return top_cells, f"# [6D Coordinate Matrix] L{c0['line_start']}-L{c0['line_end']} {c0['Y_role']} {c0['X_scope'][:32]}{zw0}{zr0}{wc0}{ex0}"
 
     table_lines = [
         "# [6D Coordinate Matrix] Lstart-Lend | Y_Role | X_Scope | ?Z_Write -> W_Calls | E_Exit | T_Mode"

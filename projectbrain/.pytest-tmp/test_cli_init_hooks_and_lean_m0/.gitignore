@@ -1,0 +1,9 @@
+# ProjectBrain cache
+.projectbrain.json
+.projectbrain_graph.json
+.projectbrain.db
+.projectbrain.db-wal
+.projectbrain.db-shm
+.projectbrain_dossier.md
+.projectbrain_patch.diff
+.projectbrain_ledger.json
