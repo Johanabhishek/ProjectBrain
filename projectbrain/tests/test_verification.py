@@ -139,3 +139,152 @@ def test_impact_multiple_files(brain):
     result = brain.impact(["services/util.py", "services/discount.py"])
     assert result["files_analyzed"] == 2
     assert len(result["details"]) == 2
+
+
+# ── 3.4 Universal Cross-File Contract Verification via brain.check() ────────
+
+def test_check_detects_post_edit_arity_and_unknown_kwarg_on_disk(tmp_path):
+    """Normal disk edits followed by brain.check(files_modified=[...]) catch arity & keyword breaks."""
+    (tmp_path / "billing.py").write_text(
+        "def charge_user(user_id: int, amount: float = 10.0) -> dict:\n"
+        "    return {'charge_id': user_id, 'total': amount}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "checkout.py").write_text(
+        "from billing import charge_user\n\n"
+        "def run_checkout(uid: int):\n"
+        "    return charge_user(uid, amt=25.0)\n",
+        encoding="utf-8",
+    )
+    b = ProjectBrain(str(tmp_path))
+    b.index()
+
+    # 1. Calling charge_user with unknown keyword `amt` (instead of `amount`)
+    res_kw = b.check(files_modified=["checkout.py"])
+    assert res_kw["all_contracts_valid"] is False
+    assert res_kw["verdict"] == "UNSAFE_CONTRACT_VIOLATION"
+    assert any(
+        "6D Caller Keyword Contract Violation" in d and "amt" in d and "amount" in d
+        for d in res_kw["contract_diagnostics"]
+    )
+
+    # 2. Edit billing.py on disk (outside brain.patch) to require 3 positional args
+    (tmp_path / "billing.py").write_text(
+        "def charge_user(user_id: int, amount: float, currency: str) -> dict:\n"
+        "    return {'charge_id': user_id, 'total': amount, 'currency': currency}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "checkout.py").write_text(
+        "from billing import charge_user\n\n"
+        "def run_checkout(uid: int):\n"
+        "    return charge_user(uid)\n",
+        encoding="utf-8",
+    )
+    res_arity = b.check(files_modified=["billing.py"])
+    assert res_arity["all_contracts_valid"] is False
+    assert any("6D Caller Arity Contract Violation" in d for d in res_arity["contract_diagnostics"])
+
+
+def test_check_detects_deleted_or_renamed_symbol_and_broken_import(tmp_path):
+    """Renaming a function on disk without updating importers flags both broken import and dangling caller."""
+    (tmp_path / "auth.py").write_text(
+        "def verify_token(tok: str) -> bool:\n"
+        "    return bool(tok and len(tok) > 5)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "api.py").write_text(
+        "from auth import verify_token\n\n"
+        "def handle_request(t: str) -> bool:\n"
+        "    return verify_token(t)\n",
+        encoding="utf-8",
+    )
+    b = ProjectBrain(str(tmp_path))
+    b.index()
+
+    # Rename verify_token -> validate_token on disk without updating api.py
+    (tmp_path / "auth.py").write_text(
+        "def validate_token(tok: str) -> bool:\n"
+        "    return bool(tok and len(tok) > 5)\n",
+        encoding="utf-8",
+    )
+    res = b.check(files_modified=["auth.py"])
+    assert res["all_contracts_valid"] is False
+    diags = "\n".join(res["contract_diagnostics"])
+    assert "verify_token" in diags
+    assert "validate_token" in diags
+
+
+def test_check_detects_cross_file_return_dict_key_drift(tmp_path):
+    """Renaming a key in a returned dict literal on disk flags callers subscripting the old key."""
+    (tmp_path / "users.py").write_text(
+        "def fetch_profile(uid: int) -> dict:\n"
+        "    return {'user_id': uid, 'email': 'a@b.com'}\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "dashboard.py").write_text(
+        "from users import fetch_profile\n\n"
+        "def render_header(uid: int) -> str:\n"
+        "    prof = fetch_profile(uid)\n"
+        "    return str(prof['user_id'])\n",
+        encoding="utf-8",
+    )
+    b = ProjectBrain(str(tmp_path))
+    b.index()
+
+    # Change 'user_id' -> 'id' in users.py on disk without updating dashboard.py
+    (tmp_path / "users.py").write_text(
+        "def fetch_profile(uid: int) -> dict:\n"
+        "    return {'id': uid, 'email': 'a@b.com'}\n",
+        encoding="utf-8",
+    )
+    res = b.check(files_modified=["users.py"])
+    assert res["all_contracts_valid"] is False
+    assert any(
+        "6D Return-Shape Key Contract Violation" in d and "user_id" in d
+        for d in res["contract_diagnostics"]
+    )
+
+
+def test_monorepo_workspace_and_barrel_reexport_contract_verification(tmp_path):
+    """Monorepo @scope/pkg imports and barrel `export * from` resolve transitively and catch arity breaks."""
+    pkg_dir = tmp_path / "packages" / "billing" / "src"
+    pkg_dir.mkdir(parents=True)
+    app_dir = tmp_path / "apps" / "web" / "src"
+    app_dir.mkdir(parents=True)
+
+    (pkg_dir / "stripe.ts").write_text(
+        "export function chargeCustomer(customerId: string): { receiptId: string } {\n"
+        "  return { receiptId: customerId };\n"
+        "}\n",
+        encoding="utf-8",
+    )
+    (pkg_dir / "index.ts").write_text(
+        "export * from './stripe';\n",
+        encoding="utf-8",
+    )
+    (app_dir / "checkout.ts").write_text(
+        "import { chargeCustomer } from '@acme/billing';\n\n"
+        "export function submitOrder(cid: string) {\n"
+        "  const { receiptId } = chargeCustomer(cid);\n"
+        "  return receiptId;\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    b = ProjectBrain(str(tmp_path))
+    b.index()
+
+    # Edit stripe.ts in packages/billing to require 2 arguments AND change return object key
+    (pkg_dir / "stripe.ts").write_text(
+        "export function chargeCustomer(customerId: string, currency: string): { transactionId: string } {\n"
+        "  return { transactionId: customerId };\n"
+        "}\n",
+        encoding="utf-8",
+    )
+
+    res = b.check(files_modified=["packages/billing/src/stripe.ts"])
+    assert res["all_contracts_valid"] is False
+    diags = "\n".join(res["contract_diagnostics"])
+    assert "6D Caller Arity Contract Violation" in diags
+    assert "6D Return-Shape Key Contract Violation" in diags
+    assert "receiptId" in diags

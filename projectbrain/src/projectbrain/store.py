@@ -181,11 +181,6 @@ class SQLiteIndexStore:
         return sym_rows, fts_rows
 
     @staticmethod
-    def _extract_symbol_rows(rel_path: str, info: dict) -> list[tuple]:
-        sym_rows, _ = SQLiteIndexStore._extract_symbol_and_fts_rows(rel_path, info)
-        return sym_rows
-
-    @staticmethod
     def _extract_node_and_edge_rows(graph_json: str | dict | None) -> tuple[list[tuple], list[tuple]]:
         if not graph_json:
             return [], []
@@ -215,11 +210,6 @@ class SQLiteIndexStore:
                 seen_pk.add(pk)
                 edge_rows.append((src, dst, et, conf, ln, rsn))
         return node_rows, edge_rows
-
-    @staticmethod
-    def _extract_edge_rows(graph_json: str | dict | None) -> list[tuple]:
-        _, edge_rows = SQLiteIndexStore._extract_node_and_edge_rows(graph_json)
-        return edge_rows
 
     def _read_source_for_blob(self, rel_path: str, info: dict) -> tuple[str, str, str] | None:
         fpath = self.root / rel_path
@@ -827,7 +817,7 @@ class SQLiteIndexStore:
                     if g_nodes_raw:
                         nodes_dict: dict[str, dict] = {}
                         for nid, ntype, rpath, nm, pjson in g_nodes_raw:
-                            nd_obj = json.loads(pjson) if pjson else {}
+                            nd_obj = json.loads(pjson) if (pjson and pjson != "{}") else {}
                             nd_obj["id"] = nid
                             nd_obj["type"] = ntype
                             if rpath:

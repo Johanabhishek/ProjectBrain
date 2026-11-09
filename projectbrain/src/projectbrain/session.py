@@ -335,24 +335,6 @@ class SessionManager:
     def get_session(self, session_id: str) -> Session | None:
         return self._sessions.get(session_id)
 
-    def list_sessions(self) -> list[dict]:
-        return [
-            {
-                "session_id": s.session_id,
-                "task": s.task,
-                "read_count": len(s.read_files),
-                "frontier_size": sum(
-                    1 for item in s._frontier_heap
-                    if item.rel_path not in s.read_files
-                ),
-                "created_at": s.created_at,
-            }
-            for s in self._sessions.values()
-        ]
-
-    def close_session(self, session_id: str) -> bool:
-        return self._sessions.pop(session_id, None) is not None
-
 
 def _normalize(path: str) -> str:
     """Normalize a file path to forward-slash relative form."""

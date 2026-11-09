@@ -245,129 +245,6 @@ def brain_remember(
     return _get_brain(repo_path).remember(target, note, tags=tags)
 
 
-# ── Legacy / Granular Tools (Preserved for Backward Compatibility) ───────────
-
-@mcp.tool()
-def projectbrain_query(prompt: str, top_n: int = 5, repo_path: str | None = None) -> dict:
-    """Find which files are relevant to a coding task and return a typed symbol graph."""
-    return _get_brain(repo_path).query_with_graph(prompt, top_n=top_n)
-
-
-@mcp.tool()
-def projectbrain_get_context(file_path: str, repo_path: str | None = None) -> dict:
-    """Get one file's functions/classes/routes/imports/skeleton plus its 1-hop dependency chain."""
-    return _get_brain(repo_path).get_context_for_file(file_path)
-
-
-@mcp.tool()
-def projectbrain_get_neighbors(
-    node_id: str,
-    edge_types: list[str] | None = None,
-    depth: int = 1,
-    repo_path: str | None = None,
-) -> dict:
-    """Traverse the symbol graph outward from a known node ID."""
-    return _get_brain(repo_path).get_neighbors(node_id, edge_types=edge_types, depth=depth)
-
-
-@mcp.tool()
-def projectbrain_find_relationship(name_a: str, name_b: str, repo_path: str | None = None) -> dict:
-    """Find the shortest typed path between any two named symbols or files."""
-    return _get_brain(repo_path).find_relationship(name_a, name_b)
-
-
-@mcp.tool()
-def projectbrain_list_nodes(
-    node_type: str | None = None,
-    query: str | None = None,
-    repo_path: str | None = None,
-) -> dict:
-    """Enumerate and filter nodes in the symbol graph for discovery."""
-    return _get_brain(repo_path).list_nodes(node_type=node_type, query=query)
-
-
-@mcp.tool()
-def projectbrain_verify_claim(
-    subject: str,
-    relation: str,
-    object: str,
-    repo_path: str | None = None,
-) -> dict:
-    """Fact-check a structural claim about the code against the symbol graph."""
-    return _get_brain(repo_path).verify_claim(subject, relation, object)
-
-
-@mcp.tool()
-def brain_verify_batch(claims: list[list[str]], repo_path: str | None = None) -> dict:
-    """Verify multiple structural claims in a single call."""
-    tuples = [(c[0], c[1], c[2]) for c in claims if len(c) >= 3]
-    return _get_brain(repo_path).verify_batch(tuples)
-
-
-@mcp.tool()
-def brain_verify_plan(
-    task: str,
-    files_to_edit: list[str],
-    files_to_create: list[str] | None = None,
-    repo_path: str | None = None,
-) -> dict:
-    """Validate an agent's plan BEFORE it starts editing files."""
-    return _get_brain(repo_path).verify_plan(task, files_to_edit, files_to_create)
-
-
-@mcp.tool()
-def brain_impact(files_changed: list[str], repo_path: str | None = None) -> dict:
-    """Analyze downstream impact of changing a set of files."""
-    return _get_brain(repo_path).impact(files_changed)
-
-
-@mcp.tool()
-def projectbrain_health(repo_path: str | None = None) -> dict:
-    """Report what the index does and does NOT actually know — its blind spots."""
-    return _get_brain(repo_path).health()
-
-
-@mcp.tool()
-def brain_start_session(task: str, repo_path: str | None = None) -> dict:
-    """Start a guided exploration session for a coding task."""
-    return _get_brain(repo_path).start_session(task)
-
-
-@mcp.tool()
-def brain_mark_read(session_id: str, file_path: str, repo_path: str | None = None) -> dict:
-    """Tell Brain you've read a file — it will route you to the next one."""
-    return _get_brain(repo_path).session_mark_read(session_id, file_path)
-
-
-@mcp.tool()
-def brain_mark_modified(
-    session_id: str,
-    file_path: str,
-    summary: str = "",
-    repo_path: str | None = None,
-) -> dict:
-    """Tell Brain you've modified a file — it surfaces downstream impact."""
-    return _get_brain(repo_path).session_mark_modified(session_id, file_path, summary)
-
-
-@mcp.tool()
-def brain_next(session_id: str, count: int = 1, repo_path: str | None = None) -> dict:
-    """Pop the next file(s) from the exploration frontier."""
-    return _get_brain(repo_path).session_next(session_id, count)
-
-
-@mcp.tool()
-def brain_compress(
-    file_paths: list[str],
-    max_tokens: int = 4000,
-    focus: str = "",
-    repo_path: str | None = None,
-) -> dict:
-    """Get a compressed structural summary and signature skeleton of files."""
-    return _get_brain(repo_path).compress_context(file_paths, max_tokens=max_tokens, focus=focus)
-
-
-
 @mcp.tool()
 def brain_run(
     raw_output: str = "",
@@ -394,22 +271,6 @@ def brain_run(
             }
         return b.run_command_compressed(command.strip(), timeout=timeout, max_lines=max_lines)
     return b.compress_command_output(raw_output, max_lines=max_lines)
-@mcp.tool()
-def brain_status(session_id: str, repo_path: str | None = None) -> dict:
-    """Check session progress: what's been read, what's left, estimated completeness."""
-    return _get_brain(repo_path).session_status(session_id)
-
-
-@mcp.tool()
-def brain_trace_flow(url_path: str, method: str = "GET", repo_path: str | None = None) -> dict:
-    """Trace a request flow across the frontend→backend boundary."""
-    return _get_brain(repo_path).trace_flow(url_path, method=method)
-
-
-@mcp.tool()
-def brain_co_changes(file_path: str, days: int = 90, repo_path: str | None = None) -> dict:
-    """Find files that historically change together with the given file."""
-    return _get_brain(repo_path).co_change_analysis(file_path, days=days)
 
 
 LEAN_CORE_TOOLS = {
@@ -423,7 +284,12 @@ LEAN_CORE_TOOLS = {
 
 
 def main() -> None:
-    if "--lean" in sys.argv or os.environ.get("PROJECTBRAIN_LEAN_MCP") == "1":
+    full_mode = (
+        "--full" in sys.argv
+        or "--all-tools" in sys.argv
+        or os.environ.get("PROJECTBRAIN_FULL_TOOLS") == "1"
+    )
+    if not full_mode:
         tm = getattr(mcp, "_tool_manager", None)
         tools_dict = getattr(tm, "_tools", None)
         if isinstance(tools_dict, dict):

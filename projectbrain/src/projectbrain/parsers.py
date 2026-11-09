@@ -106,7 +106,7 @@ def _split_top_level_params(inner: str) -> list[str]:
 
 
 def extract_arity_spec(params_str: str, is_method: bool = False, is_python: bool = True) -> dict:
-    """Compute formal parameter arity bounds (min_args, max_args, kwonly_required, has_varargs)."""
+    """Compute formal parameter arity bounds (min_args, max_args, kwonly_required, param_names, required_pos_names)."""
     s = params_str.strip()
     if s.startswith("(") and s.endswith(")"):
         s = s[1:-1].strip()
@@ -117,6 +117,9 @@ def extract_arity_spec(params_str: str, is_method: bool = False, is_python: bool
             "has_varargs": False,
             "has_kwargs": False,
             "kwonly_required": [],
+            "param_names": [],
+            "pos_param_names": [],
+            "required_pos_names": [],
         }
     raw_parts = _split_top_level_params(s)
     min_pos = 0
@@ -125,9 +128,16 @@ def extract_arity_spec(params_str: str, is_method: bool = False, is_python: bool
     has_kwargs = False
     in_kwonly = False
     kwonly_req: list[str] = []
+    all_param_names: list[str] = []
+    pos_param_names: list[str] = []
+    required_pos_names: list[str] = []
+    posonly_set: set[str] = set()
 
     for idx, p in enumerate(raw_parts):
-        if not p or p == "/":
+        if not p:
+            continue
+        if p == "/":
+            posonly_set.update(pos_param_names)
             continue
         first_tok = p.split(":")[0].split("=")[0].strip()
         if is_python and idx == 0 and (is_method or first_tok in ("self", "cls")):
@@ -173,13 +183,20 @@ def extract_arity_spec(params_str: str, is_method: bool = False, is_python: bool
             head = head[:-1].strip()
 
         is_optional = top_eq or top_opt
+        is_valid_ident = bool(re.match(r"^[A-Za-z_]\w*$", head))
+        if is_valid_ident:
+            all_param_names.append(head)
         if in_kwonly:
-            if not is_optional and re.match(r"^[A-Za-z_]\w*$", head):
+            if not is_optional and is_valid_ident:
                 kwonly_req.append(head)
         else:
             max_pos += 1
+            if is_valid_ident:
+                pos_param_names.append(head)
             if not is_optional:
                 min_pos += 1
+                if is_valid_ident:
+                    required_pos_names.append(head)
 
     return {
         "min_args": min_pos,
@@ -187,7 +204,134 @@ def extract_arity_spec(params_str: str, is_method: bool = False, is_python: bool
         "has_varargs": has_varargs,
         "has_kwargs": has_kwargs,
         "kwonly_required": kwonly_req,
+        "param_names": [nm for nm in all_param_names if nm not in posonly_set],
+        "pos_param_names": pos_param_names,
+        "required_pos_names": required_pos_names,
     }
+
+
+_SCOPE_BOUNDARY_TYPES = {
+    "function_definition", "function_declaration", "function_expression",
+    "arrow_function", "method_definition", "generator_function_declaration",
+    "class_definition", "class_declaration",
+}
+
+
+def _extract_dict_or_obj_keys(expr_node, is_python: bool) -> list[str] | None:
+    while expr_node is not None and expr_node.type == "parenthesized_expression":
+        named = [c for c in expr_node.children if c.is_named and c.type != "comment"]
+        expr_node = named[0] if len(named) == 1 else None
+    if expr_node is None:
+        return None
+    target_type = "dictionary" if is_python else "object"
+    if expr_node.type != target_type:
+        return None
+    keys: list[str] = []
+    for child in expr_node.children:
+        if not child.is_named or child.type == "comment":
+            continue
+        if child.type in ("dictionary_splat", "spread_element"):
+            return None
+        if child.type == "pair":
+            k_node = child.child_by_field_name("key")
+            if k_node is None:
+                return None
+            if k_node.type == "string":
+                raw_k = _text(k_node).strip("'\"`")
+                if raw_k and "{" not in raw_k:
+                    keys.append(raw_k)
+                else:
+                    return None
+            elif not is_python and k_node.type in ("property_identifier", "identifier"):
+                keys.append(_text(k_node))
+            else:
+                return None
+        elif not is_python and child.type in ("shorthand_property_identifier", "shorthand_property_identifier_pattern"):
+            keys.append(_text(child))
+        else:
+            return None
+    return sorted(set(keys)) if keys else None
+
+
+def _extract_closed_return_keys(func_node, is_python: bool = True) -> list[str] | None:
+    """If every value-returning branch of `func_node` returns a closed dict/object literal, return its sorted keys."""
+    if not is_python and func_node.type == "variable_declarator":
+        val_n = func_node.child_by_field_name("value")
+        if val_n is not None:
+            func_node = val_n
+    if not is_python and func_node.type == "arrow_function":
+        body = func_node.child_by_field_name("body")
+        if body is not None and body.type != "statement_block":
+            return _extract_dict_or_obj_keys(body, is_python=False)
+
+    ret_nodes = []
+    has_yield = False
+
+    def _walk(node):
+        nonlocal has_yield
+        for ch in node.children:
+            if ch.type in _SCOPE_BOUNDARY_TYPES:
+                continue
+            if ch.type in ("yield", "yield_expression"):
+                has_yield = True
+                return
+            if ch.type == "return_statement":
+                ret_nodes.append(ch)
+            else:
+                _walk(ch)
+
+    _walk(func_node)
+    if has_yield or not ret_nodes:
+        return None
+
+    all_keys: set[str] = set()
+    saw_dict = False
+    for r_node in ret_nodes:
+        exprs = [c for c in r_node.children if c.is_named and c.type != "comment"]
+        if not exprs:
+            continue
+        expr = exprs[0]
+        if _text(expr).strip() in ("None", "null", "undefined"):
+            continue
+        ks = _extract_dict_or_obj_keys(expr, is_python=is_python)
+        if ks is None:
+            return None
+        saw_dict = True
+        all_keys.update(ks)
+
+    return sorted(all_keys) if saw_dict else None
+
+
+_PRIMITIVE_TYPE_NAMES = {
+    "str", "int", "float", "bool", "bytes", "dict", "list", "set", "tuple",
+    "any", "none", "object", "callable", "iterable", "iterator", "sequence",
+    "mapping", "optional", "union", "literal", "type", "string", "number",
+    "boolean", "void", "unknown", "never", "record", "array", "promise",
+    "valueerror", "typeerror", "runtimeerror", "keyerror", "indexerror",
+    "attributeerror", "oserror", "exception", "path",
+}
+
+
+def _extract_param_and_local_types(params_str: str | None, body_text: str) -> dict[str, str]:
+    """Extract static receiver type bindings (`var -> ClassName`) from parameter annotations and constructor assignments."""
+    types_map: dict[str, str] = {}
+    if params_str:
+        inner = params_str.strip()
+        if inner.startswith("(") and inner.endswith(")"):
+            inner = inner[1:-1]
+        for m_p in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\??\s*:\s*([A-Za-z_][A-Za-z0-9_.]*)", inner):
+            p_nm, t_raw = m_p.group(1), m_p.group(2).split(".")[-1]
+            if p_nm not in ("self", "cls", "this") and t_raw.lower() not in _PRIMITIVE_TYPE_NAMES:
+                types_map[p_nm] = t_raw
+    if body_text and len(body_text) <= 16000:
+        for m_c in re.finditer(
+            r"\b((?:self\.|this\.)?[a-z_][A-Za-z0-9_]*)\s*(?::\s*[A-Za-z0-9_.\[\]| ]+\s*)?=\s*(?:new\s+)?([A-Z][A-Za-z0-9_]*)\s*\(",
+            body_text,
+        ):
+            v_nm, cls_nm = m_c.group(1), m_c.group(2)
+            if cls_nm.lower() not in _PRIMITIVE_TYPE_NAMES:
+                types_map.setdefault(v_nm, cls_nm)
+    return types_map
 
 
 _HTTP = {"get", "post", "put", "delete", "patch", "all"}
@@ -244,16 +388,6 @@ def _ast_hash(text: str) -> str:
 
 def _collapse_ws(text: str) -> str:
     return re.sub(r"\s+", " ", text.strip())
-
-def _call_sites(callee_nodes) -> dict:
-    """Map each callee name to the earliest line it is called on."""
-    sites: dict[str, int] = {}
-    for n in callee_nodes:
-        name = _text(n)
-        line = _line(n)
-        if name not in sites or line < sites[name]:
-            sites[name] = line
-    return sites
 
 
 # ── Python ──────────────────────────────────────────────────────────────────
@@ -463,13 +597,14 @@ def _py_extract_imports_and_bindings(root) -> tuple[list[str], dict[str, dict]]:
             elif child.type == "import_from_statement":
                 mod_node = child.child_by_field_name("module_name")
                 mod_name = _text(mod_node) if mod_node else ""
+                imp_line = _line(child)
                 for sub in child.children:
                     if sub == mod_node:
                         continue
                     if sub.type == "dotted_name":
                         sym = _text(sub)
                         full_mod = f"{mod_name}.{sym}" if mod_name and not mod_name.endswith(".") else f"{mod_name}{sym}"
-                        bindings[sym] = {"module": mod_name or ".", "symbol": sym, "qualified_module": full_mod}
+                        bindings[sym] = {"module": mod_name or ".", "symbol": sym, "qualified_module": full_mod, "line": imp_line}
                     elif sub.type == "aliased_import":
                         name_node = sub.child_by_field_name("name")
                         alias_node = sub.child_by_field_name("alias")
@@ -477,7 +612,14 @@ def _py_extract_imports_and_bindings(root) -> tuple[list[str], dict[str, dict]]:
                             sym = _text(name_node)
                             local = _text(alias_node) if alias_node else sym
                             full_mod = f"{mod_name}.{sym}" if mod_name and not mod_name.endswith(".") else f"{mod_name}{sym}"
-                            bindings[local] = {"module": mod_name or ".", "symbol": sym, "qualified_module": full_mod}
+                            bindings[local] = {"module": mod_name or ".", "symbol": sym, "qualified_module": full_mod, "line": imp_line}
+                    elif sub.type == "wildcard_import":
+                        bindings[f"__star__{mod_name or '.'}"] = {
+                            "module": mod_name or ".",
+                            "symbol": "*",
+                            "is_reexport": True,
+                            "line": imp_line,
+                        }
             elif child.type in ("block", "if_statement", "try_statement", "function_definition"):
                 _walk_imports(child)
 
@@ -689,11 +831,12 @@ def _parse_python(root) -> dict:
             continue
         fn_nm_str = _text(name_node)
         parent_cls = method_to_class.get(func_node.start_point)
+        decorators: list[str] = []
         if func_node.parent and func_node.parent.type == "decorated_definition":
-            if any(
-                dec_c.type == "decorator" and re.search(r"\boverload\b", _text(dec_c))
-                for dec_c in func_node.parent.children
-            ) and (parent_cls, fn_nm_str) in non_overload_keys:
+            for dec_c in func_node.parent.children:
+                if dec_c.type == "decorator":
+                    decorators.append(_collapse_ws(_text(dec_c)).lstrip("@").strip())
+            if any(re.search(r"\boverload\b", d) for d in decorators) and (parent_cls, fn_nm_str) in non_overload_keys:
                 continue
         is_nested_fn = False
         anc = func_node.parent
@@ -729,6 +872,10 @@ def _parse_python(root) -> dict:
                         qualified_calls[qual] = line
         sig, params, ret_type = _py_func_signature(func_node)
         is_meth = parent_cls is not None
+        fn_body_raw = _text(func_node)
+        param_types = _extract_param_and_local_types(params, fn_body_raw)
+        ret_keys = _extract_closed_return_keys(func_node, is_python=True)
+        iface_str = f"{sig}|ret:{','.join(ret_keys)}" if ret_keys else sig
         entry = {
             "name": fn_nm_str,
             "line_start": _line(func_node),
@@ -737,15 +884,20 @@ def _parse_python(root) -> dict:
             "params": params,
             "return_type": ret_type,
             "arity_spec": extract_arity_spec(params, is_method=is_meth, is_python=True),
+            "param_types": param_types,
             "docstring": _py_docstring(func_node),
             "body_tokens": _extract_body_tokens(func_node, py_consts),
             "calls": calls,
             "call_sites": call_sites,
             "call_sites_all": call_sites_all,
             "qualified_calls": qualified_calls,
-            "interface_hash": _ast_hash(sig),
-            "ast_hash": _ast_hash(_text(func_node)),
+            "interface_hash": _ast_hash(iface_str),
+            "ast_hash": _ast_hash(fn_body_raw),
         }
+        if ret_keys:
+            entry["return_keys"] = ret_keys
+        if decorators:
+            entry["decorators"] = decorators
         if is_meth:
             entry["is_method"] = True
             entry["parent_class"] = parent_cls
@@ -823,6 +975,7 @@ def _parse_python(root) -> dict:
         "classes": classes,
         "imports": imports,
         "import_bindings": import_bindings,
+        "exports": list(py_consts.keys()),
         "routes": routes,
         "const_aliases": _extract_const_aliases(py_consts),
     }
@@ -850,6 +1003,7 @@ _JS_CLASS = """
 _JS_IMPORT = """
 [
   (import_statement source: (string (string_fragment) @mod))
+  (export_statement source: (string (string_fragment) @mod))
   (call_expression
     function: (import)
     arguments: (arguments (string (string_fragment) @mod)))
@@ -1042,11 +1196,12 @@ def _js_import_bindings(root) -> dict[str, dict]:
             if not src_node:
                 continue
             mod = _text(src_node).strip("'\"")
+            imp_line = _line(node)
             for child in node.children:
                 if child.type == "import_clause":
                     for sub in child.children:
                         if sub.type == "identifier":
-                            bindings[_text(sub)] = {"module": mod, "symbol": "default"}
+                            bindings[_text(sub)] = {"module": mod, "symbol": "default", "line": imp_line}
                         elif sub.type == "named_imports":
                             for spec in sub.children:
                                 if spec.type == "import_specifier":
@@ -1055,19 +1210,52 @@ def _js_import_bindings(root) -> dict[str, dict]:
                                     if name_n:
                                         orig = _text(name_n)
                                         local = _text(alias_n) if alias_n else orig
-                                        bindings[local] = {"module": mod, "symbol": orig}
+                                        bindings[local] = {"module": mod, "symbol": orig, "line": _line(spec)}
                                     else:
                                         ids = [c for c in spec.children if c.type == "identifier"]
                                         if len(ids) == 1:
                                             sym = _text(ids[0])
-                                            bindings[sym] = {"module": mod, "symbol": sym}
+                                            bindings[sym] = {"module": mod, "symbol": sym, "line": _line(spec)}
                                         elif len(ids) >= 2:
-                                            bindings[_text(ids[-1])] = {"module": mod, "symbol": _text(ids[0])}
+                                            bindings[_text(ids[-1])] = {"module": mod, "symbol": _text(ids[0]), "line": _line(spec)}
                         elif sub.type == "namespace_import":
                             for ns_c in sub.children:
                                 if ns_c.type == "identifier":
-                                    bindings[_text(ns_c)] = {"module": mod, "symbol": "*"}
+                                    bindings[_text(ns_c)] = {"module": mod, "symbol": "*", "line": imp_line}
+        elif node.type == "export_statement":
+            src_node = node.child_by_field_name("source")
+            if not src_node:
+                continue
+            mod = _text(src_node).strip("'\"")
+            imp_line = _line(node)
+            has_clause = False
+            for child in node.children:
+                if child.type == "export_clause":
+                    has_clause = True
+                    for spec in child.children:
+                        if spec.type == "export_specifier":
+                            name_n = spec.child_by_field_name("name")
+                            alias_n = spec.child_by_field_name("alias")
+                            if name_n:
+                                orig = _text(name_n)
+                                exported = _text(alias_n) if alias_n else orig
+                                bindings[exported] = {"module": mod, "symbol": orig, "is_reexport": True, "line": _line(spec)}
+                            else:
+                                ids = [c for c in spec.children if c.type == "identifier"]
+                                if len(ids) == 1:
+                                    sym = _text(ids[0])
+                                    bindings[sym] = {"module": mod, "symbol": sym, "is_reexport": True, "line": _line(spec)}
+                                elif len(ids) >= 2:
+                                    bindings[_text(ids[-1])] = {"module": mod, "symbol": _text(ids[0]), "is_reexport": True, "line": _line(spec)}
+                elif child.type == "namespace_export":
+                    has_clause = True
+                    for ns_c in child.children:
+                        if ns_c.type == "identifier":
+                            bindings[_text(ns_c)] = {"module": mod, "symbol": "*", "is_reexport": True, "line": imp_line}
+            if not has_clause and "*" in _text(node):
+                bindings[f"__star__{mod}"] = {"module": mod, "symbol": "*", "is_reexport": True, "line": imp_line}
         elif node.type in ("lexical_declaration", "variable_declaration"):
+            imp_line = _line(node)
             for sub in node.children:
                 if sub.type != "variable_declarator":
                     continue
@@ -1082,17 +1270,17 @@ def _js_import_bindings(root) -> dict[str, dict]:
                 mod, prop = m_req.group(1), m_req.group(2)
                 if name_n.type == "identifier":
                     local = _text(name_n)
-                    bindings[local] = {"module": mod, "symbol": prop or "*"}
+                    bindings[local] = {"module": mod, "symbol": prop or "*", "line": imp_line}
                 elif name_n.type == "object_pattern":
                     for pat_c in name_n.children:
                         if pat_c.type == "shorthand_property_identifier_pattern":
                             sym = _text(pat_c)
-                            bindings[sym] = {"module": mod, "symbol": sym}
+                            bindings[sym] = {"module": mod, "symbol": sym, "line": _line(pat_c)}
                         elif pat_c.type == "pair_pattern":
                             k_n = pat_c.child_by_field_name("key")
                             v_n = pat_c.child_by_field_name("value")
                             if k_n and v_n and v_n.type == "identifier":
-                                bindings[_text(v_n)] = {"module": mod, "symbol": _text(k_n)}
+                                bindings[_text(v_n)] = {"module": mod, "symbol": _text(k_n), "line": _line(pat_c)}
     return bindings
 
 
@@ -1232,6 +1420,10 @@ def _parse_js(root, lang: Language) -> dict:
         parent_cls = method_to_class.get(func_node.start_point)
         is_meth = parent_cls is not None
         seen_fn_keys.add((parent_cls, fn_name, l_start))
+        fn_body_raw = _text(func_node)
+        param_types = _extract_param_and_local_types(params, fn_body_raw)
+        ret_keys = _extract_closed_return_keys(func_node, is_python=False)
+        iface_str = f"{sig}|ret:{','.join(ret_keys)}" if ret_keys else sig
         entry = {
             "name": fn_name,
             "line_start": l_start,
@@ -1240,15 +1432,18 @@ def _parse_js(root, lang: Language) -> dict:
             "params": params,
             "return_type": ret_type,
             "arity_spec": extract_arity_spec(params, is_method=is_meth, is_python=False),
+            "param_types": param_types,
             "docstring": doc,
             "body_tokens": _extract_body_tokens(func_node, js_consts),
             "calls": calls,
             "call_sites": call_sites,
             "call_sites_all": call_sites_all,
             "qualified_calls": qualified_calls,
-            "interface_hash": _ast_hash(sig),
-            "ast_hash": _ast_hash(_text(func_node)),
+            "interface_hash": _ast_hash(iface_str),
+            "ast_hash": _ast_hash(fn_body_raw),
         }
+        if ret_keys:
+            entry["return_keys"] = ret_keys
         if is_meth:
             entry["is_method"] = True
             entry["parent_class"] = parent_cls
@@ -2524,12 +2719,3 @@ def parse(source: str, ext: str) -> dict:
     res, _ = parse_with_tree(source, ext)
     return res
 
-
-# ── Legacy shims (brain.py calls these directly) ────────────────────────────
-
-def parse_python(source: str) -> dict:
-    return parse(source, ".py")
-
-
-def parse_js(source: str) -> dict:
-    return parse(source, ".js")

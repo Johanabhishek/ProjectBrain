@@ -254,7 +254,7 @@ def _run_init(
     if write_mcp:
         stdio_cfg = {
             "command": "projectbrain-mcp",
-            "args": [resolved_root],
+            "args": ["--lean", resolved_root],
         }
         if ide in ("auto", "all", "claude", "antigravity"):
             _write_or_merge_json(root_path / ".mcp.json", "mcpServers", "projectbrain", stdio_cfg)
@@ -266,7 +266,7 @@ def _run_init(
             vscode_cfg = {
                 "type": "stdio",
                 "command": "projectbrain-mcp",
-                "args": [resolved_root],
+                "args": ["--lean", resolved_root],
             }
             _write_or_merge_json(root_path / ".vscode" / "mcp.json", "servers", "projectbrain", vscode_cfg)
             actions.append("configured_.vscode/mcp.json")
@@ -406,6 +406,17 @@ def main(argv: list[str] | None = None) -> int:
 
     impact_parser = sub.add_parser("impact", help="Compute blast radius (direct consumers, test consumers, callers) for files")
     impact_parser.add_argument("files", nargs="+", help="File paths to analyze")
+
+    check_parser = sub.add_parser(
+        "check",
+        help="Run unified 6D & cross-file contract verification gate on modified files or git diff HEAD",
+    )
+    check_parser.add_argument("files", nargs="*", default=None, help="Modified file paths (default: auto-detect via git diff HEAD)")
+    check_parser.add_argument(
+        "--fail-on-violation",
+        action="store_true",
+        help="Exit with non-zero code (1) if any 6D or cross-file contract violation is detected",
+    )
 
     remember_parser = sub.add_parser("remember", help="Pin an architectural note to a symbol or file")
     remember_parser.add_argument("target", help="Symbol name, file path, or node ID")
@@ -550,6 +561,13 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "impact":
         print(json.dumps(brain.impact(args.files), indent=2))
+        return 0
+
+    if args.command == "check":
+        res = brain.check(files_modified=args.files or None)
+        print(json.dumps(res, indent=2))
+        if getattr(args, "fail_on_violation", False) and res.get("all_contracts_valid") is False:
+            return 1
         return 0
 
     if args.command == "remember":

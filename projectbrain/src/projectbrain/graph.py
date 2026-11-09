@@ -136,6 +136,7 @@ class CodeGraph:
                 "signature": c.get("signature", ""),
                 "line_start": c.get("line_start"),
                 "line_end": c.get("line_end"),
+                "bases": c.get("bases", []),
                 "fields": c.get("fields", []),
                 "interface_hash": c.get("interface_hash", ""),
                 "ast_hash": c.get("ast_hash", ""),
@@ -181,27 +182,69 @@ class CodeGraph:
 
             call_sites = fn.get("call_sites", {})
             qualified_calls = fn.get("qualified_calls", {})
+            param_types = fn.get("param_types", {})
             added_call_dsts: set[str] = set()
 
-            # 1. Resolve receiver-qualified calls first (e.g. self.foo(), ClassName.foo(), mod.foo())
+            # 1. Resolve receiver-qualified calls first (e.g. self.foo(), store.save(), ClassName.foo(), mod.foo())
             for qual_expr, q_line in qualified_calls.items():
                 parts = qual_expr.split(".")
                 if len(parts) < 2:
                     continue
                 receiver = parts[0]
+                recv_prefix = ".".join(parts[:-1])
                 callee_name = parts[-1]
 
-                # Case A: `self.method()` or `this.method()` inside a class method
-                if receiver in ("self", "this", "cls") and parent:
-                    same_cls_id = fn_id(rel_path, callee_name, parent)
-                    if same_cls_id in self.nodes and same_cls_id != nid:
-                        self._add_edge(
-                            nid, same_cls_id, "calls", "exact",
-                            f"'{qual_expr}()' resolved to method on enclosing class {parent}",
-                            line=q_line,
-                        )
-                        added_call_dsts.add(same_cls_id)
+                # Case A: `self.method()`, `this.method()`, `cls.method()`, or `super().method()` inside a class method
+                if receiver in ("self", "this", "cls", "super") and parent and len(parts) == 2:
+                    if receiver != "super":
+                        same_cls_id = fn_id(rel_path, callee_name, parent)
+                        if same_cls_id in self.nodes and same_cls_id != nid:
+                            self._add_edge(
+                                nid, same_cls_id, "calls", "exact",
+                                f"'{qual_expr}()' resolved to method on enclosing class {parent}",
+                                line=q_line,
+                            )
+                            added_call_dsts.add(same_cls_id)
+                            continue
+                    # Check base classes of `parent` (1-2 levels of inheritance)
+                    parent_cls_nd = self.nodes.get(cls_id(rel_path, parent), {})
+                    base_queue = list(parent_cls_nd.get("bases", []))
+                    resolved_base = False
+                    for b_raw in base_queue[:6]:
+                        b_name = b_raw.split(".")[-1].split("[")[0].strip()
+                        for b_cand in registry.get(f"{b_name}.{callee_name}", []):
+                            if b_cand != nid and b_cand not in added_call_dsts:
+                                b_rel = self.nodes.get(b_cand, {}).get("rel_path")
+                                b_conf = "exact" if b_rel == rel_path else "import_resolved"
+                                self._add_edge(
+                                    nid, b_cand, "calls", b_conf,
+                                    f"'{qual_expr}()' resolved to inherited method on base class {b_name}",
+                                    line=q_line,
+                                )
+                                added_call_dsts.add(b_cand)
+                                resolved_base = True
+                                break
+                        if resolved_base:
+                            break
+                    if resolved_base:
                         continue
+
+                # Case A2: Statically typed parameter or constructor-assigned local/field receiver (`store: SQLiteStore`, `self.db = DB()`)
+                recv_type = param_types.get(recv_prefix) or param_types.get(receiver)
+                if recv_type:
+                    typed_cands = registry.get(f"{recv_type}.{callee_name}", [])
+                    if typed_cands:
+                        t_cand = typed_cands[0]
+                        if t_cand != nid and t_cand not in added_call_dsts:
+                            t_rel = self.nodes.get(t_cand, {}).get("rel_path")
+                            t_conf = "exact" if t_rel == rel_path else "import_resolved"
+                            self._add_edge(
+                                nid, t_cand, "calls", t_conf,
+                                f"'{qual_expr}()' resolved via static receiver type '{recv_type}'",
+                                line=q_line,
+                            )
+                            added_call_dsts.add(t_cand)
+                            continue
 
                 # Case B: `ReceiverClass.method()` or `receiver_instance.method()`
                 if receiver in file_sym_map:
@@ -280,7 +323,7 @@ class CodeGraph:
                     added_call_dsts.add(cand)
                     cross_added += 1
 
-                if cross_added < 2 and len(all_cands) <= 12:
+                if cross_added < 2 and len(all_cands) <= 4:
                     num_other = sum(1 for c0 in all_cands if c0 != nid)
                     for cand in all_cands:
                         if cross_added >= 2:
