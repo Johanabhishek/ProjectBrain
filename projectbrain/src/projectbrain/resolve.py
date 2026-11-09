@@ -7,11 +7,13 @@ than a best-effort wrong answer.
 """
 from __future__ import annotations
 
+import sys
 from pathlib import PurePosixPath
 
 _JS_EXTS = (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")
 _ALIAS_PREFIXES = ("@/", "~/", "#/")
 _ALIAS_ROOTS = ("src", "app", "")
+_STDLIB_MODULES = getattr(sys, "stdlib_module_names", frozenset())
 
 
 # ── Python ───────────────────────────────────────────────────────────────────
@@ -44,6 +46,8 @@ def build_python_module_index(index: dict) -> dict[str, list[str]]:
         for start in range(len(segments)):
             suffix = ".".join(segments[start:])
             if not suffix:
+                continue
+            if start > 0 and suffix.split(".")[0] in _STDLIB_MODULES and segments[0] not in _STDLIB_MODULES:
                 continue
             module_index.setdefault(suffix, [])
             if rel_path not in module_index[suffix]:

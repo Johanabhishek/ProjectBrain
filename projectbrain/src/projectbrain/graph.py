@@ -174,6 +174,10 @@ class CodeGraph:
         fid = file_id(rel_path)
         file_imports = set(import_targets.get(rel_path, []))
         file_sym_map = symbol_imports.get(rel_path, {})
+        has_star_import = (
+            any(k.startswith("__star__") for k in (info.get("import_bindings") or {}))
+            or ("import_bindings" not in info and not file_sym_map)
+        )
 
         for fn in info.get("functions", []):
             parent = fn.get("parent_class")
@@ -184,6 +188,8 @@ class CodeGraph:
             qualified_calls = fn.get("qualified_calls", {})
             param_types = fn.get("param_types", {})
             added_call_dsts: set[str] = set()
+            qual_receivers_for_callee: dict[str, set[str]] = {}
+            resolved_qual_callees: set[str] = set()
 
             # 1. Resolve receiver-qualified calls first (e.g. self.foo(), store.save(), ClassName.foo(), mod.foo())
             for qual_expr, q_line in qualified_calls.items():
@@ -193,6 +199,7 @@ class CodeGraph:
                 receiver = parts[0]
                 recv_prefix = ".".join(parts[:-1])
                 callee_name = parts[-1]
+                qual_receivers_for_callee.setdefault(callee_name, set()).update((receiver, recv_prefix))
 
                 # Case A: `self.method()`, `this.method()`, `cls.method()`, or `super().method()` inside a class method
                 if receiver in ("self", "this", "cls", "super") and parent and len(parts) == 2:
@@ -259,7 +266,12 @@ class CodeGraph:
                         )
                         added_call_dsts.add(qual_fn)
                         continue
-                    if direct_fn in self.nodes and direct_fn != nid:
+                    r_bind = (info.get("import_bindings") or {}).get(receiver) or {}
+                    is_obj_from_same_named_mod = (
+                        r_bind.get("symbol") not in (None, "", "*", "default")
+                        and r_bind.get("module", "").split(".")[-1] == r_bind.get("symbol")
+                    )
+                    if direct_fn in self.nodes and direct_fn != nid and not is_obj_from_same_named_mod:
                         self._add_edge(
                             nid, direct_fn, "calls", "import_resolved",
                             f"'{qual_expr}()' resolved via imported module '{receiver}' from {target_file}",
@@ -293,10 +305,15 @@ class CodeGraph:
                 line = call_sites.get(callee_name)
                 all_lines = call_sites_all.get(callee_name)
 
+                same_file_matched = False
                 for cand in by_file_name.get((rel_path, callee_name), ()):
                     if cand != nid and cand not in added_call_dsts:
                         self._add_edge(nid, cand, "calls", "exact", "same-file function call", line=line, lines=all_lines)
                         added_call_dsts.add(cand)
+                        same_file_matched = True
+
+                if same_file_matched and callee_name not in file_sym_map and callee_name not in qual_receivers_for_callee:
+                    continue
 
                 imp_cands: list[str] = []
                 sym_imp_rel = file_sym_map.get(callee_name)
@@ -304,10 +321,24 @@ class CodeGraph:
                     for c_imp in by_file_name.get((sym_imp_rel, callee_name), ()):
                         if c_imp != nid and c_imp not in imp_cands:
                             imp_cands.append(c_imp)
-                for imp_rel in file_imports:
-                    if imp_rel != rel_path and imp_rel != sym_imp_rel:
-                        for c_imp in by_file_name.get((imp_rel, callee_name), ()):
-                            if c_imp != nid and c_imp not in imp_cands:
+                if not imp_cands or callee_name in qual_receivers_for_callee:
+                    for imp_rel in file_imports:
+                        if imp_rel != rel_path and imp_rel != sym_imp_rel:
+                            imp_stem = imp_rel.rsplit("/", 1)[-1].rsplit(".", 1)[0]
+                            for c_imp in by_file_name.get((imp_rel, callee_name), ()):
+                                if c_imp == nid or c_imp in imp_cands:
+                                    continue
+                                c_parent = self.nodes.get(c_imp, {}).get("parent")
+                                if c_parent is None and not has_star_import:
+                                    r_bind = (info.get("import_bindings") or {}).get(imp_stem) or {}
+                                    if r_bind.get("module", "").split(".")[-1] == r_bind.get("symbol") == imp_stem:
+                                        continue
+                                    is_unique_bare = len(all_cands) == 1 and callee_name not in qual_receivers_for_callee
+                                    if not is_unique_bare and not any(
+                                        r == imp_stem or r.endswith("." + imp_stem) or file_sym_map.get(r) == imp_rel
+                                        for r in qual_receivers_for_callee.get(callee_name, ())
+                                    ):
+                                        continue
                                 imp_cands.append(c_imp)
 
                 cross_added = 0

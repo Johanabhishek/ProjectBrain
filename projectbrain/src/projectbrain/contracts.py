@@ -1953,16 +1953,24 @@ def compile_6d_contract_diagnostics(
     return warnings, offending_nodes
 
 
-def _extract_balanced_call_args(snippet: str, fn_name: str, is_method: bool = False, mod_stem: str = "") -> list[str] | None:
+def _extract_balanced_call_args(
+    snippet: str,
+    fn_name: str,
+    is_method: bool = False,
+    mod_stem: str = "",
+    qual_expr: str = "",
+) -> list[str] | None:
     """Extract top-level argument strings for `fn_name(...)` respecting nested `()`, `[]`, `{}`, and quotes."""
     m = None
-    if not is_method:
+    if qual_expr:
+        m = re.search(rf"(?<!def\s)(?<!function\s)\b{re.escape(qual_expr)}\s*\(", snippet)
+    elif not is_method:
         if mod_stem:
-            m = re.search(rf"(?:(?<!\.)|\b{re.escape(mod_stem)}\.)\b{re.escape(fn_name)}\s*\(", snippet)
+            m = re.search(rf"(?<!def\s)(?<!function\s)(?:(?<!\.)|\b{re.escape(mod_stem)}\.)\b{re.escape(fn_name)}\s*\(", snippet)
         else:
-            m = re.search(rf"(?<!\.)\b{re.escape(fn_name)}\s*\(", snippet)
-    if m is None:
-        m = re.search(rf"\b{re.escape(fn_name)}\s*\(", snippet)
+            m = re.search(rf"(?<!def\s)(?<!function\s)(?<!\.)\b{re.escape(fn_name)}\s*\(", snippet)
+    else:
+        m = re.search(rf"(?<!def\s)(?<!function\s)\b{re.escape(fn_name)}\s*\(", snippet)
     if not m:
         return None
     i = m.end()
@@ -2068,34 +2076,10 @@ def verify_cross_file_contracts(
         r"\b(?:property|cached_property|fixture|model_validator|field_validator|validator|root_validator|contextmanager|asynccontextmanager)\b"
     )
 
-    def _verify_call_site(
-        caller_rel: str,
-        caller_name: str,
-        call_line: int,
-        callee_rel: str,
-        callee_fn: dict,
-    ) -> None:
-        arity = callee_fn.get("arity_spec")
-        if not arity or not caller_rel or not call_line:
-            return
-        decs = callee_fn.get("decorators") or []
-        if any(_FRAMEWORK_DECORATOR_RE.search(d) for d in decs):
-            return
-        caller_src = _get_text(caller_rel)
-        if not caller_src:
-            return
-        c_lines = caller_src.splitlines()
-        if not (1 <= call_line <= len(c_lines)):
-            return
-        snippet = " ".join(c_lines[call_line - 1 : min(len(c_lines), call_line + 25)])
-        if re.search(rf"\b{re.escape(callee_fn['name'])}\.(?:delay|apply_async|s|si)\s*\(", snippet):
-            return
-        is_meth = bool(callee_fn.get("parent_class") or callee_fn.get("is_method"))
-        mod_stem = Path(callee_rel).stem
-        arg_items = _extract_balanced_call_args(snippet, callee_fn["name"], is_method=is_meth, mod_stem=mod_stem)
-        if arg_items is None or any(a.startswith("*") for a in arg_items):
-            return
-
+    def _check_args_against_fn(arg_items: list[str], callee_rel: str, cand_fn: dict, is_meth: bool) -> list[str]:
+        arity = cand_fn.get("arity_spec")
+        if not arity:
+            return []
         pos_args = [a for a in arg_items if not re.match(r"^[A-Za-z_]\w*\s*=(?!=)", a)]
         kw_names = {
             a.split("=", 1)[0].strip()
@@ -2105,10 +2089,27 @@ def verify_cross_file_contracts(
         min_a = arity.get("min_args", 0)
         max_a = arity.get("max_args")
         kw_req = set(arity.get("kwonly_required", []))
-        param_names = arity.get("param_names")
-        pos_param_names = arity.get("pos_param_names", [])
-        req_pos_names = arity.get("required_pos_names", [])
+        param_names = list(arity.get("param_names") or []) if arity.get("param_names") is not None else None
+        pos_param_names = list(arity.get("pos_param_names") or [])
+        req_pos_names = list(arity.get("required_pos_names") or [])
 
+        # Top-level function whose 1st parameter happens to be named `cls` or `self` (e.g. `def itermro(cls, stop)`)
+        sig_str = cand_fn.get("signature", "")
+        if not is_meth and re.search(r"\(\s*(cls|self)\b", sig_str):
+            m_first = re.search(r"\(\s*(cls|self)\b(\s*=)?", sig_str)
+            first_nm = m_first.group(1) if m_first else "cls"
+            has_def = bool(m_first and m_first.group(2))
+            if param_names is not None and first_nm not in param_names:
+                param_names.insert(0, first_nm)
+            if first_nm not in pos_param_names:
+                pos_param_names.insert(0, first_nm)
+            if not has_def and first_nm not in req_pos_names:
+                req_pos_names.insert(0, first_nm)
+                min_a += 1
+            if max_a is not None:
+                max_a += 1
+
+        errs: list[str] = []
         # 1A. Unknown keyword arguments (Python functions without **kwargs)
         if callee_rel.endswith(".py") and kw_names and not arity.get("has_kwargs") and param_names is not None:
             valid_params = set(param_names) | kw_req
@@ -2120,10 +2121,9 @@ def verify_cross_file_contracts(
                     if close:
                         hints.append(f"`{ukw}` -> `{close[0]}`")
                 hint_str = f" (did you mean {', '.join(hints)}?)" if hints else ""
-                _emit(
-                    f"- ⚠️ **[6D Caller Keyword Contract Violation]** `{caller_rel}:L{call_line}` (`{caller_name}`) → "
-                    f"Call to `{callee_fn['name']}(...)` passes unexpected keyword arg(s) `{', '.join(unknown_kws)}`{hint_str} "
-                    f"for signature `{callee_fn.get('signature', callee_fn['name'])}`."
+                errs.append(
+                    f"__KW__Call to `{cand_fn['name']}(...)` passes unexpected keyword arg(s) `{', '.join(unknown_kws)}`{hint_str} "
+                    f"for signature `{cand_fn.get('signature', cand_fn['name'])}`."
                 )
 
         # 1B. Duplicate positional + keyword arguments
@@ -2131,9 +2131,8 @@ def verify_cross_file_contracts(
             already_pos = set(pos_param_names[: len(pos_args)])
             dup_kws = sorted(kw_names & already_pos)
             if dup_kws:
-                _emit(
-                    f"- ⚠️ **[6D Caller Arity Contract Violation]** `{caller_rel}:L{call_line}` (`{caller_name}`) → "
-                    f"Call to `{callee_fn['name']}(...)` passes multiple values for parameter(s) `{', '.join(dup_kws)}`."
+                errs.append(
+                    f"__ARITY__Call to `{cand_fn['name']}(...)` passes multiple values for parameter(s) `{', '.join(dup_kws)}`."
                 )
 
         # 1C. Arity & required keyword-only / positional obligations
@@ -2147,7 +2146,6 @@ def verify_cross_file_contracts(
         else:
             valid_kw_set = (kw_names & set(param_names)) - kw_req if param_names is not None else (kw_names - kw_req)
             total_supplied = len(pos_args) + len(valid_kw_set)
-            missing_pos = []
             too_few = total_supplied < min_a
 
         too_many = max_a is not None and len(pos_args) > max_a
@@ -2156,13 +2154,92 @@ def verify_cross_file_contracts(
                 reason_str = f"missing required keyword-only arg(s) `{', '.join(missing_kw)}`"
             else:
                 reason_str = (
-                    f"passes {len(arg_items)} arg(s), but updated signature `{callee_fn.get('signature', callee_fn['name'])}` "
+                    f"passes {len(arg_items)} arg(s), but updated signature `{cand_fn.get('signature', cand_fn['name'])}` "
                     f"requires {min_a}..{max_a if max_a is not None else '∞'}"
                 )
-            _emit(
-                f"- ⚠️ **[6D Caller Arity Contract Violation]** `{caller_rel}:L{call_line}` (`{caller_name}`) → "
-                f"Call to `{callee_fn['name']}(...)` {reason_str}."
+            errs.append(f"__ARITY__Call to `{cand_fn['name']}(...)` {reason_str}.")
+        return errs
+
+    def _verify_call_site(
+        caller_rel: str,
+        caller_name: str,
+        call_line: int,
+        callee_rel: str,
+        callee_fn: dict,
+        edge_reason: str = "",
+        caller_l_start: int = 0,
+        caller_l_end: int = 0,
+    ) -> None:
+        arity = callee_fn.get("arity_spec")
+        if not arity or not caller_rel or not call_line:
+            return
+        decs = callee_fn.get("decorators") or []
+        if any(_FRAMEWORK_DECORATOR_RE.search(d) for d in decs):
+            return
+        is_meth = bool(callee_fn.get("parent_class") or callee_fn.get("is_method"))
+        m_qual = re.match(r"^'([^']+?)\(\)'", edge_reason or "")
+        qual_expr = m_qual.group(1) if m_qual else ""
+        if is_meth and not qual_expr:
+            return
+        caller_src = _get_text(caller_rel)
+        if not caller_src:
+            return
+        c_lines = caller_src.splitlines()
+        if not (1 <= call_line <= len(c_lines)):
+            return
+        if caller_l_start and 1 <= caller_l_start <= call_line:
+            mod_stem_chk = Path(callee_rel).stem if caller_rel != callee_rel else ""
+            fn_head_lines = "\n".join(c_lines[caller_l_start - 1 : call_line])
+            for m_loc_imp in re.finditer(rf"(?m)^\s*from\s+([A-Za-z0-9_.]+)\s+import\s+([^\n#]+)", fn_head_lines):
+                imp_mod, imp_names = m_loc_imp.group(1), m_loc_imp.group(2)
+                if re.search(rf"\b{re.escape(callee_fn['name'])}\b", imp_names):
+                    mod_tail = imp_mod.lstrip(".").replace(".", "/")
+                    if mod_tail and mod_tail not in callee_rel:
+                        return
+                if mod_stem_chk and re.search(rf"\b{re.escape(mod_stem_chk)}\b", imp_names) and imp_mod.endswith("." + mod_stem_chk):
+                    return
+        end_idx = min(len(c_lines), call_line + 25)
+        if caller_l_end and caller_l_end >= call_line:
+            end_idx = min(end_idx, caller_l_end)
+        snippet = " ".join(re.sub(r"\s+#.*$", "", ln) for ln in c_lines[call_line - 1 : end_idx])
+        if re.search(rf"\b{re.escape(callee_fn['name'])}\.(?:delay|apply_async|s|si)\s*\(", snippet):
+            return
+        mod_stem = Path(callee_rel).stem if caller_rel != callee_rel else ""
+        arg_items = _extract_balanced_call_args(
+            snippet, callee_fn["name"], is_method=is_meth, mod_stem=mod_stem, qual_expr=qual_expr
+        )
+        if arg_items is None or any(a.startswith("*") or re.search(r"\blambda\b", a) for a in arg_items):
+            return
+
+        # Support overloaded / conditional definitions of the same callable in `callee_rel`
+        callee_info = _get_info(callee_rel)
+        overloads = [
+            f for f in callee_info.get("functions", [])
+            if f["name"] == callee_fn["name"] and f.get("parent_class") == callee_fn.get("parent_class")
+        ] or [callee_fn]
+
+        errs = _check_args_against_fn(arg_items, callee_rel, callee_fn, is_meth)
+        if not errs:
+            return
+        for alt_fn in overloads:
+            if alt_fn is not callee_fn and not _check_args_against_fn(arg_items, callee_rel, alt_fn, is_meth):
+                return
+
+        # If a compatibility branch in the same snippet calls the same function again with valid args, accept it
+        if qual_expr and snippet.count(f"{qual_expr}(") > 1:
+            second_idx = snippet.find(f"{qual_expr}(")
+            rest_snip = snippet[second_idx + len(qual_expr) + 1 :]
+            alt_args = _extract_balanced_call_args(
+                rest_snip, callee_fn["name"], is_method=is_meth, mod_stem=mod_stem, qual_expr=qual_expr
             )
+            if alt_args is not None and not _check_args_against_fn(alt_args, callee_rel, callee_fn, is_meth):
+                return
+
+        for e_msg in errs:
+            if e_msg.startswith("__KW__"):
+                _emit(f"- ⚠️ **[6D Caller Keyword Contract Violation]** `{caller_rel}:L{call_line}` (`{caller_name}`) → {e_msg[6:]}")
+            else:
+                _emit(f"- ⚠️ **[6D Caller Arity Contract Violation]** `{caller_rel}:L{call_line}` (`{caller_name}`) → {e_msg[9:]}")
 
     def _verify_return_keys_for_caller(
         caller_rel: str,
@@ -2264,7 +2341,16 @@ def verify_cross_file_contracts(
                     caller_rel = caller_nd.get("rel_path", "")
                     call_line = e_in.get("line", 0)
                     if not (patched_texts and iface_unchanged and caller_rel not in focus_rels):
-                        _verify_call_site(caller_rel, caller_nd.get("name", ""), call_line, f_rel, fn)
+                        _verify_call_site(
+                            caller_rel,
+                            caller_nd.get("name", ""),
+                            call_line,
+                            f_rel,
+                            fn,
+                            edge_reason=e_in.get("reason", ""),
+                            caller_l_start=caller_nd.get("line_start", 0),
+                            caller_l_end=caller_nd.get("line_end", 0),
+                        )
                     if fn.get("return_keys"):
                         _verify_return_keys_for_caller(
                             caller_rel,
@@ -2313,7 +2399,16 @@ def verify_cross_file_contracts(
                     )
                     if dst_fn:
                         call_line = e_out.get("line") or fn.get("call_sites", {}).get(dst_fn["name"], 0)
-                        _verify_call_site(f_rel, fn["name"], call_line, dst_rel, dst_fn)
+                        _verify_call_site(
+                            f_rel,
+                            fn["name"],
+                            call_line,
+                            dst_rel,
+                            dst_fn,
+                            edge_reason=e_out.get("reason", ""),
+                            caller_l_start=fn.get("line_start", 0),
+                            caller_l_end=fn.get("line_end", 0),
+                        )
                         if dst_fn.get("return_keys"):
                             _verify_return_keys_for_caller(
                                 f_rel,
@@ -2388,7 +2483,20 @@ def verify_cross_file_contracts(
             target_rel = resolve.resolve_import(imp_rel, mod, file_set, module_index)
             if not target_rel or target_rel == imp_rel:
                 continue
+            if (
+                imp_rel.endswith(".py")
+                and "." not in mod
+                and not mod.startswith(".")
+                and target_rel.count("/") >= 2
+                and Path(imp_rel).parent != Path(target_rel).parent
+            ):
+                continue
             unwrapped_rel = resolve.unwrap_barrel_reexport(target_rel, sym, combined_index, file_set, module_index)
+            if unwrapped_rel != target_rel:
+                re_bind = (_get_info(target_rel).get("import_bindings") or {}).get(sym)
+                if re_bind and re_bind.get("qualified_module"):
+                    if resolve.resolve_python_import(target_rel, re_bind["qualified_module"], file_set, module_index) == unwrapped_rel:
+                        continue
             if unwrapped_rel not in focus_rels and target_rel not in focus_rels and imp_rel not in focus_rels:
                 continue
             if unwrapped_rel.endswith("__init__.py") and unwrapped_rel not in focus_rels:
@@ -2406,10 +2514,14 @@ def verify_cross_file_contracts(
                 continue
             target_txt = _get_text(unwrapped_rel)
             if target_txt and re.search(rf"\b{re.escape(sym)}\b", target_txt):
-                if re.search(
-                    rf"(?m)^[ \t]*(?:export\s+)?(?:const|let|var|type|interface|enum|function|class|def|async\s+def)?[ \t]*\b{re.escape(sym)}\b\s*(?:[:=(]|$)",
-                    target_txt,
-                ) or re.search(rf"\bfrom\s+\S+\s+import\s+\*|\bexport\s+\*\s+from\b", target_txt):
+                if (
+                    re.search(
+                        rf"(?m)^[ \t]*(?:export\s+)?(?:const|let|var|type|interface|enum|function|class|def|async\s+def)?[ \t]*\b{re.escape(sym)}\b\s*(?:[:=(]|$)",
+                        target_txt,
+                    )
+                    or re.search(rf"\bfrom\s+\S+\s+import\s+\*|\bexport\s+\*\s+from\b", target_txt)
+                    or (unwrapped_rel.endswith("__init__.py") and re.search(rf"['\"]{re.escape(sym)}['\"]", target_txt))
+                ):
                     continue
             close = difflib.get_close_matches(sym, sorted(defined_syms), n=1, cutoff=0.45)
             hint = f" (did you mean `{close[0]}`?)" if close else ""
