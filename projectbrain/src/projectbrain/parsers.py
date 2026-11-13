@@ -1033,17 +1033,43 @@ def _parse_python(root) -> dict:
 
     imports, import_bindings = _py_extract_imports_and_bindings(root)
     raw_root_text = _text(root)
+    def _resolve_py_prefix_const(cname: str | None) -> str:
+        if not cname:
+            return ""
+        raw_c = py_consts.get(cname, "")
+        if not raw_c:
+            return ""
+        m_lit = re.search(r"=\s*['\"](/[^'\"]*)['\"]", raw_c)
+        return m_lit.group(1) if m_lit else ""
+
     router_prefixes: dict[str, str] = {}
     default_router_prefix = ""
     for m_rp in re.finditer(
-        r"(?:([A-Za-z_][A-Za-z0-9_]*)\s*=\s*)?\b(?:APIRouter|Blueprint)\s*\([^)]*?\b(?:url_)?prefix\s*=\s*['\"]([^'\"]+)['\"]",
+        r"(?:([A-Za-z_][A-Za-z0-9_]*)\s*=\s*)?\b(?:APIRouter|Blueprint)\s*\([^)]*?\b(?:url_)?prefix\s*=\s*(?:['\"]([^'\"]+)['\"]|([A-Za-z_][A-Za-z0-9_]*))",
         raw_root_text,
     ):
-        r_var, r_pref = m_rp.group(1), m_rp.group(2).rstrip("/")
+        r_var = m_rp.group(1)
+        raw_pref = m_rp.group(2) or _resolve_py_prefix_const(m_rp.group(3))
+        r_pref = raw_pref.rstrip("/") if isinstance(raw_pref, str) else ""
+        if not r_pref:
+            continue
         if not default_router_prefix:
             default_router_prefix = r_pref
         if r_var:
             router_prefixes[r_var] = r_pref
+
+    router_mounts: list[dict] = []
+    for m_inc in re.finditer(
+        r"\b(?:include_\w+|register_\w+)\s*\(\s*([A-Za-z_][A-Za-z0-9_.]*)\s*(?:,[\s\S]{0,220}?\b(?:url_)?prefix\s*=\s*(?:['\"]([^'\"]+)['\"]|([A-Za-z_][A-Za-z0-9_]*)))?",
+        raw_root_text,
+    ):
+        target_expr = m_inc.group(1).strip()
+        mount_pref = m_inc.group(2) or _resolve_py_prefix_const(m_inc.group(3))
+        if target_expr and isinstance(mount_pref, str) and mount_pref.startswith("/"):
+            router_mounts.append({
+                "target": target_expr,
+                "prefix": mount_pref.rstrip("/") or "/",
+            })
 
     seen_routes: set[tuple[str, str, str]] = set()
     for _, mc in _matches(_PY, _PY_ROUTE, root):
@@ -1096,7 +1122,7 @@ def _parse_python(root) -> dict:
             "framework": "django",
         })
 
-    return {
+    py_out: dict = {
         "functions": functions,
         "classes": classes,
         "imports": imports,
@@ -1105,6 +1131,9 @@ def _parse_python(root) -> dict:
         "routes": routes,
         "const_aliases": _extract_const_aliases(py_consts),
     }
+    if router_mounts:
+        py_out["router_mounts"] = router_mounts
+    return py_out
 
 
 # ── JavaScript / TypeScript ─────────────────────────────────────────────────
@@ -1892,7 +1921,18 @@ def _parse_js(root, lang: Language) -> dict:
             route_dict["handler"] = handler_name
         routes.append(route_dict)
 
-    return {
+    js_router_mounts: list[dict] = []
+    raw_js_root = _text(root)
+    if ".use(" in raw_js_root or ".route(" in raw_js_root:
+        for m_use in re.finditer(
+            r"\b[A-Za-z_$][\w$]*\.use\s*\(\s*['\"](/[A-Za-z0-9_/\-:]+)['\"]\s*,\s*([A-Za-z_$][\w$.]*)",
+            raw_js_root,
+        ):
+            u_pref, u_tgt = m_use.group(1).rstrip("/") or "/", m_use.group(2).strip()
+            if u_tgt and u_tgt not in ("express", "cors", "json", "urlencoded", "helmet"):
+                js_router_mounts.append({"target": u_tgt, "prefix": u_pref})
+
+    js_out: dict = {
         "functions": functions,
         "classes": classes,
         "imports": imports,
@@ -1901,6 +1941,9 @@ def _parse_js(root, lang: Language) -> dict:
         "routes": routes,
         "const_aliases": _extract_const_aliases(js_consts),
     }
+    if js_router_mounts:
+        js_out["router_mounts"] = js_router_mounts
+    return js_out
 
 
 # ── SQL schema & function parser ────────────────────────────────────────────
@@ -3055,12 +3098,17 @@ def parse_files_parallel(
 
     parsed_by_rel: dict[str, tuple[dict, int]] = {}
     cpu_cnt = min(os.cpu_count() or 4, 8)
-    use_multiproc = (
-        len(to_parse) >= 48
-        and cpu_cnt >= 2
-        and os.environ.get("PROJECTBRAIN_PARALLEL_INDEX", "1") != "0"
-    )
-    if use_multiproc:
+    parallel_enabled = os.environ.get("PROJECTBRAIN_PARALLEL_INDEX", "1") != "0"
+    mcp_stdio = os.environ.get("PROJECTBRAIN_MCP_STDIO") == "1"
+    if not mcp_stdio and os.name == "nt":
+        try:
+            import sys as _sys
+            if _sys.stdin is None or not _sys.stdin.isatty():
+                mcp_stdio = True
+        except Exception:
+            mcp_stdio = True
+
+    if parallel_enabled and cpu_cnt >= 2 and len(to_parse) >= (24 if mcp_stdio else 48):
         # Sort descending by source length and deal round-robin across chunks so no worker straggles
         sorted_items = sorted(to_parse, key=lambda x: len(x[2]), reverse=True)
         num_batches = cpu_cnt * 2
@@ -3069,7 +3117,11 @@ def parse_files_parallel(
             batches[idx % num_batches].append(it)
         batches = [b for b in batches if b]
         try:
-            with ProcessPoolExecutor(max_workers=cpu_cnt) as cpu_pool:
+            # Inside stdio MCP servers (or non-TTY Windows pipes), spawning child processes
+            # inherits JSON-RPC stdin/stdout handles and risks spawn deadlocks; Tree-sitter C
+            # parsers release the GIL, so ThreadPoolExecutor scales cleanly with zero spawn risk.
+            pool_cls = ThreadPoolExecutor if mcp_stdio else ProcessPoolExecutor
+            with pool_cls(max_workers=cpu_cnt) as cpu_pool:
                 for batch_res in cpu_pool.map(_parse_worker_batch, batches):
                     for rel, info, size in batch_res:
                         parsed_by_rel[rel] = (info, size)

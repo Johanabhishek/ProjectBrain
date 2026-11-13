@@ -418,10 +418,84 @@ def read_blob_at_ref(root: Path, ref_commit: str, rel_path: str) -> str | None:
     if git_root is None:
         return None
     norm = _clean_rel_path(rel_path)
-    proc = _git_run(git_root, ["show", f"{ref_commit}:{sub_prefix}{norm}"], timeout=3.0)
+    proc = _git_run(git_root, ["show", f"{ref_commit}:{sub_prefix}{norm}"], timeout=2.5)
     if proc and proc.returncode == 0:
         return proc.stdout
     return None
+
+
+def read_blobs_batch_at_ref(
+    root: Path,
+    ref_commit: str,
+    rel_paths: Iterable[str],
+    *,
+    max_files: int = 120,
+    timeout: float = 4.0,
+) -> dict[str, str | None]:
+    """Read many `<ref_commit>:<rel_path>` blobs in ONE `git cat-file --batch` subprocess (<30ms on Windows)."""
+    unique_rels: list[str] = []
+    seen: set[str] = set()
+    for r in rel_paths:
+        norm = _clean_rel_path(r)
+        if norm and norm not in seen:
+            seen.add(norm)
+            unique_rels.append(norm)
+            if len(unique_rels) >= max_files:
+                break
+    if not unique_rels:
+        return {}
+
+    git_root, sub_prefix = find_git_context(root)
+    if git_root is None:
+        return {r: None for r in unique_rels}
+
+    stdin_lines = "".join(f"{ref_commit}:{sub_prefix}{r}\n" for r in unique_rels).encode("utf-8")
+    try:
+        proc = subprocess.run(
+            ["git", "-c", "core.quotepath=false", "cat-file", "--batch"],
+            cwd=str(git_root),
+            input=stdin_lines,
+            capture_output=True,
+            timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return {r: None for r in unique_rels}
+
+    if proc.returncode != 0 or not proc.stdout:
+        return {r: None for r in unique_rels}
+
+    buf = proc.stdout
+    pos = 0
+    buf_len = len(buf)
+    out: dict[str, str | None] = {}
+    for r in unique_rels:
+        nl = buf.find(b"\n", pos)
+        if nl == -1:
+            out[r] = None
+            continue
+        header = buf[pos:nl].decode("utf-8", errors="replace").strip()
+        pos = nl + 1
+        if header.endswith(" missing"):
+            out[r] = None
+            continue
+        parts = header.rsplit(" ", 2)
+        if len(parts) < 3 or parts[1] != "blob":
+            out[r] = None
+            continue
+        try:
+            sz = int(parts[2])
+        except ValueError:
+            out[r] = None
+            break
+        end_pos = min(buf_len, pos + sz)
+        raw_bytes = buf[pos:end_pos]
+        pos = end_pos + (1 if end_pos < buf_len and buf[end_pos : end_pos + 1] == b"\n" else 0)
+        out[r] = raw_bytes.decode("utf-8", errors="replace")
+    return out
+
+
+_PARSED_BLOB_CACHE: dict[tuple[str, str], dict] = {}
+_PARSED_BLOB_LOCK = __import__("threading").RLock()
 
 
 def load_parsed_snapshots_at_ref(
@@ -430,38 +504,98 @@ def load_parsed_snapshots_at_ref(
     active_files: Iterable[str],
     renamed_files: dict[str, str],
     deleted_or_moved_paths: Iterable[str],
+    *,
+    max_files: int = 120,
+    deadline_sec: float = 4.5,
 ) -> tuple[dict[str, dict], dict[str, dict]]:
-    """Parse pre-change file AST snapshots from `ref_commit` for modified, renamed, and deleted files."""
-    blob_info_cache: dict[str, dict | None] = {}
+    """Parse pre-change file AST snapshots from `ref_commit` via batched `git cat-file --batch` + thread pool."""
+    from concurrent.futures import ThreadPoolExecutor
+    import hashlib
+    import os
+    import time as _time
 
-    def _parse_at_ref(old_rel: str) -> dict | None:
-        if old_rel in blob_info_cache:
-            return blob_info_cache[old_rel]
-        ext = Path(old_rel).suffix.lower()
-        if ext not in SUPPORTED_CODE_EXTS:
-            blob_info_cache[old_rel] = None
-            return None
-        raw = read_blob_at_ref(root, ref_commit, old_rel)
-        if raw is None:
-            blob_info_cache[old_rel] = None
-            return None
+    t0 = _time.monotonic()
+    act_list = list(active_files)[:max_files]
+    del_list = list(deleted_or_moved_paths)[:max_files]
+
+    needed_old_rels: list[str] = []
+    for act_rel in act_list:
+        src_old_rel = renamed_files.get(act_rel, act_rel)
+        if Path(src_old_rel).suffix.lower() in SUPPORTED_CODE_EXTS:
+            needed_old_rels.append(src_old_rel)
+    for del_rel in del_list:
+        if Path(del_rel).suffix.lower() in SUPPORTED_CODE_EXTS:
+            needed_old_rels.append(del_rel)
+
+    batched_blobs = read_blobs_batch_at_ref(
+        root,
+        ref_commit,
+        needed_old_rels,
+        max_files=max_files,
+        timeout=min(3.5, deadline_sec),
+    )
+
+    blob_info_cache: dict[str, dict | None] = {}
+    to_parse: list[tuple[str, str, str, str]] = []
+    seen_norms: set[str] = set()
+    for raw_rel in needed_old_rels:
+        norm = _clean_rel_path(raw_rel)
+        if norm in seen_norms:
+            continue
+        seen_norms.add(norm)
+        ext = Path(norm).suffix.lower()
+        raw = batched_blobs.get(norm)
+        if ext not in SUPPORTED_CODE_EXTS or raw is None:
+            blob_info_cache[norm] = None
+            continue
+        digest = hashlib.blake2b(raw.encode("utf-8", errors="replace"), digest_size=12).hexdigest()
+        with _PARSED_BLOB_LOCK:
+            cached = _PARSED_BLOB_CACHE.get((ext, digest))
+        if cached is not None:
+            blob_info_cache[norm] = cached
+        else:
+            to_parse.append((norm, ext, digest, raw))
+
+    def _parse_one(item: tuple[str, str, str, str]) -> tuple[str, str, str, dict | None]:
+        norm, ext, digest, raw = item
+        if (_time.monotonic() - t0) > deadline_sec:
+            return (norm, ext, digest, None)
         try:
             inf = parse(raw, ext)
         except Exception:
             inf = None
-        blob_info_cache[old_rel] = inf
-        return inf
+        return (norm, ext, digest, inf)
+
+    if len(to_parse) == 1:
+        norm, ext, digest, inf = _parse_one(to_parse[0])
+        blob_info_cache[norm] = inf
+        if inf is not None:
+            with _PARSED_BLOB_LOCK:
+                if len(_PARSED_BLOB_CACHE) >= 256:
+                    _PARSED_BLOB_CACHE.clear()
+                _PARSED_BLOB_CACHE[(ext, digest)] = inf
+    elif len(to_parse) > 1:
+        workers = min(len(to_parse), max(2, os.cpu_count() or 4))
+        with ThreadPoolExecutor(max_workers=workers) as pool:
+            for norm, ext, digest, inf in pool.map(_parse_one, to_parse):
+                blob_info_cache[norm] = inf
+                if inf is not None:
+                    with _PARSED_BLOB_LOCK:
+                        if len(_PARSED_BLOB_CACHE) >= 256:
+                            _PARSED_BLOB_CACHE.clear()
+                        _PARSED_BLOB_CACHE[(ext, digest)] = inf
 
     pre_base_infos: dict[str, dict] = {}
-    for act_rel in active_files:
-        src_old_rel = renamed_files.get(act_rel, act_rel)
-        inf = _parse_at_ref(src_old_rel)
+    for act_rel in act_list:
+        norm = _clean_rel_path(renamed_files.get(act_rel, act_rel))
+        inf = blob_info_cache.get(norm)
         if inf:
             pre_base_infos[act_rel] = inf
 
     deleted_base_infos: dict[str, dict] = {}
-    for del_rel in deleted_or_moved_paths:
-        inf = _parse_at_ref(del_rel)
+    for del_rel in del_list:
+        norm = _clean_rel_path(del_rel)
+        inf = blob_info_cache.get(norm)
         if inf:
             deleted_base_infos[del_rel] = inf
 

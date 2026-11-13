@@ -1103,6 +1103,107 @@ def extract_monolith_landmarks(
     return [raw_lms[i] for i in range(0, len(raw_lms), step)][:max_landmarks]
 
 
+_COMP_USESTATE_PAT = re.compile(r"\bconst\s+\[\s*([A-Za-z_$][\w$]*)\s*,\s*([A-Za-z_$][\w$]*)\s*\]\s*=\s*useState\b")
+_COMP_HOOK_PAT = re.compile(r"\b(useEffect|useLayoutEffect|useCallback|useMemo)\s*\(")
+_COMP_HOOK_DEPS_PAT = re.compile(r",\s*(\[[^\]]*\])\s*\)\s*;?\s*$")
+_COMP_INNER_FN_PAT = re.compile(
+    r"^\s*(?:const|let|async\s+function|function|def|async\s+def)\s+([A-Za-z_$][\w$]*)\s*(?:=\s*(?:async\s*)?(?:\([^)]*\)|[A-Za-z_$][\w$]*)\s*=>|\()"
+)
+_COMP_JSX_RETURN_PAT = re.compile(r"^\s*return\s*\(\s*$")
+
+
+def build_monolith_component_map(
+    lines: list[str],
+    line_start: int,
+    line_end: int,
+    rel_path: str = "",
+) -> str:
+    """Build a compact <25-line Internal Component/Function Map for monolith functions (>=220 lines).
+
+    Surfaces all `[state, setState]` hook pairs, `useEffect`/`useCallback` spans + dependency arrays,
+    inner handler line ranges, and JSX return bounds so agents never miss state declared at L50 when
+    inspecting a handler at L1300.
+    """
+    n = len(lines)
+    s_idx = max(0, line_start - 1)
+    e_idx = min(n, line_end)
+    span = e_idx - s_idx
+    if span < 220:
+        return ""
+
+    states: list[str] = []
+    hooks: list[str] = []
+    raw_handlers: list[tuple[int, int, str]] = []
+    jsx_return_span: str | None = None
+    _ACTION_FN_PREFIXES = (
+        "handle", "on", "submit", "save", "approve", "reject",
+        "delete", "remove", "send", "dispatch", "toggle", "open", "close",
+    )
+
+    for idx in range(s_idx + 1, e_idx):
+        ln_no = idx + 1
+        raw = lines[idx]
+        st = raw.strip()
+        if not st or st.startswith(("//", "/*", "*", "#")):
+            continue
+
+        if "useState" in raw and len(states) < 24:
+            for m_us in _COMP_USESTATE_PAT.finditer(raw):
+                states.append(f"L{ln_no}:[{m_us.group(1)}, {m_us.group(2)}]")
+
+        m_hk = _COMP_HOOK_PAT.search(st) if "use" in st else None
+        if m_hk and len(hooks) < 14:
+            hk_kind = m_hk.group(1)
+            hk_end = _find_balanced_end(lines, idx, "(", ")", max_scan=260) + 1
+            tail = " ".join(lines[max(idx, hk_end - 4) : min(n, hk_end)])
+            m_dp = _COMP_HOOK_DEPS_PAT.search(tail)
+            deps_lbl = m_dp.group(1).strip() if m_dp else ""
+            if len(deps_lbl) > 28:
+                deps_lbl = deps_lbl[:25] + "...]"
+            hooks.append(f"L{ln_no}-L{hk_end}:{hk_kind}{deps_lbl}")
+            continue
+
+        m_fn = _COMP_INNER_FN_PAT.match(raw)
+        if m_fn and len(raw_handlers) < 240:
+            fn_nm = m_fn.group(1)
+            if fn_nm not in ("if", "for", "while", "switch", "catch"):
+                if "def " in st:
+                    fn_end = min(e_idx, ln_no + 40)
+                else:
+                    fn_end = min(e_idx, _find_balanced_end(lines, idx, "{", "}", max_scan=300) + 1)
+                fn_low = fn_nm.lower()
+                prio = 0 if (fn_low.startswith(_ACTION_FN_PREFIXES) or "async " in st) else 1
+                raw_handlers.append((prio, ln_no, f"L{ln_no}-L{fn_end}:{fn_nm}()"))
+
+        if jsx_return_span is None and _COMP_JSX_RETURN_PAT.match(raw):
+            indent = len(raw) - len(raw.lstrip())
+            if indent <= 8:
+                ret_end = min(e_idx, _find_balanced_end(lines, idx, "(", ")", max_scan=1200) + 1)
+                if (ret_end - ln_no) >= 15:
+                    jsx_return_span = f"L{ln_no}-L{ret_end}"
+
+    chosen_handlers = sorted(sorted(raw_handlers, key=lambda x: (x[0], x[1]))[:14], key=lambda x: x[1])
+    handlers = [h[2] for h in chosen_handlers]
+    total_handlers = len(raw_handlers)
+
+    if not (states or hooks or handlers or jsx_return_span):
+        return ""
+
+    loc = f"{rel_path} " if rel_path else ""
+    hdr = [
+        f"# [Monolith Internal Map: {loc}L{line_start}-L{line_end} ({span} lines) — pass `{rel_path}:<start>-<end>` or `read_file` for full context]"
+    ]
+    if states:
+        hdr.append("#   State Hooks : " + ", ".join(states[:18]) + (f" (+{len(states) - 18} more)" if len(states) > 18 else ""))
+    if hooks:
+        hdr.append("#   Effects/Memo: " + ", ".join(hooks[:10]) + (f" (+{len(hooks) - 10} more)" if len(hooks) > 10 else ""))
+    if handlers:
+        hdr.append("#   Handlers    : " + ", ".join(handlers) + (f" (+{total_handlers - len(handlers)} more)" if total_handlers > len(handlers) else ""))
+    if jsx_return_span:
+        hdr.append(f"#   JSX Return  : {jsx_return_span}")
+    return "\n".join(hdr)
+
+
 def snap_to_block_boundaries(
     lines: list[str],
     line_start: int,

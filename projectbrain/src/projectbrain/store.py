@@ -1627,12 +1627,28 @@ class SQLiteIndexStore:
                         """,
                         (base_name,),
                     ).fetchall()
+                    norm_base = re.sub(r"[^a-z0-9]+", "", base_name)
+                    if not rows and len(norm_base) >= 4:
+                        rows = conn.execute(
+                            """
+                            SELECT s.node_id, s.rel_path, s.kind, s.name, s.line_start, s.line_end, s.signature, f.mtime
+                            FROM symbols s
+                            LEFT JOIN files f ON f.rel_path = s.rel_path
+                            WHERE REPLACE(REPLACE(LOWER(s.name), '_', ''), '-', '') = ?;
+                            """,
+                            (norm_base,),
+                        ).fetchall()
                 out: list[dict] = []
+                norm_q = re.sub(r"[^a-z0-9]+", "", q_low)
                 for nid, rel, kind, name, l_s, l_e, sig, mtime in rows:
                     if ff_low and ff_low not in rel.lower():
                         continue
                     qname = nid.split(":", 2)[2] if nid.count(":") >= 2 else name
-                    if sym_query.startswith(("fn:", "cls:")) or q_low in (name.lower(), qname.lower()):
+                    if (
+                        sym_query.startswith(("fn:", "cls:"))
+                        or q_low in (name.lower(), qname.lower())
+                        or (len(norm_q) >= 4 and norm_q in (re.sub(r"[^a-z0-9]+", "", name.lower()), re.sub(r"[^a-z0-9]+", "", qname.lower())))
+                    ):
                         out.append({
                             "node_id": nid,
                             "rel_path": rel,
@@ -1752,16 +1768,21 @@ class SQLiteIndexStore:
                 def _fast_close_matches(word: str) -> list[str]:
                     if not word:
                         return []
-                    w_len = len(word)
-                    w_chars = set(word.lower())
+                    norm_w = re.sub(r"[^a-z0-9]+", "", word.lower())
+                    if not norm_w:
+                        return []
+                    w_len = len(norm_w)
+                    w_chars = set(norm_w)
                     min_shared = max(1, (len(w_chars) + 1) // 3)
                     min_l = max(1, w_len // 3)
                     max_l = w_len * 3
-                    filtered = [
-                        c for c in sym_candidates
-                        if min_l <= len(c) <= max_l and len(w_chars & set(c.lower())) >= min_shared
-                    ]
-                    return difflib.get_close_matches(word, filtered, n=5, cutoff=0.5)
+                    norm_to_orig: dict[str, str] = {}
+                    for c in sym_candidates:
+                        nc = re.sub(r"[^a-z0-9]+", "", c.lower())
+                        if nc and min_l <= len(nc) <= max_l and len(w_chars & set(nc)) >= min_shared:
+                            norm_to_orig.setdefault(nc, c)
+                    matched_norms = difflib.get_close_matches(norm_w, list(norm_to_orig.keys()), n=5, cutoff=0.5)
+                    return [norm_to_orig[mn] for mn in matched_norms]
 
                 close_raw = _fast_close_matches(sym_query)
                 if not close_raw and "." in sym_query:
@@ -1835,8 +1856,10 @@ class SQLiteIndexStore:
         return e_obj
 
     def _find_nodes_by_name_conn(self, conn: sqlite3.Connection, name: str) -> list[str]:
-        name_clean = name.strip()
+        name_clean = name.strip().replace("\\", "/")
         name_low = name_clean.lower()
+        norm_key = re.sub(r"[^a-z0-9]+", "", name_low)
+        wants_file = "." in name_clean.rsplit("/", 1)[-1] and not name_clean.startswith(("fn:", "cls:", "route:", "mod:"))
         exact_matches: list[str] = []
         seen: set[str] = set()
 
@@ -1847,14 +1870,26 @@ class SQLiteIndexStore:
 
         for (nid,) in conn.execute("SELECT node_id FROM graph_nodes WHERE node_id = ?;", (name_clean,)).fetchall():
             _add(nid, exact_matches)
+        if wants_file:
+            for (nid,) in conn.execute(
+                """
+                SELECT node_id FROM graph_nodes
+                WHERE node_type = 'file' AND (LOWER(rel_path) = ? OR LOWER(rel_path) LIKE ?);
+                """,
+                (name_low, f"%/{name_low}"),
+            ).fetchall():
+                _add(nid, exact_matches)
         for (nid,) in conn.execute(
             "SELECT node_id FROM graph_nodes WHERE LOWER(name) = ? OR LOWER(node_id) = ?;",
             (name_low, name_low),
         ).fetchall():
             _add(nid, exact_matches)
         for (nid,) in conn.execute(
-            "SELECT node_id FROM graph_nodes WHERE name = '' AND LOWER(rel_path) = ?;",
-            (name_low,),
+            """
+            SELECT node_id FROM graph_nodes
+            WHERE node_type = 'file' AND (LOWER(rel_path) = ? OR LOWER(rel_path) LIKE ?);
+            """,
+            (name_low, f"%/{name_low}"),
         ).fetchall():
             _add(nid, exact_matches)
         for nid, pjson in conn.execute(
@@ -1862,8 +1897,22 @@ class SQLiteIndexStore:
         ).fetchall():
             props = _decode_props_blob(pjson)
             r_path = str(props.get("path") or "").lower()
+            r_full = str(props.get("full_path") or r_path).lower()
             r_lbl = f"{props.get('method', '')} {props.get('path', '')}".strip().lower()
-            if r_path == name_low or (r_lbl and r_lbl == name_low):
+            r_flbl = f"{props.get('method', '')} {r_full}".strip().lower()
+            if name_low in (r_path, r_full) or (r_lbl and r_lbl == name_low) or (r_flbl and r_flbl == name_low):
+                _add(nid, exact_matches)
+
+        if len(norm_key) >= 4 and len(exact_matches) < 10:
+            for (nid,) in conn.execute(
+                """
+                SELECT node_id FROM graph_nodes
+                WHERE node_type IN ('fn', 'cls')
+                  AND REPLACE(REPLACE(LOWER(name), '_', ''), '-', '') = ?
+                LIMIT 15;
+                """,
+                (norm_key,),
+            ).fetchall():
                 _add(nid, exact_matches)
 
         if len(exact_matches) >= 10:
@@ -1880,6 +1929,18 @@ class SQLiteIndexStore:
             (like_pat, like_pat, like_pat),
         ).fetchall():
             _add(nid, partial_matches)
+        if not exact_matches and not partial_matches and len(norm_key) >= 5:
+            norm_like = f"%{norm_key}%"
+            for (nid,) in conn.execute(
+                """
+                SELECT node_id FROM graph_nodes
+                WHERE node_type IN ('fn', 'cls')
+                  AND REPLACE(REPLACE(LOWER(name), '_', ''), '-', '') LIKE ?
+                LIMIT 20;
+                """,
+                (norm_like,),
+            ).fetchall():
+                _add(nid, partial_matches)
         return exact_matches + partial_matches
 
     def explore_fast(
@@ -2053,11 +2114,12 @@ class SQLiteIndexStore:
                             (best_a, best_b),
                         ).fetchall()
                     }
-                    return {
+                    from .graph import compact_explore_result
+                    return compact_explore_result({
                         "path": best_path,
                         "from_node": endpoints.get(best_a, {"id": best_a}),
                         "to_node": endpoints.get(best_b, {"id": best_b}),
-                    }
+                    })
 
                 # Neighbors mode (`target_b` is None)
                 exact_row = conn.execute(
@@ -2070,7 +2132,17 @@ class SQLiteIndexStore:
                 else:
                     matches = self._find_nodes_by_name_conn(conn, target)
                     if not matches:
-                        return {"error": f"No graph node matching '{target}'", "nodes": [], "edges": []}
+                        did_you_mean, pkg_matches = self.suggest_missing_target_fast(target, target)
+                        miss_out: dict = {
+                            "error": f"No graph node matching '{target}'",
+                            "nodes": [],
+                            "edges": [],
+                        }
+                        if did_you_mean:
+                            miss_out["did_you_mean"] = did_you_mean
+                        if pkg_matches:
+                            miss_out["closest_files"] = pkg_matches
+                        return miss_out
                     node_id = matches[0]
                     exact_row = conn.execute(
                         f"SELECT {_GN_SELECT_COLS} FROM graph_nodes WHERE node_id = ?;",
@@ -2148,11 +2220,23 @@ class SQLiteIndexStore:
                     for s_i, d_i, et, conf, ln_i, rsn in raw_edges
                     if s_i in id_by_nid and d_i in id_by_nid
                 ]
-                return {
-                    "center": self._row_to_node_dict(exact_row[1:]),
+                from .graph import compact_explore_result
+                center_dict = self._row_to_node_dict(exact_row[1:])
+                compacted = compact_explore_result({
+                    "center": center_dict,
                     "nodes": neighbor_nodes,
                     "edges": collected_edges,
-                }
+                })
+                c_rel = compacted.get("center", {}).get("rel_path")
+                if c_rel:
+                    sz_row = conn.execute("SELECT size FROM files WHERE rel_path = ?;", (c_rel,)).fetchone()
+                    if sz_row and sz_row[0] is not None and int(sz_row[0]) <= 12_000:
+                        est_lines = max(1, int(sz_row[0]) // 34)
+                        compacted["direct_read_hint"] = (
+                            f"'{c_rel}' is small (~{est_lines} lines, {int(sz_row[0])} bytes) — "
+                            f"read_file('{c_rel}') reads the full source directly in 1 turn."
+                        )
+                return compacted
             finally:
                 conn.close()
         except (sqlite3.Error, json.JSONDecodeError, zlib.error):

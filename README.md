@@ -1,16 +1,26 @@
-# ProjectBrain (`projectbrain-mcp` v1.1.0)
+# ProjectBrain (`projectbrain-mcp` v1.2.0)
 
 [![PyPI](https://img.shields.io/pypi/v/projectbrain-mcp.svg)](https://pypi.org/project/projectbrain-mcp/)
 [![License: MIT](https://img.shields.io/badge/License: MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-**Zero-LSP SQLite Code Graph, Real-Time Blast-Radius & PR Merge-Base Contract Guardrail, and PDG Context Compiler for AI Coding Agents.**
+**Zero-LSP SQLite Code Graph, `<8 KB` Inline MCP Context Compiler, Full-Stack Route Tracer & Sub-2s Contract Guardrail for AI Coding Agents.**
 
-ProjectBrain gives Claude Code, Cursor, Antigravity, Windsurf, and CI pipelines both **Offense** (1-turn architectural context + `<20ms` surgical PDG slicing) and **Defense** (active post-edit hooks, PR merge-base contract & boundary verification, Governance Tamper Lock, SARIF v2.1.0, and Day-1 architecture learning) backed by a local SQLite WAL + FTS5 graph (`.projectbrain.db`) and lazy-loaded `tree-sitter` / Python `ast`. No LSP servers, no Docker, no cloud embeddings, and no API keys.
+ProjectBrain gives Claude Code, Cursor, Antigravity, Windsurf, and CI pipelines both **Offense** (`<8 KB` zero-spillover architectural dossiers, `<20ms` surgical PDG + React monolith maps, and verb-agnostic `${baseUrl}` -> FastAPI/Express route tracing) and **Defense** (sub-2s batched `git cat-file --batch` contract checks, React hook & undeclared-setter AST detection, PR merge-base verification, Governance Tamper Lock, and SARIF v2.1.0) backed by a local SQLite WAL + FTS5 graph (`.projectbrain.db`) and lazy-loaded `tree-sitter` / Python `ast`. No LSP servers, no Docker, no cloud embeddings, and no API keys.
 
 ---
 
-## Why ProjectBrain v1.1? (Offense + Team/CI Defense)
+## What's New in v1.2.0 (Speed, Zero Spillovers & Full-Stack Precision)
+
+1. **Strict `<8 KB` Inline MCP Payload Cap (`0` `output.txt` Double-Hop Spillovers):** Every MCP tool (`brain_explore`, `brain_dossier`, `brain_slice`, `brain_check`) strips internal 6D IR arrays/hashes, registers `structured_output=False` (eliminating duplicate FastMCP wire serialization), and enforces `<= 7,800` UTF-8 chars inline — preventing IDE `.system_generated/.../output.txt` file spillovers and extra `read_file` billing turns.
+2. **React/JSX Monolith Internal Maps + `undeclared_state_setter` AST Gate:** Slicing 1,000–2,000+ line React components prepends a compact `[Monolith Internal Map]` indexing all `useState` pairs, `useEffect`/`useMemo` spans, interactive handlers, and JSX return bounds. `brain_check` now runs single-pass CST lexical binding verification (`Law 6`) to catch bare `setFoo(...)` typos/refactors (`ReferenceError` at runtime) and suggest the closest `[state, setState]` hook declaration.
+3. **Dynamic `` `${baseUrl}/api/...` `` & Cross-File `include_router` Route Flows + `snake_case` <-> `camelCase` Lookup:** `brain_explore("/api/v1/...")` is now verb-agnostic (`GET`/`POST`/`PUT`/`DELETE`), resolves FastAPI `include_router(..., prefix=...)` and Express `app.use('/prefix', router)` mounts across files (including PEP 420 namespace packages), traces template-literal `fetch`/`axios`/wrapper callers, and matches `send_email` <-> `sendEmail` seamlessly.
+4. **Sub-2s `brain_check` on Windows `stdio` (`git cat-file --batch` + Lock-Safe Thread Pool):** Replaces per-file `git show` subprocesses with a single `git cat-file --batch` stream (`<30ms`), caches `HEAD` baseline misses, switches MCP `stdio` indexing from `ProcessPoolExecutor` `spawn` to GIL-releasing `ThreadPoolExecutor` (eliminating 3-minute Windows `stdio` pipe hangs and prompt-cache TTL evictions), and guards concurrent MCP calls with per-repo reentrant locks.
+5. **Small-Scope Direct-Read Discipline:** Built-in `direct_read_hint` and updated `AGENTS.md` rules explicitly steer agents to use native `rg` + `read_file` directly when a feature spans `<=6` files, a file is `<=350` lines, or a single React monolith is being audited end-to-end.
+
+---
+
+## Why ProjectBrain? (Offense + Team/CI Defense)
 
 AI coding agents edit fast with native `Edit` / `edit_file` tools, but routinely **break uninspected callers across files**, **violate layer boundaries**, **silently delete governance rules in PRs**, or **burn 50k+ tokens** grep-crawling monoliths. ProjectBrain solves both without forcing agents to learn a custom edit DSL:
 
@@ -155,7 +165,7 @@ flowchart LR
 
 ProjectBrain is a deterministic static AST + lexical/graph engine, **not** an embedding model or runtime tracer:
 
-1. **When plain `rg` / `grep` is better:** If you already know an exact literal string, error constant, or config key and only want line numbers, `rg` is faster and simpler.
+1. **When plain `rg` + `read_file` is better:** If you already know an exact literal string, if the repo/feature touches `<=6` well-named files, if a file is `<=350` lines (`<=12 KB`), or if you are auditing a single giant React JSX monolith component end-to-end, native `rg` + `read_file` in 1 turn beats adding a code-graph middleman — then run `brain_check` once at the end as a `<2s` cross-file & hook contract gate.
 2. **Lexical + Graph Ranking vs. Embeddings (`dossier`):** Indexing takes `~0.1–1.5s` locally with zero API keys or model downloads. If a query uses completely different words from the codebase's identifiers and docstrings (naming zero symbols), lexical ranking can miss entry points until you supply a domain term.
 3. **Static Analysis vs. Dynamic Dispatch (`verify` / `check`):** Calls through runtime-assigned variables (`adapter = self.get_adapter(url); adapter.send(req)`) cannot be proven to hit a single concrete class statically. `dossier` surfaces candidate edges (`send -> HTTPAdapter.send`), while `verify` honestly returns **`UNKNOWN`** rather than fabricating a false `REFUTED` or `SUPPORTED`.
 4. **Language Tier Depth:**
@@ -179,7 +189,7 @@ python projectbrain/eval/bench_scale.py
 # 3. External repository benchmarks: pallets/flask, django/django, psf/requests, pallets/click, expressjs/express
 python projectbrain/eval/bench_external.py --suite all
 
-# 4. Full unit, guardrail, anti-leakage, security, and regression test suite (256 tests)
+# 4. Full unit, guardrail, anti-leakage, security, and regression test suite (260 tests)
 pytest projectbrain/tests -q
 ```
 
@@ -187,10 +197,10 @@ pytest projectbrain/tests -q
 
 | Repository | Dossier Questions | Target Symbol Slice Recall | Cost per Hit | Structural & Slicing Checks |
 | :--- | :---: | :---: | :---: | :--- |
-| **`psf/requests`** | 4 questions (`proxies`, `redirects/auth`, `cookies`, `adapters/pool`) | **`15 / 15` (`100%`)** | `3.71 KB` | `verify_claim("Session.send", "calls", "HTTPAdapter.send")` -> **`UNKNOWN`** (dynamic receiver `adapter.send`, never false `REFUTED`); `slice_symbols(["should_strip_auth", "get_environ_proxies"])` -> `2 / 2` |
-| **`pallets/click`** | 3 questions (`option/arg parsing`, `Group subcommand dispatch`, `ParamType converters`) | **`9 / 11` (`81.8%`)** | `4.95 KB` | **`0` bare `__init__` headers** (all methods qualified as `ClassName.method`, e.g. `Group.invoke`, `Group.resolve_command`) |
-| **`expressjs/express`** | 3 questions (`res.send content-type`, `app.use mounting`, `app.handle dispatch`) | **`6 / 6` (`100%`)** | `2.34 KB` | `lib/response.js`: **32 functions** indexed; `lib/application.js`: **18 functions** indexed; `slice_symbols(["res.send", "app.use", "app.handle"])` -> **`3 / 3`** |
-| **Combined Held-Out Total** | **10 questions** | **`30 / 32` (`93.8%`)** | **`3.81 KB`** | — |
+| **`psf/requests`** | 4 questions (`proxies`, `redirects/auth`, `cookies`, `adapters/pool`) | **`15 / 15` (`100%`)** | `3.99 KB` | `verify_claim("Session.send", "calls", "HTTPAdapter.send")` -> **`UNKNOWN`** (dynamic receiver `adapter.send`, never false `REFUTED`); `slice_symbols(["should_strip_auth", "get_environ_proxies"])` -> `2 / 2` |
+| **`pallets/click`** | 3 questions (`option/arg parsing`, `Group subcommand dispatch`, `ParamType converters`) | **`11 / 11` (`100%`)** | `4.35 KB` | **`0` bare `__init__` headers** (all methods qualified as `ClassName.method`, e.g. `Group.invoke`, `Group.resolve_command`, `ParamType.convert`) |
+| **`expressjs/express`** | 3 questions (`res.send content-type`, `app.use mounting`, `app.handle dispatch`) | **`6 / 6` (`100%`)** | `2.81 KB` | `lib/response.js`: **32 functions** indexed; `lib/application.js`: **18 functions** indexed; `slice_symbols(["res.send", "app.use", "app.handle"])` -> **`3 / 3`** |
+| **Combined Held-Out Total** | **10 questions** | **`32 / 32` (`100%`)** | **`3.89 KB`** | — |
 
 ### 2. Scale & Incremental Latency (`pallets/flask` & `django/django`)
 

@@ -8,16 +8,17 @@ from pathlib import Path
 _AGENT_RULE_CONTENT = """\
 # ProjectBrain — Code Graph & Blast-Radius Guardrail Rules
 
-This repository is indexed by **ProjectBrain** (`projectbrain`). Use it alongside native tools:
+This repository is indexed by **ProjectBrain** (`projectbrain`). Choose the fastest tool for the scope:
 
-1. **When to Use Native Tools vs. ProjectBrain (`brain_dossier` / `brain_explore`):**
-   Use native `rg` and `read_file` for exact literal searches and normal file reads. Reach for `brain_dossier(tasks=["<question_or_bug>"])` (`projectbrain dossier`) or `brain_explore` (`projectbrain explore`) when tracing unfamiliar multi-file call chains, `/api/...` HTTP routes, or `co_changes`.
+1. **Direct Reads vs. Code Graph (`rg` / `read_file` vs. `brain_dossier` / `brain_explore`):**
+   - **Small scope / small files / React monoliths:** When a feature lives in `<=6` well-named files, a file is `<=350` lines, or a React/JSX component is one giant monolith function (`>400` lines), use native `rg` + batch `read_file` directly — do not query graph edges on small files.
+   - **Large multi-file chains:** Use `brain_explore` (`projectbrain explore`) or `brain_dossier` (`projectbrain dossier`) when tracing unfamiliar multi-hop call chains, cross-file `/api/...` routes, or git `co_changes` across dozens of files.
 2. **Surgical Symbol & Variable Slicing (`brain_slice` / `projectbrain slice`):**
-   When inspecting specific functions, class skeletons, or variable flows inside large files, batch targets into `brain_slice(targets=["file.py:Class.method"], focus="target_var")` (`projectbrain slice`).
-3. **Edit Natively + Verify Blast Radius (`brain_check`):**
-   Edit files with native editing tools (`Edit` / `edit_file`). Post-edit guardrail hooks automatically check syntax, layer boundaries, and pinned invariants. Call `brain_check` (`projectbrain check`) to inspect downstream callers or verify multi-file changes.
+   When inspecting specific functions, class skeletons, monolith internal component maps, or PDG variable flows (`focus="target_var"`), batch targets into `brain_slice(targets=["file.py:Class.method"])`.
+3. **Edit Natively + Sub-2s Contract & Blast-Radius Gate (`brain_check`):**
+   Edit files natively (`Edit` / `edit_file`). Call `brain_check` (`projectbrain check`) once after multi-file edits (or during bug audits) to catch cross-file arity/import/return-key breaks, React hook/undeclared-setter bugs, and layer boundary violations.
 4. **Architectural Invariants (`brain_remember`) & Test Log Compression (`projectbrain run`):**
-   Pin function invariants (`brain_remember(target="Symbol", note="...")`) or layer rules (`forbid="routes/* -> db/*"`). Use `projectbrain run "<cmd>"` when you want noisy test output folded to failing traceback symbols.
+   Pin function invariants (`brain_remember(target="Symbol", note="...")`) or layer rules (`forbid="routes/* -> db/*"`). Use `projectbrain run "<cmd>"` to fold noisy test output to failing traceback symbols.
 """
 
 _CURSOR_MDC_FRONTMATTER = """\

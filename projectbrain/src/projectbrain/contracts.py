@@ -468,7 +468,108 @@ _JS_IGNORE_HANDLERS = (
 )
 
 
-def _analyze_js_ts_ast_contracts(lines: list[str], ext: str) -> list[dict]:
+_JS_BUILTIN_SETTERS = frozenset({
+    "setTimeout", "setInterval", "setImmediate", "setState",
+    "setAttribute", "setAttributeNS", "setAttributeNode", "setAttributeNodeNS",
+    "setProperty", "setHeader", "setHeaders", "setItem", "setPrototypeOf",
+    "setHours", "setMinutes", "setSeconds", "setMilliseconds", "setDate",
+    "setMonth", "setFullYear", "setTime", "setUTCDate", "setUTCHours",
+    "setUTCMinutes", "setUTCSeconds", "setUTCMilliseconds", "setUTCMonth",
+    "setUTCFullYear", "setBigInt64", "setBigUint64", "setFloat32", "setFloat64",
+    "setInt8", "setInt16", "setInt32", "setUint8", "setUint16", "setUint32",
+    "setRequestHeader", "setCustomValidity", "setSelectionRange", "setRangeText",
+    "setPointerCapture", "setDragImage", "setPosition", "setBaseAndExtent",
+    "setStart", "setEnd", "setStartBefore", "setStartAfter", "setEndBefore",
+    "setEndAfter", "setNamedItem", "setNamedItemNS", "setServerSideProps",
+})
+_JS_SETTER_IDENT_RE = re.compile(r"^set[A-Z][a-zA-Z0-9_]*$")
+
+
+def _collect_js_pattern_bindings(pat_node, out: set[str]) -> None:
+    """Collect bound identifier names from a JS/TS parameter, declarator LHS, or destructuring pattern."""
+    if pat_node is None:
+        return
+    stack = [pat_node]
+    while stack:
+        nd = stack.pop()
+        nt = nd.type
+        if nt in ("type_annotation", "type_arguments", "TSTypeAnnotation"):
+            continue
+        if nt in ("identifier", "shorthand_property_identifier_pattern", "shorthand_property_identifier"):
+            out.add(nd.text.decode("utf-8", errors="replace"))
+            continue
+        if nt == "assignment_pattern":
+            left_n = nd.child_by_field_name("left")
+            if left_n is not None:
+                stack.append(left_n)
+            continue
+        if nt == "pair_pattern":
+            val_n = nd.child_by_field_name("value")
+            if val_n is not None:
+                stack.append(val_n)
+            continue
+        for ch in nd.children:
+            stack.append(ch)
+
+
+def _collect_js_file_bindings_and_bare_setter_calls(root_node) -> tuple[set[str], list[tuple[str, int]]]:
+    """Single-pass CST walk returning `(all_bound_identifiers, bare_setX_calls_with_line)`."""
+    bound: set[str] = set()
+    bare_setter_calls: list[tuple[str, int]] = []
+    stack = [root_node]
+    while stack:
+        nd = stack.pop()
+        nt = nd.type
+        if nt == "import_specifier":
+            alias_n = nd.child_by_field_name("alias") or nd.child_by_field_name("name")
+            if alias_n is not None:
+                bound.add(alias_n.text.decode("utf-8", errors="replace"))
+        elif nt in ("import_clause", "namespace_import"):
+            for ch in nd.children:
+                if ch.type == "identifier":
+                    bound.add(ch.text.decode("utf-8", errors="replace"))
+        elif nt == "variable_declarator":
+            _collect_js_pattern_bindings(nd.child_by_field_name("name"), bound)
+        elif nt in (
+            "function_declaration",
+            "generator_function_declaration",
+            "function_expression",
+            "generator_function",
+            "arrow_function",
+            "method_definition",
+        ):
+            nm_n = nd.child_by_field_name("name")
+            if nm_n is not None and nm_n.type in ("identifier", "property_identifier"):
+                bound.add(nm_n.text.decode("utf-8", errors="replace"))
+            params_n = nd.child_by_field_name("parameters") or nd.child_by_field_name("parameter")
+            if params_n is not None:
+                _collect_js_pattern_bindings(params_n, bound)
+        elif nt in ("class_declaration", "class", "interface_declaration", "type_alias_declaration", "enum_declaration"):
+            nm_n = nd.child_by_field_name("name")
+            if nm_n is not None:
+                bound.add(nm_n.text.decode("utf-8", errors="replace"))
+        elif nt == "catch_clause":
+            _collect_js_pattern_bindings(nd.child_by_field_name("parameter"), bound)
+        elif nt == "for_in_statement":
+            _collect_js_pattern_bindings(nd.child_by_field_name("left"), bound)
+        elif nt == "assignment_expression":
+            lhs_n = nd.child_by_field_name("left")
+            if lhs_n is not None and lhs_n.type in ("identifier", "array_pattern", "object_pattern"):
+                _collect_js_pattern_bindings(lhs_n, bound)
+        elif nt == "call_expression":
+            fn_n = nd.child_by_field_name("function")
+            if fn_n is not None and fn_n.type == "identifier":
+                c_txt = fn_n.text.decode("utf-8", errors="replace")
+                if _JS_SETTER_IDENT_RE.match(c_txt) and c_txt not in _JS_BUILTIN_SETTERS:
+                    bare_setter_calls.append((c_txt, fn_n.start_point[0] + 1))
+
+        ch_list = nd.children
+        if ch_list:
+            stack.extend(reversed(ch_list))
+    return bound, bare_setter_calls
+
+
+def _analyze_js_ts_ast_contracts(lines: list[str], ext: str, tree: object | None = None) -> list[dict]:
     """Universal JS/TS/React static AST & lexical-closure contract analyzer:
       1. `premature_effect_event_handler`: Callback `H` bound to JSX `on[A-Z]*` prop is also invoked
          synchronously inside `useEffect` on mount/state-change.
@@ -481,6 +582,8 @@ def _analyze_js_ts_ast_contracts(lines: list[str], ext: str) -> list[dict]:
          with fewer arguments than its REQUIRED parameters (no `?`, default, or rest).
       5. `listener_cleanup_mismatch`: Inside an effect whose cleanup removes listeners, an
          `addEventListener(evt, h)` pair is never removed with the same function identity.
+      6. `undeclared_state_setter`: Inside a component with `useState` hooks, a bare `set[A-Z]*` call
+         references an identifier with zero lexical declaration/import/prop binding in the file.
     """
     if ext.lower() not in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs") or not lines:
         return []
@@ -814,6 +917,65 @@ def _analyze_js_ts_ast_contracts(lines: list[str], ext: str) -> list[dict]:
                 ),
             })
 
+    # Law 6: Undeclared React State Setter Call (`setFoo(...)` typo / stale refactor in monolith components)
+    if state_vars and "eval(" not in full_text and "with (" not in full_text:
+        ts_tree = tree
+        if ts_tree is None:
+            js_parser = get_parser(ext.lower())
+            if js_parser is not None:
+                try:
+                    ts_tree = js_parser.parse(full_text.encode("utf-8", errors="replace"))
+                except Exception:
+                    ts_tree = None
+        if ts_tree is not None and not getattr(ts_tree.root_node, "has_error", False):
+            bound_idents, bare_setter_calls = _collect_js_file_bindings_and_bare_setter_calls(ts_tree.root_node)
+            if bare_setter_calls:
+                import difflib
+                declared_setters = [
+                    (sv_var, sv_set, sv_ln)
+                    for sv_var, (sv_set, sv_ln) in state_vars.items()
+                ]
+                emitted_per_sym: dict[str, int] = {}
+                for callee_nm, call_ln in bare_setter_calls:
+                    if callee_nm in bound_idents:
+                        continue
+                    if emitted_per_sym.get(callee_nm, 0) >= 2:
+                        continue
+                    emitted_per_sym[callee_nm] = emitted_per_sym.get(callee_nm, 0) + 1
+                    core_low = callee_nm[3:].lower()
+                    best_match: tuple[float, str, str, int] | None = None
+                    for sv_var, sv_set, sv_ln in declared_setters:
+                        cand_core = sv_set[3:].lower() if sv_set.startswith("set") else sv_set.lower()
+                        ratio = difflib.SequenceMatcher(None, core_low, cand_core).ratio()
+                        if core_low and (cand_core.endswith(core_low) or core_low.endswith(cand_core)):
+                            ratio = max(ratio, 0.88)
+                        if best_match is None or ratio > best_match[0]:
+                            best_match = (ratio, sv_var, sv_set, sv_ln)
+                    if best_match and best_match[0] >= 0.45:
+                        _, b_var, b_set, b_ln = best_match
+                        pins = [call_ln, b_ln]
+                        hint_inline = f" (did you mean '{b_set}' from [{b_var}, {b_set}] at L{b_ln}?)"
+                        hint_md = f"; closest declared hook setter is `{b_set}` (`[{b_var}, {b_set}] = useState(...)` at `L{b_ln}`)"
+                    else:
+                        pins = [call_ln]
+                        hint_inline = ""
+                        hint_md = ""
+                    violations.append({
+                        "kind": "undeclared_state_setter",
+                        "symbol": callee_nm,
+                        "line": call_ln,
+                        "end_line": call_ln + 1,
+                        "extra_pin_lines": pins,
+                        "inline_msg": (
+                            f"# >>> [6D-CONTRACT L{call_ln}] Undeclared state setter: '{callee_nm}(...)' is never "
+                            f"declared, imported, or passed as a prop in this module (ReferenceError at runtime){hint_inline}"
+                        ),
+                        "summary": (
+                            f"Calls undeclared state setter `{callee_nm}(...)` at `L{call_ln}` "
+                            f"(throws `ReferenceError` at runtime){hint_md}."
+                        ),
+                    })
+
     return violations
 
 
@@ -948,17 +1110,23 @@ _4D_DIALECT_ILIKE_RE = re.compile(r"\bILIKE\b")
 _4D_DIALECT_CAST_RE = re.compile(r"::(?:uuid|jsonb|timestamptz|inet|text\[\]|int\[\])\b", re.IGNORECASE)
 _4D_JSON_VAR_RE = re.compile(r"\b(?:const|let|var)\s+([a-zA-Z_]\w*)\s*=\s*await\s+\w+\.json\(\)")
 _4D_FETCH_RE = re.compile(
-    r"\bfetch\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?[`'\"](?:\$\{[^}]+\})?(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"](?:\s*,\s*\{([\s\S]{0,260}?)\})?"
+    r"\bfetch\s*\(\s*(?:[a-zA-Z_$][\w$.]*\s*\+\s*)?[`'\"](?:\$\{[^{}`]+\})*(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"](?:\s*,\s*\{([\s\S]{0,260}?)\})?"
 )
 _4D_FETCH_METHOD_RE = re.compile(r"\bmethod\s*:\s*['\"]([A-Za-z]+)['\"]")
 _4D_URL_PARAM_RE = re.compile(r"\$\{[^}]+\}|:[a-zA-Z_]\w*")
 _4D_HTTP_PY_RE = re.compile(
-    r"\b(?:requests|httpx)\.(get|post|put|delete|patch)\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?[`'\"](?:\$\{[^}]+\})?(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]",
+    r"\b(?:requests|httpx|client)\.(get|post|put|delete|patch)\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?f?[`'\"](?:\{[^{}]+\}|\$\{[^{}`]+\})*(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]",
     re.IGNORECASE,
 )
 _4D_HTTP_JS_RE = re.compile(
-    r"\b(?:axios|api|client|http)\.(get|post|put|delete|patch)\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?[`'\"](?:\$\{[^}]+\})?(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]",
+    r"\b(?:axios|api|client|http|httpClient|apiClient)\.(get|post|put|delete|patch)\s*\(\s*(?:[a-zA-Z_$][\w$.]*\s*\+\s*)?[`'\"](?:\$\{[^{}`]+\})*(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]",
     re.IGNORECASE,
+)
+_4D_HTTP_WRAPPER_RE = re.compile(
+    r"\b(?:apiRequest|apiFetch|request|fetchJson|httpRequest|(post|get|put|patch|delete)(?:Json|Api|Request)?)\s*\(\s*(?:[a-zA-Z_$][\w$.]*\s*\+\s*)?[`'\"](?:\$\{[^{}`]+\})*(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"](?:\s*,\s*\{([\s\S]{0,260}?)\})?",
+)
+_4D_URL_VAR_DECL_RE = re.compile(
+    r"\b(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(?:[a-zA-Z_$][\w$.]*\s*\+\s*)?[`'\"](?:\$\{[^{}`]+\})*(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]"
 )
 _4D_FETCHONE_RE = re.compile(
     r"\b([a-zA-Z_]\w*)\s*=\s*[\w.]+\.execute\(\s*(?:f?['\"]{1,3})\s*SELECT\s+([\s\S]+?)\s+FROM\s+([a-zA-Z_]\w*)\b[\s\S]*?\)\.fetchone\(\)",
@@ -991,18 +1159,21 @@ def extract_4d_coordinate_matrix(
 
     ast_span_by_start: dict[int, int] = {}
     ast_mutations_by_line: dict[int, list[str]] = {}
+    parser = get_parser(ext_l)
+    if tree is None and parser is not None and n > 0:
+        try:
+            src_bytes = "\n".join(lines).encode("utf-8", errors="replace")
+            tree = parser.parse(src_bytes)
+        except Exception:
+            tree = None
     py_ast_contracts: dict[int, dict] = _analyze_python_ast_contracts(lines) if ext_l == ".py" else {}
     js_ast_contracts: list[dict] = (
-        _analyze_js_ts_ast_contracts(lines, ext)
+        _analyze_js_ts_ast_contracts(lines, ext, tree=tree)
         if ext_l in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
         else []
     )
-    parser = get_parser(ext_l)
-    if (tree is not None or parser is not None) and n > 0:
+    if tree is not None and n > 0:
         try:
-            if tree is None and parser is not None:
-                src_bytes = "\n".join(lines).encode("utf-8", errors="replace")
-                tree = parser.parse(src_bytes)
             stack = [tree.root_node]
             while stack:
                 nd = stack.pop()
@@ -1501,6 +1672,7 @@ def extract_4d_coordinate_matrix(
                         expected_res_keys.append(pk)
 
         http_calls: list[dict] = []
+        seen_hc_keys: set[tuple[str, str, int]] = set()
         if "fetch" in chunk_words:
             for m_fe in _4D_FETCH_RE.finditer(chunk):
                 raw_u = m_fe.group(1).split("?")[0]
@@ -1509,14 +1681,38 @@ def extract_4d_coordinate_matrix(
                 verb_u = m_verb.group(1).upper() if m_verb else "GET"
                 norm_u = _4D_URL_PARAM_RE.sub("{*}", raw_u).rstrip("/") or "/"
                 fe_line = s + chunk.count("\n", 0, m_fe.start())
-                hc_entry: dict = {"method": verb_u, "url": raw_u, "norm_url": norm_u, "line": fe_line}
-                if expected_res_keys:
-                    hc_entry["expected_keys"] = expected_res_keys[:8]
-                http_calls.append(hc_entry)
+                hc_k = (verb_u, norm_u, fe_line)
+                if hc_k not in seen_hc_keys:
+                    seen_hc_keys.add(hc_k)
+                    hc_entry: dict = {"method": verb_u, "url": raw_u, "norm_url": norm_u, "line": fe_line}
+                    if expected_res_keys:
+                        hc_entry["expected_keys"] = expected_res_keys[:8]
+                    http_calls.append(hc_entry)
+            # Also resolve `const url = \`${baseUrl}/api/...\`; fetch(url, { method: ... })`
+            if "/" in chunk:
+                for m_uv in _4D_URL_VAR_DECL_RE.finditer(chunk):
+                    u_var, raw_uv = m_uv.group(1), m_uv.group(2).split("?")[0]
+                    m_fvar = re.search(
+                        rf"\bfetch\s*\(\s*{re.escape(u_var)}\b(?:\s*,\s*\{{([\s\S]{{0,260}}?)\}})?",
+                        chunk[m_uv.end() :],
+                    )
+                    if m_fvar:
+                        opts_uv = m_fvar.group(1) or ""
+                        m_vb = _4D_FETCH_METHOD_RE.search(opts_uv)
+                        verb_uv = m_vb.group(1).upper() if m_vb else "GET"
+                        norm_uv = _4D_URL_PARAM_RE.sub("{*}", raw_uv).rstrip("/") or "/"
+                        uv_line = s + chunk.count("\n", 0, m_uv.end() + m_fvar.start())
+                        hc_k = (verb_uv, norm_uv, uv_line)
+                        if hc_k not in seen_hc_keys:
+                            seen_hc_keys.add(hc_k)
+                            hc_ev: dict = {"method": verb_uv, "url": raw_uv, "norm_url": norm_uv, "line": uv_line}
+                            if expected_res_keys:
+                                hc_ev["expected_keys"] = expected_res_keys[:8]
+                            http_calls.append(hc_ev)
         has_http_client = (
-            ("REQUESTS." in up_chunk or "HTTPX." in up_chunk)
+            ("REQUESTS." in up_chunk or "HTTPX." in up_chunk or "CLIENT." in up_chunk)
             if ext_l == ".py"
-            else any(k in up_chunk for k in ("AXIOS.", "API.", "CLIENT.", "HTTP."))
+            else any(k in up_chunk for k in ("AXIOS.", "API.", "CLIENT.", "HTTP.", "HTTPCLIENT.", "APICLIENT."))
         )
         if has_http_client:
             for m_ax in http_client_rx.finditer(chunk):
@@ -1524,10 +1720,29 @@ def extract_4d_coordinate_matrix(
                 raw_u = m_ax.group(2).split("?")[0]
                 norm_u = _4D_URL_PARAM_RE.sub("{*}", raw_u).rstrip("/") or "/"
                 ax_line = s + chunk.count("\n", 0, m_ax.start())
-                hc_entry_ax: dict = {"method": verb_u, "url": raw_u, "norm_url": norm_u, "line": ax_line}
-                if expected_res_keys:
-                    hc_entry_ax["expected_keys"] = expected_res_keys[:8]
-                http_calls.append(hc_entry_ax)
+                hc_k = (verb_u, norm_u, ax_line)
+                if hc_k not in seen_hc_keys:
+                    seen_hc_keys.add(hc_k)
+                    hc_entry_ax: dict = {"method": verb_u, "url": raw_u, "norm_url": norm_u, "line": ax_line}
+                    if expected_res_keys:
+                        hc_entry_ax["expected_keys"] = expected_res_keys[:8]
+                    http_calls.append(hc_entry_ax)
+        if ext_l != ".py" and "/" in chunk:
+            for m_wr in _4D_HTTP_WRAPPER_RE.finditer(chunk):
+                fn_vb = m_wr.group(1)
+                raw_w = m_wr.group(2).split("?")[0]
+                opts_w = m_wr.group(3) or ""
+                m_vw = _4D_FETCH_METHOD_RE.search(opts_w)
+                verb_w = (m_vw.group(1) if m_vw else (fn_vb or "ANY")).upper()
+                norm_w = _4D_URL_PARAM_RE.sub("{*}", raw_w).rstrip("/") or "/"
+                wr_line = s + chunk.count("\n", 0, m_wr.start())
+                hc_k = (verb_w, norm_w, wr_line)
+                if hc_k not in seen_hc_keys:
+                    seen_hc_keys.add(hc_k)
+                    hc_ew: dict = {"method": verb_w, "url": raw_w, "norm_url": norm_w, "line": wr_line}
+                    if expected_res_keys:
+                        hc_ew["expected_keys"] = expected_res_keys[:8]
+                    http_calls.append(hc_ew)
 
         type_comparisons: list[dict] = []
         sql_select_violations: list[dict] = []
@@ -2140,7 +2355,13 @@ def compile_6d_contract_diagnostics(
                         hm = hc["method"]
                         h_line = hc.get("line", c_line)
                         allowed_verbs = be_routes_by_norm.get(hu)
-                        if allowed_verbs and "ANY" not in allowed_verbs and "ALL" not in allowed_verbs and hm not in allowed_verbs:
+                        if (
+                            allowed_verbs
+                            and hm not in ("ANY", "ALL")
+                            and "ANY" not in allowed_verbs
+                            and "ALL" not in allowed_verbs
+                            and hm not in allowed_verbs
+                        ):
                             w_key = (rel, h_line, f"http_verb:{hm}:{hu}")
                             if w_key not in seen_warn_keys:
                                 seen_warn_keys.add(w_key)
@@ -2287,34 +2508,41 @@ def _py_scope_binds_name(
 
     if not fn_name:
         return False
-    top = cache.get(rel, False)
-    if top is False:
+    fn_by_name = cache.get(rel, False)
+    if fn_by_name is False:
         try:
             top = symtable.symtable(src, rel, "exec")
         except (SyntaxError, ValueError):
             top = None
-        cache[rel] = top
-    if top is None:
+        if top is None:
+            fn_by_name = None
+        else:
+            fn_map: dict[str, list[tuple[int, object]]] = {}
+            stack = [top]
+            while stack:
+                tbl = stack.pop()
+                try:
+                    children = tbl.get_children()
+                except Exception:
+                    children = []
+                stack.extend(children)
+                if tbl.get_type() == "function":
+                    fn_map.setdefault(tbl.get_name(), []).append((tbl.get_lineno(), tbl))
+            for lst in fn_map.values():
+                lst.sort(key=lambda x: x[0])
+            fn_by_name = fn_map
+        cache[rel] = fn_by_name
+    if not fn_by_name:
         return False
 
     best = None
-    stack = [top]
-    while stack:
-        tbl = stack.pop()
-        try:
-            children = tbl.get_children()
-        except Exception:
-            children = []
-        stack.extend(children)
-        if tbl.get_type() != "function" or tbl.get_name() != fn_name:
-            continue
-        ln = tbl.get_lineno()
+    for ln, tbl in fn_by_name.get(fn_name, ()):
         if fn_line_lo and ln < fn_line_lo:
             continue
         if ln > call_line:
-            continue
-        if best is None or ln < best.get_lineno():
-            best = tbl
+            break
+        best = tbl
+        break
     if best is None:
         return False
     try:
@@ -2360,6 +2588,39 @@ def _log_skip(rule: str, caller_rel: str, call_line: int) -> None:
         SKIP_LOG.append((rule, caller_rel, call_line))
 
 
+def _extract_py_import_statements_fast(src: str) -> str:
+    """Extract top-level and nested `import` / `from ... import` statements (0-indented) for fast AST parsing."""
+    imp_lines: list[str] = []
+    in_cont = False
+    paren_balance = 0
+    in_triple: str | None = None
+    for raw_ln in src.splitlines():
+        st = raw_ln.strip()
+        if in_triple is not None:
+            if raw_ln.count(in_triple) % 2 == 1:
+                in_triple = None
+            continue
+        if not in_cont:
+            for q3 in ('"""', "'''"):
+                if q3 in st and st.count(q3) % 2 == 1:
+                    in_triple = q3
+                    break
+            if in_triple is not None:
+                continue
+            if st.startswith(("import ", "from ")) and not st.startswith("from __future__"):
+                clean = raw_ln.lstrip()
+                imp_lines.append(clean)
+                no_comment = clean.split("#", 1)[0].rstrip()
+                paren_balance = no_comment.count("(") - no_comment.count(")")
+                in_cont = paren_balance > 0 or no_comment.endswith("\\")
+        else:
+            imp_lines.append(raw_ln)
+            no_comment = raw_ln.split("#", 1)[0].rstrip()
+            paren_balance += no_comment.count("(") - no_comment.count(")")
+            in_cont = paren_balance > 0 or no_comment.endswith("\\")
+    return "\n".join(imp_lines)
+
+
 def _py_import_bindings(rel: str, src: str, cache: dict) -> dict[str, tuple[str, int, str | None]]:
     """Map each name bound by an import in `src` to `(module_dotted, level, imported_attr)`.
 
@@ -2370,11 +2631,19 @@ def _py_import_bindings(rel: str, src: str, cache: dict) -> dict[str, tuple[str,
     if key in cache:
         return cache[key]
     out: dict[str, tuple[str, int, str | None]] = {}
-    try:
-        tree = ast.parse(src)
-    except (SyntaxError, ValueError):
+    imp_src = _extract_py_import_statements_fast(src)
+    if not imp_src:
         cache[key] = out
         return out
+    tree = None
+    try:
+        tree = ast.parse(imp_src)
+    except (SyntaxError, ValueError):
+        try:
+            tree = ast.parse(src)
+        except (SyntaxError, ValueError):
+            cache[key] = out
+            return out
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for a in node.names:
@@ -2506,6 +2775,7 @@ def verify_cross_file_contracts(
 
     info_cache: dict[str, dict] = {}
     text_cache: dict[str, str] = {}
+    lines_cache: dict[str, list[str]] = {}
     _symtable_cache: dict[str, object] = {}
     _resolve_cache: dict = {}
 
@@ -2517,6 +2787,13 @@ def verify_cross_file_contracts(
             txt = brain._get_file_text(rel) or ""
         text_cache[rel] = txt
         return txt
+
+    def _get_lines(rel: str) -> list[str]:
+        if rel in lines_cache:
+            return lines_cache[rel]
+        lns = _get_text(rel).splitlines()
+        lines_cache[rel] = lns
+        return lns
 
     def _get_info(rel: str) -> dict:
         if rel in info_cache:
@@ -2662,7 +2939,7 @@ def verify_cross_file_contracts(
         caller_src = _get_text(caller_rel)
         if not caller_src:
             return
-        c_lines = caller_src.splitlines()
+        c_lines = _get_lines(caller_rel)
         if not (1 <= call_line <= len(c_lines)):
             return
         if caller_l_start and 1 <= caller_l_start <= call_line:
@@ -2779,7 +3056,7 @@ def verify_cross_file_contracts(
         caller_src = _get_text(caller_rel)
         if not caller_src:
             return
-        c_lines = caller_src.splitlines()
+        c_lines = _get_lines(caller_rel)
         l0 = max(1, caller_l_start)
         l1 = min(len(c_lines), max(l0, caller_l_end))
         body_slice = "\n".join(c_lines[l0 - 1 : l1])

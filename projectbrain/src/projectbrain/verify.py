@@ -705,101 +705,205 @@ def url_matches(pattern: str, url: str) -> bool:
     return bool(re.fullmatch(pattern_re, url))
 
 
-def find_url_callers(brain: "ProjectBrain", url_path: str, method: str) -> list[dict]:
-    if hasattr(brain, "_ensure_blobs"):
-        brain._ensure_blobs()
-    callers = []
-    url_lower = url_path.lower()
+def _normalize_url_query(raw_url: str, method: str | None) -> tuple[str, str | None]:
+    """Extract optional leading HTTP verb (`'POST /api/foo'`) and strip query string / `${baseUrl}` prefix."""
+    s = raw_url.strip()
+    m_verb = re.match(r"^(GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD|ANY|\*)\s+(.+)$", s, re.IGNORECASE)
+    if m_verb:
+        verb = m_verb.group(1).upper()
+        s = m_verb.group(2).strip()
+        if method is None:
+            method = None if verb in ("ANY", "*") else verb
+    s = re.sub(r"^(?:\$\{[^}]+\}|https?://[^/]+)+", "", s).split("?")[0].strip()
+    if not s.startswith("/"):
+        s = "/" + s
+    eff_method = None if (method is None or method.upper() in ("ANY", "*")) else method.upper()
+    return s, eff_method
 
-    for rel_path, blob in brain._blobs.items():
-        if url_lower not in blob.lower():
-            continue
 
-        info = brain._index.get(rel_path, {})
-        routes = info.get("routes", [])
-        is_route_definer = any(url_matches(r["path"], url_path) for r in routes)
-        if is_route_definer:
-            continue
+def find_url_callers(brain: "ProjectBrain", url_path: str, method: str | None = None) -> list[dict]:
+    callers: list[dict] = []
+    seen_locs: set[tuple[str, str]] = set()
+    clean_url = url_path.rstrip("/") or "/"
+    url_segs = [seg for seg in clean_url.split("/") if seg and not seg.startswith((":", "{", "["))]
+    tail_2 = ("/" + "/".join(url_segs[-2:])).lower() if len(url_segs) >= 2 else ""
+    last_seg = url_segs[-1].lower() if url_segs else ""
+    norm_query = re.sub(r"(:\w+|\[\w+\]|\{\w+\}|\$\{[^}]+\})", "{*}", clean_url).rstrip("/") or "/"
 
+    def _enclosing_fn_name(info: dict, line_no: int) -> str | None:
+        best_fn: dict | None = None
         for fn in info.get("functions", []):
-            calls = fn.get("calls", [])
-            qualified = fn.get("qualified_calls", {})
-            http_callers = {"fetch", "post", "get", "put", "delete", "patch", "request", "ajax"}
-            if any(c.lower() in http_callers for c in calls):
-                callers.append({
-                    "rel_path": rel_path,
-                    "function": fn["name"],
-                    "line": fn.get("line_start"),
-                    "detail": f"{fn['name']}() calls {method} {url_path}",
-                })
-                break
-            for qc in qualified:
-                qc_lower = qc.lower()
-                if any(h in qc_lower for h in ("fetch", "axios", "requests", "http")):
+            ls, le = fn.get("line_start", 0), fn.get("line_end", 0)
+            if ls <= line_no <= le:
+                if best_fn is None or (le - ls) < (best_fn.get("line_end", 0) - best_fn.get("line_start", 0)):
+                    best_fn = fn
+        return best_fn["name"] if best_fn else None
+
+    for rel_path, info in brain._index.items():
+        routes = info.get("routes", [])
+        if any(
+            url_matches(r.get("full_path") or r["path"], clean_url) or url_matches(r["path"], clean_url)
+            for r in routes
+        ):
+            continue
+
+        matched_in_file = False
+        # 1. Structured 6D `http_calls` (captures fetch/axios/template-literals/wrappers)
+        for cell in info.get("cells_4d") or ():
+            for hc in cell.get("http_calls") or ():
+                hc_method = (hc.get("method") or "GET").upper()
+                if method and hc_method not in ("ANY", "ALL", method):
+                    continue
+                hc_url = hc.get("url") or ""
+                hc_norm = hc.get("norm_url") or ""
+                is_hit = (
+                    url_matches(hc_url, clean_url)
+                    or hc_norm == norm_query
+                    or (len(hc_norm) > 4 and hc_norm.count("/") >= 2 and norm_query.endswith(hc_norm))
+                    or (len(norm_query) > 4 and norm_query.count("/") >= 2 and hc_norm.endswith(norm_query))
+                )
+                if is_hit:
+                    ln = hc.get("line") or cell.get("line_start") or 1
+                    fn_nm = _enclosing_fn_name(info, ln) or cell.get("X_scope", "").removeprefix("fn:") or Path(rel_path).stem
+                    key = (rel_path, fn_nm)
+                    if key not in seen_locs:
+                        seen_locs.add(key)
+                        callers.append({
+                            "rel_path": rel_path,
+                            "function": fn_nm,
+                            "line": ln,
+                            "detail": f"{fn_nm}() calls {hc_method} {hc_url}",
+                        })
+                        matched_in_file = True
+
+        if matched_in_file or not last_seg or len(last_seg) < 3:
+            continue
+
+        # 2. Fast raw-source literal & `${baseUrl}/...` template scan (zero false negatives on custom clients)
+        src_txt = brain._get_file_text(rel_path)
+        if not src_txt or last_seg not in src_txt.lower():
+            continue
+        src_low = src_txt.lower()
+        target_sub = clean_url.lower() if clean_url.lower() in src_low else (tail_2 if (tail_2 and tail_2 in src_low) else "")
+        if not target_sub:
+            continue
+        for idx_ln, raw_ln in enumerate(src_txt.splitlines()):
+            if target_sub in raw_ln.lower():
+                ln_no = idx_ln + 1
+                fn_nm = _enclosing_fn_name(info, ln_no) or Path(rel_path).stem
+                key = (rel_path, fn_nm)
+                if key not in seen_locs:
+                    seen_locs.add(key)
+                    verb_lbl = method or "HTTP"
                     callers.append({
                         "rel_path": rel_path,
-                        "function": fn["name"],
-                        "line": fn.get("line_start"),
-                        "detail": f"{fn['name']}() calls {qc}('{url_path}')",
+                        "function": fn_nm,
+                        "line": ln_no,
+                        "detail": f"{fn_nm}() references '{target_sub}' ({verb_lbl} {clean_url})",
                     })
-                    break
+                break
 
     return callers
 
 
-def find_route_handler(brain: "ProjectBrain", url_path: str, method: str) -> list[dict]:
-    matches = []
+def find_route_handler(brain: "ProjectBrain", url_path: str, method: str | None = None) -> list[dict]:
+    from .graph import CodeGraph
+
+    CodeGraph.propagate_router_mounts(brain._index, brain._import_targets, brain._symbol_imports)
+    clean_url = url_path.rstrip("/") or "/"
+    exact_matches: list[dict] = []
+    suffix_matches: list[dict] = []
+
     for rel_path, info in brain._index.items():
         for route in info.get("routes", []):
-            if route["method"].upper() != method:
+            r_method = (route.get("method") or "GET").upper()
+            if method and r_method not in (method, "ANY", "ALL"):
                 continue
-            if not url_matches(route["path"], url_path):
+            r_full = route.get("full_path") or route["path"]
+            r_raw = route["path"]
+            is_exact = url_matches(r_full, clean_url) or url_matches(r_raw, clean_url)
+            is_suffix = False
+            if not is_exact and r_raw.startswith("/") and len(r_raw) > 2:
+                raw_norm = r_raw.rstrip("/")
+                if raw_norm.count("/") >= 2 and clean_url.lower().endswith(raw_norm.lower()):
+                    is_suffix = True
+                elif raw_norm.count("/") == 1:
+                    # Single-segment subroute `/assign-feed` inside `routers/quality.py` matching `/api/v1/quality/assign-feed`
+                    parent_seg = clean_url.rstrip("/").rsplit("/", 2)
+                    stem_low = Path(rel_path).stem.lower()
+                    if (
+                        len(parent_seg) >= 3
+                        and clean_url.lower().endswith(raw_norm.lower())
+                        and parent_seg[-2].lower().rstrip("s") in stem_low
+                    ):
+                        is_suffix = True
+            if not (is_exact or is_suffix):
                 continue
 
             handler = route.get("handler")
-            if not handler:
-                route_node = route_id(method, route["path"])
-                if brain._graph and route_node in brain._graph.nodes:
-                    for edge in brain._graph.edges:
-                        if edge["dst"] == route_node and edge["type"] == "handles":
-                            src_node = brain._graph.nodes.get(edge["src"], {})
-                            handler = src_node.get("name")
-                            break
+            if not handler and brain._graph:
+                for cand_rid in (route_id(r_method, r_full), route_id(r_method, r_raw)):
+                    if cand_rid in brain._graph.nodes:
+                        for ei in brain._graph._adj.get(cand_rid, ()):
+                            edge = brain._graph.edges[ei]
+                            if edge["type"] == "handles":
+                                dst_node = brain._graph.nodes.get(edge["dst"], {})
+                                handler = dst_node.get("name")
+                                break
+                        if not handler:
+                            for ei in brain._graph._radj.get(cand_rid, ()):
+                                edge = brain._graph.edges[ei]
+                                if edge["type"] == "handles":
+                                    src_node = brain._graph.nodes.get(edge["src"], {})
+                                    handler = src_node.get("name")
+                                    break
+                    if handler:
+                        break
 
-            matches.append({
+            item = {
                 "rel_path": rel_path,
-                "route_path": route["path"],
+                "method": r_method,
+                "route_path": r_full,
                 "handler": handler,
                 "line": route.get("line"),
-            })
+            }
+            if is_exact:
+                exact_matches.append(item)
+            else:
+                suffix_matches.append(item)
 
-    return matches
+    return exact_matches if exact_matches else suffix_matches
 
 
-def trace_flow(brain: "ProjectBrain", url_path: str, method: str = "GET") -> dict:
+def trace_flow(brain: "ProjectBrain", url_path: str, method: str | None = None) -> dict:
     brain._ensure_fresh()
-    method = method.upper()
+    clean_url, eff_method = _normalize_url_query(url_path, method)
+    display_verb = eff_method or "ANY"
     steps: list[dict] = []
 
-    ui_triggers = find_url_callers(brain, url_path, method)
-    for trigger in ui_triggers:
+    route_matches = find_route_handler(brain, clean_url, eff_method)
+    matched_verb = route_matches[0]["method"] if (len(route_matches) == 1 and eff_method is None) else eff_method
+
+    ui_triggers = find_url_callers(brain, clean_url, matched_verb)
+    for trigger in ui_triggers[:15]:
         steps.append({
             "step": len(steps) + 1,
             "type": "ui_trigger",
             "rel_path": trigger["rel_path"],
+            "function": trigger.get("function"),
             "line": trigger.get("line"),
-            "detail": trigger.get("detail", f"calls {method} {url_path}"),
+            "detail": trigger.get("detail", f"calls {display_verb} {clean_url}"),
         })
 
-    route_matches = find_route_handler(brain, url_path, method)
-    for match in route_matches:
+    for match in route_matches[:10]:
+        r_verb = match.get("method") or display_verb
         steps.append({
             "step": len(steps) + 1,
             "type": "route",
             "rel_path": match["rel_path"],
             "handler": match.get("handler"),
             "line": match.get("line"),
-            "detail": f"{method} {match.get('route_path', url_path)}",
+            "detail": f"{r_verb} {match.get('route_path', clean_url)}",
         })
 
         handler_name = match.get("handler")
@@ -808,8 +912,9 @@ def trace_flow(brain: "ProjectBrain", url_path: str, method: str = "GET") -> dic
             fn_node = fn_id(handler_file, handler_name)
             if fn_node in brain._graph.nodes:
                 callees = [
-                    e for e in brain._graph.edges
-                    if e["src"] == fn_node and e["type"] == "calls"
+                    brain._graph.edges[ei]
+                    for ei in brain._graph._adj.get(fn_node, ())
+                    if brain._graph.edges[ei]["type"] == "calls"
                 ]
                 for callee_edge in callees[:10]:
                     callee_node = brain._graph.nodes.get(callee_edge["dst"], {})
@@ -837,18 +942,19 @@ def trace_flow(brain: "ProjectBrain", url_path: str, method: str = "GET") -> dic
                         "detail": f"{handler_name}() calls {callee_name}()",
                     })
 
+    final_verb = matched_verb or display_verb
     if not steps:
         return {
-            "url": f"{method} {url_path}",
+            "url": f"{final_verb} {clean_url}",
             "steps": [],
             "message": (
-                f"No flow found for {method} {url_path}. "
+                f"No flow found for {final_verb} {clean_url}. "
                 "Ensure the route is indexed and URL format matches."
             ),
         }
 
     return {
-        "url": f"{method} {url_path}",
+        "url": f"{final_verb} {clean_url}",
         "steps": steps,
         "step_count": len(steps),
     }
@@ -1273,6 +1379,10 @@ def run_check(
                     )
                     for r, inf in pre_head_infos.items():
                         brain._pre_edit_index.setdefault(r, dict(inf))
+                        brain._git_head_cache[r] = inf
+                    for r_miss in active_head:
+                        if r_miss not in pre_head_infos:
+                            brain._git_head_cache.setdefault(r_miss, None)
 
         if files_modified:
             effective_modified = list(files_modified)
@@ -1416,11 +1526,15 @@ def run_check(
                 return deduped
 
             signature_blast: list[dict] = []
+            import time as _time
+            blast_deadline = _time.monotonic() + 3.5
             for r in sorted(valid_focus):
                 if r in files_with_syntax_err:
                     continue
                 post_inf = brain._index.get(r)
-                pre_inf = brain._pre_edit_index.get(r) or brain._get_git_head_info(r)
+                pre_inf = brain._pre_edit_index.get(r)
+                if pre_inf is None and _time.monotonic() < blast_deadline:
+                    pre_inf = brain._get_git_head_info(r)
                 if not pre_inf or not post_inf:
                     continue
                 idiff = compute_interface_diff(pre_inf, post_inf)
@@ -1571,6 +1685,20 @@ def run_check(
                 co_w = brain._memory.check_co_change_drift(touched_non_code, existing_files=all_indexed_set)
                 if co_w:
                     out["co_change_warnings"] = co_w
+            # Fast whole-repo static bug audit on small/medium clean checkouts (<160 files)
+            if 0 < len(brain._index) <= 160:
+                from .contracts import verify_cross_file_contracts
+                from .reporters import _is_test_file_path
+
+                prod_rels = {r for r in brain._index if not _is_test_file_path(r)}
+                if prod_rels:
+                    static_6d, _ = brain._compile_6d_contract_diagnostics(
+                        "static contract bug audit", prod_rels, strict_focus=True,
+                    )
+                    static_xf = verify_cross_file_contracts(brain, prod_rels)
+                    combined_static = list(dict.fromkeys([*static_6d, *static_xf]))
+                    if combined_static:
+                        out["static_audit_findings"] = combined_static[:25]
 
         should_check_governance = (
             bool(merge_base)

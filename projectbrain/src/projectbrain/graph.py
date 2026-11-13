@@ -146,13 +146,14 @@ class CodeGraph:
             _reg(c["name"], nid)
 
         for r in info.get("routes", []):
-            nid = route_id(r["method"], r["path"])
+            eff_path = r.get("full_path") or r["path"]
+            nid = route_id(r["method"], eff_path)
             self.nodes[nid] = {
                 "type": "route",
                 "rel_path": rel_path,
                 "method": r["method"],
                 "path": r["path"],
-                "full_path": r.get("full_path") or r["path"],
+                "full_path": eff_path,
                 "handler": r.get("handler"),
                 "line": r.get("line"),
             }
@@ -434,7 +435,8 @@ class CodeGraph:
                     break
 
         for r in info.get("routes", []):
-            rid = route_id(r["method"], r["path"])
+            eff_path = r.get("full_path") or r["path"]
+            rid = route_id(r["method"], eff_path)
             handler = r.get("handler")
             if handler:
                 local = fn_id(rel_path, handler)
@@ -454,6 +456,87 @@ class CodeGraph:
                             line=r.get("line"),
                         )
 
+    @staticmethod
+    def propagate_router_mounts(
+        index: dict,
+        import_targets: dict[str, list[str]],
+        symbol_imports: dict[str, dict[str, str]],
+    ) -> None:
+        """Resolve cross-file sub-router and sub-application prefix mounts into `route['full_path']`."""
+        mount_edges: list[tuple[str, str, str]] = []
+        for src_rel, info in index.items():
+            mounts = info.get("router_mounts")
+            if not mounts:
+                continue
+            sym_map = symbol_imports.get(src_rel, {})
+            imp_rels = import_targets.get(src_rel, [])
+            bindings = info.get("import_bindings") or {}
+            for m in mounts:
+                tgt_expr = m.get("target") or ""
+                pref = (m.get("prefix") or "").rstrip("/")
+                if not tgt_expr or not pref:
+                    continue
+                root_id = tgt_expr.split(".")[0]
+                target_rel = sym_map.get(root_id)
+                if not target_rel and root_id in bindings:
+                    b_entry = bindings[root_id] or {}
+                    b_mod = (b_entry.get("qualified_module") or b_entry.get("module") or "").strip(".").replace(".", "/")
+                    b_sym = (b_entry.get("name") or b_entry.get("symbol") or "").strip()
+                    cand_mod_paths: list[str] = []
+                    if b_mod and b_sym and b_sym != "*":
+                        cand_mod_paths.append(f"{b_mod}/{b_sym}")
+                    if b_mod:
+                        cand_mod_paths.append(b_mod)
+                    search_pool = list(imp_rels) + [rk for rk in index if rk not in imp_rels]
+                    for cm in cand_mod_paths:
+                        for ir in search_pool:
+                            ir_no_ext = ir.rsplit(".", 1)[0]
+                            if ir_no_ext == cm or ir_no_ext.endswith("/" + cm) or ir_no_ext.endswith(f"{cm}/__init__"):
+                                target_rel = ir
+                                break
+                        if target_rel:
+                            break
+                if not target_rel:
+                    cleaned = re.sub(r"(?:_?router|_?routes|_?bp)$", "", root_id, flags=re.IGNORECASE).lower()
+                    search_pool = list(imp_rels) + [rk for rk, rv in index.items() if rv.get("routes")]
+                    for ir in search_pool:
+                        stem = ir.rsplit("/", 1)[-1].rsplit(".", 1)[0].lower()
+                        if stem in (root_id.lower(), cleaned) and stem:
+                            target_rel = ir
+                            break
+                if target_rel and target_rel in index and target_rel != src_rel:
+                    mount_edges.append((src_rel, target_rel, pref))
+
+        if not mount_edges:
+            return
+
+        # Support 2-hop nested routers (e.g. main -> api_v1_router('/api/v1') -> sub_router('/billing'))
+        file_prefix: dict[str, str] = {}
+        for _ in range(2):
+            changed = False
+            for src_rel, dst_rel, pref in mount_edges:
+                parent_pref = file_prefix.get(src_rel, "")
+                combined = f"{parent_pref.rstrip('/')}/{pref.lstrip('/')}".rstrip("/") or "/"
+                if file_prefix.get(dst_rel) != combined:
+                    file_prefix[dst_rel] = combined
+                    changed = True
+            if not changed:
+                break
+
+        for dst_rel, full_pref in file_prefix.items():
+            dst_info = index.get(dst_rel)
+            if not dst_info:
+                continue
+            for r in dst_info.get("routes", []):
+                cur_fp = r.get("full_path") or r.get("path") or "/"
+                if cur_fp == "/" or cur_fp == "":
+                    new_fp = full_pref
+                elif not cur_fp.startswith(full_pref + "/") and cur_fp != full_pref:
+                    new_fp = f"{full_pref}/{cur_fp.lstrip('/')}".rstrip("/") or "/"
+                else:
+                    new_fp = cur_fp
+                r["full_path"] = new_fp
+
     @classmethod
     def build(
         cls,
@@ -464,6 +547,7 @@ class CodeGraph:
         g = cls()
         import_targets = import_targets or {}
         symbol_imports = symbol_imports or {}
+        cls.propagate_router_mounts(index, import_targets, symbol_imports)
 
         # ── Pass 1: nodes ────────────────────────────────────────────────────
         for rel_path, info in index.items():
@@ -514,7 +598,8 @@ class CodeGraph:
                             self._registry[qnm] = [x for x in self._registry[qnm] if x != nid]
                         self._by_file_name.pop((rel, qnm), None)
 
-        # Pass 1 (Δ): Add updated nodes for changed_rels
+        # Pass 1 (Δ): Propagate router mounts & add updated nodes for changed_rels
+        self.propagate_router_mounts(index, import_targets, symbol_imports)
         for rel in changed_rels:
             if rel in index:
                 self._populate_file_nodes(rel, index[rel])
@@ -809,10 +894,12 @@ class CodeGraph:
                     hm = hc["method"]
                     hu = hc["norm_url"]
                     for rmeth, rnorm, rshort, h_dst in route_handlers:
-                        if rmeth not in ("ANY", "ALL", hm):
+                        if rmeth not in ("ANY", "ALL", hm) and hm not in ("ANY", "ALL"):
                             continue
-                        matched_route = (hu == rnorm) or (
-                            len(rshort) > 4 and rshort.count("/") >= 2 and hu.endswith(rshort)
+                        matched_route = (
+                            (hu == rnorm)
+                            or (len(rshort) > 4 and rshort.count("/") >= 2 and hu.endswith(rshort))
+                            or (len(hu) > 4 and hu.count("/") >= 2 and rnorm.endswith(hu))
                         )
                         if matched_route and fnid != h_dst and (fnid, h_dst, hu) not in seen_http_pairs:
                             seen_http_pairs.add((fnid, h_dst, hu))
@@ -1211,25 +1298,51 @@ class CodeGraph:
         }
 
     def find_nodes_by_name(self, name: str) -> list[str]:
-        name_lower = name.lower().strip()
-        exact_matches = []
-        partial_matches = []
+        name_clean = name.strip().replace("\\", "/")
+        name_lower = name_clean.lower()
+        norm_key = normalize_ident_key(name_clean)
+        wants_file = "." in name_clean.rsplit("/", 1)[-1] and not name_clean.startswith(("fn:", "cls:", "route:", "mod:"))
+
+        exact_file_matches: list[str] = []
+        exact_matches: list[str] = []
+        norm_matches: list[str] = []
+        partial_matches: list[str] = []
+
         for node_id, nd in self.nodes.items():
-            nd_name = (nd.get("name") or nd.get("path") or nd.get("rel_path") or "").lower()
-            route_label = f"{nd.get('method', '')} {nd.get('path', '')}".strip().lower()
+            ntype = nd.get("type", "")
+            rel_p = (nd.get("rel_path") or "").lower()
+            base_p = rel_p.rsplit("/", 1)[-1] if rel_p else ""
+            nd_name = (nd.get("name") or nd.get("full_path") or nd.get("path") or nd.get("rel_path") or "").lower()
+            route_label = f"{nd.get('method', '')} {nd.get('full_path') or nd.get('path', '')}".strip().lower()
+
+            if ntype == "file" and (rel_p == name_lower or base_p == name_lower or rel_p.endswith("/" + name_lower)):
+                exact_file_matches.append(node_id)
+                continue
+
             if nd_name == name_lower or node_id.lower() == name_lower or (route_label and route_label == name_lower):
                 exact_matches.append(node_id)
                 continue
+
+            if len(norm_key) >= 4 and ntype in ("fn", "cls"):
+                raw_nm = nd.get("name") or ""
+                if normalize_ident_key(raw_nm) == norm_key:
+                    norm_matches.append(node_id)
+                    continue
+
             searchable = " ".join([
                 node_id,
                 nd.get("name", ""),
                 nd.get("rel_path", ""),
+                nd.get("full_path", ""),
                 nd.get("path", ""),
                 route_label,
             ]).lower()
-            if name_lower in searchable:
+            if name_lower in searchable or (len(norm_key) >= 5 and norm_key in normalize_ident_key(nd.get("name", ""))):
                 partial_matches.append(node_id)
-        return exact_matches + partial_matches
+
+        if wants_file and exact_file_matches:
+            return exact_file_matches + exact_matches + norm_matches + partial_matches
+        return exact_matches + exact_file_matches + norm_matches + partial_matches
 
     # ── serialization ────────────────────────────────────────────────────────
 
@@ -1247,3 +1360,144 @@ class CodeGraph:
         g.edges = data["edges"]
         g._build_index()
         return g
+
+
+_IDENT_NORM_RE = re.compile(r"[^a-z0-9]+")
+
+_EXPLORE_NODE_KEEP_KEYS = (
+    "id",
+    "type",
+    "rel_path",
+    "name",
+    "signature",
+    "line_start",
+    "line_end",
+    "parent_class",
+    "method",
+    "path",
+    "full_path",
+    "handler",
+    "line",
+)
+
+_EXPLORE_EDGE_PRIORITY = {
+    "http_flow": 0,
+    "handles": 1,
+    "calls": 2,
+    "inherits": 3,
+    "imports": 4,
+    "state_flow": 5,
+    "exports": 6,
+    "defines": 7,
+    "defines_nested": 8,
+}
+
+
+def normalize_ident_key(raw: str) -> str:
+    """Alphanumeric lowercase key unifying `snake_case`, `camelCase`, and `kebab-case` (`send_email` == `sendEmail`)."""
+    return _IDENT_NORM_RE.sub("", raw.lower())
+
+
+def compact_explore_node(node: dict) -> dict:
+    """Strip internal 6D IR arrays/hashes (`?Z:`, `effect_provenance`, `ast_hash`, etc.) from an explore node."""
+    out: dict = {}
+    for k in _EXPLORE_NODE_KEEP_KEYS:
+        val = node.get(k)
+        if val is not None and val != "":
+            out[k] = val
+    return out
+
+
+def compact_explore_result(
+    res: dict,
+    max_nodes: int = 28,
+    max_edges: int = 34,
+) -> dict:
+    """Bound and sanitize `explore()` / `explore_fast()` output so it always stays <6 KB inline."""
+    if not isinstance(res, dict):
+        return res
+
+    out = dict(res)
+    if "from_node" in out and isinstance(out["from_node"], dict):
+        out["from_node"] = compact_explore_node(out["from_node"])
+    if "to_node" in out and isinstance(out["to_node"], dict):
+        out["to_node"] = compact_explore_node(out["to_node"])
+    if "path" in out and isinstance(out["path"], list):
+        out["path"] = out["path"][:30]
+        return out
+
+    if "center" not in out or not isinstance(out.get("center"), dict):
+        return out
+
+    center_clean = compact_explore_node(out["center"])
+    center_id = center_clean.get("id", "")
+    center_rel = center_clean.get("rel_path", "")
+    out["center"] = center_clean
+
+    raw_nodes: list[dict] = out.get("nodes") or []
+    raw_edges: list[dict] = out.get("edges") or []
+    node_by_id: dict[str, dict] = {
+        nd["id"]: compact_explore_node(nd)
+        for nd in raw_nodes
+        if isinstance(nd, dict) and nd.get("id")
+    }
+
+    def _edge_rank(e: dict) -> tuple[int, int, int, int]:
+        et = e.get("type", "")
+        direct = 0 if (e.get("src") == center_id or e.get("dst") == center_id) else 1
+        src_rel = center_rel if e.get("src") == center_id else node_by_id.get(e.get("src", ""), {}).get("rel_path", "")
+        dst_rel = center_rel if e.get("dst") == center_id else node_by_id.get(e.get("dst", ""), {}).get("rel_path", "")
+        cross_file = 0 if (src_rel and dst_rel and src_rel != dst_rel) else 1
+        conf_rank = 0 if e.get("confidence") in (None, "exact", "import_resolved") else 1
+        return (direct, cross_file, _EXPLORE_EDGE_PRIORITY.get(et, 6), conf_rank)
+
+    # Drop noisy structural `defines` fanout when real call/import/route edges already exceed budget
+    non_def_edges = [e for e in raw_edges if e.get("type") not in ("defines", "defines_nested")]
+    candidate_edges = non_def_edges if len(non_def_edges) >= 12 else raw_edges
+    sorted_edges = sorted(candidate_edges, key=_edge_rank)
+    kept_edges_raw = sorted_edges[:max_edges]
+
+    kept_edges: list[dict] = []
+    referenced_ids: set[str] = set()
+    for e in kept_edges_raw:
+        s_id, d_id = e.get("src", ""), e.get("dst", "")
+        if s_id and s_id != center_id:
+            referenced_ids.add(s_id)
+        if d_id and d_id != center_id:
+            referenced_ids.add(d_id)
+        ce: dict = {"src": s_id, "dst": d_id, "type": e.get("type", "")}
+        if e.get("line"):
+            ce["line"] = e["line"]
+        if e.get("confidence") and e.get("confidence") != "exact":
+            ce["confidence"] = e["confidence"]
+        rsn = e.get("reason")
+        if rsn and e.get("type") in ("http_flow", "state_flow"):
+            ce["reason"] = rsn[:90]
+        kept_edges.append(ce)
+
+    kept_nodes: list[dict] = []
+    for nid in referenced_ids:
+        if nid in node_by_id:
+            kept_nodes.append(node_by_id[nid])
+            if len(kept_nodes) >= max_nodes:
+                break
+    if len(kept_nodes) < max_nodes:
+        kept_set = {nd["id"] for nd in kept_nodes}
+        for nid, nd in node_by_id.items():
+            if nid not in kept_set:
+                kept_nodes.append(nd)
+                if len(kept_nodes) >= max_nodes:
+                    break
+
+    out["nodes"] = kept_nodes
+    out["edges"] = kept_edges
+    omitted_n = max(0, len(raw_nodes) - len(kept_nodes))
+    omitted_e = max(0, len(raw_edges) - len(kept_edges))
+    if omitted_n or omitted_e:
+        out["truncated"] = {
+            "nodes_omitted": omitted_n,
+            "edges_omitted": omitted_e,
+        }
+    if "co_changes" in out and isinstance(out["co_changes"], list):
+        out["co_changes"] = out["co_changes"][:10]
+    return out

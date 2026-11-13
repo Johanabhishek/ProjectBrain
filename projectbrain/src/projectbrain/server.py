@@ -1,4 +1,4 @@
-"""ProjectBrain MCP Server (v1.1: Zero-LSP Code Graph, PR Merge-Base & Blast-Radius Guardrail).
+"""ProjectBrain MCP Server (v1.2: <8KB Inline Cap, Monolith Maps, Dynamic Route Flows & Sub-2s Check).
 
 Exposes 5 primary non-overlapping power tools by default (`--lean`):
   1. `brain_dossier`  — One-call Architecture & Context Compiler: returns PDG/AST code
@@ -20,11 +20,12 @@ Pass `--full` (or `PROJECTBRAIN_FULL_TOOLS=1`) to also expose auxiliary tools
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import sys
 import threading
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Callable, TypeVar
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -75,6 +76,147 @@ mcp = FastMCP("projectbrain")
 _brains_by_root: dict[str, "ProjectBrain"] = {}
 _brains_lock = threading.RLock()
 
+_F = TypeVar("_F", bound=Callable[..., object])
+
+# Antigravity / Claude Code / Cursor inline MCP tool cap is ~10 KB; staying strictly
+# <= 7,800 serialized UTF-8 chars (with FastMCP's indent=2 formatting) guarantees ZERO
+# `.system_generated/.../output.txt` spillovers and eliminates 2-turn `read_file` hops.
+MCP_INLINE_CHAR_BUDGET = int(os.environ.get("PROJECTBRAIN_MCP_MAX_CHARS", "7800"))
+
+
+def _unstructured_endpoint() -> Callable[[_F], _F]:
+    """Register an MCP endpoint with `structured_output=False` so dicts serialize once (TextContent only)."""
+    try:
+        return mcp.tool(structured_output=False)  # type: ignore[return-value]
+    except TypeError:
+        return mcp.tool()  # type: ignore[return-value]
+
+
+def _serialized_len(obj: object) -> int:
+    try:
+        return len(json.dumps(obj, indent=2, ensure_ascii=True))
+    except Exception:
+        return len(str(obj))
+
+
+def _enforce_mcp_inline_budget(res: dict, max_chars: int = MCP_INLINE_CHAR_BUDGET) -> dict:
+    """Guarantee every MCP tool payload serializes under `max_chars` (<8 KB inline, 0 file spillovers)."""
+    if not isinstance(res, dict) or _serialized_len(res) <= max_chars:
+        return res
+
+    out = dict(res)
+
+    # 1. Dossier payloads: strip duplicate structured arrays first, then bound markdown
+    if "markdown" in out and isinstance(out["markdown"], str):
+        for k_drop in ("sections", "target_slices", "neighbor_skeletons", "route_flows", "state_flows"):
+            if k_drop in out and _serialized_len(out) > max_chars:
+                out.pop(k_drop, None)
+        if _serialized_len(out) > max_chars:
+            overhead = _serialized_len({k: v for k, v in out.items() if k != "markdown"}) + 180
+            md_budget = max(1200, max_chars - overhead)
+            md_raw = out["markdown"]
+            if len(md_raw) > md_budget:
+                out["markdown"] = (
+                    md_raw[:md_budget].rsplit("\n", 1)[0]
+                    + "\n\n... [Trimmed to fit <8KB inline MCP cap; use `brain_slice` or `read_file` for full source]"
+                )
+                out["inline_budget_trimmed"] = True
+
+    # 2. Slice payloads: trim individual `code` / `skeleton` strings proportionally
+    if _serialized_len(out) > max_chars and isinstance(out.get("slices"), list) and out["slices"]:
+        n_sl = max(1, len(out["slices"]))
+        per_slice = max(450, (max_chars - 500) // n_sl)
+        trimmed_slices: list[dict] = []
+        for s in out["slices"]:
+            if not isinstance(s, dict):
+                continue
+            sc = dict(s)
+            for k_code in ("code", "skeleton"):
+                val = sc.get(k_code)
+                if isinstance(val, str) and len(val) > per_slice:
+                    sc[k_code] = (
+                        val[:per_slice].rsplit("\n", 1)[0]
+                        + f"\n# ... [trimmed to fit <8KB inline cap; use read_file('{sc.get('rel_path', '')}')]"
+                    )
+                    if k_code == "skeleton" and sc.get("code") == val:
+                        sc["code"] = sc["skeleton"]
+            if sc.get("skeleton") and sc.get("code") == sc.get("skeleton"):
+                sc.pop("skeleton", None)
+            trimmed_slices.append(sc)
+        out["slices"] = trimmed_slices
+        out["inline_budget_trimmed"] = True
+
+    # 3. Explore payloads: progressively trim `edges`, `nodes`, `steps`, `co_changes`
+    if _serialized_len(out) > max_chars:
+        for list_key, cap in (("edges", 18), ("nodes", 16), ("steps", 14), ("co_changes", 6), ("path", 16)):
+            if isinstance(out.get(list_key), list) and len(out[list_key]) > cap:
+                out[list_key] = out[list_key][:cap]
+                out["inline_budget_trimmed"] = True
+
+    # 4. Check / Impact payloads: compact verbose caller fanout & cap diagnostics
+    if _serialized_len(out) > max_chars:
+        imp = out.get("impact_analysis")
+        if isinstance(imp, dict):
+            imp_c = dict(imp)
+            imp_c.pop("contract_diagnostics", None)  # already at top-level `out["contract_diagnostics"]`
+            if isinstance(imp_c.get("all_impacted_files"), list) and len(imp_c["all_impacted_files"]) > 20:
+                imp_c["all_impacted_files"] = imp_c["all_impacted_files"][:20]
+            if isinstance(imp_c.get("details"), list):
+                compact_details = []
+                for det in imp_c["details"][:10]:
+                    if isinstance(det, dict):
+                        dc = dict(det)
+                        if isinstance(dc.get("called_by"), list) and len(dc["called_by"]) > 6:
+                            dc["called_by"] = dc["called_by"][:6]
+                        if isinstance(dc.get("direct_consumers"), list) and len(dc["direct_consumers"]) > 8:
+                            dc["direct_consumers"] = dc["direct_consumers"][:8]
+                        compact_details.append(dc)
+                imp_c["details"] = compact_details
+            out["impact_analysis"] = imp_c
+            out["inline_budget_trimmed"] = True
+        for diag_key, d_cap in (
+            ("contract_diagnostics", 18),
+            ("static_audit_findings", 15),
+            ("signature_blast", 6),
+            ("memories", 8),
+            ("stale_memories", 8),
+        ):
+            if isinstance(out.get(diag_key), list) and len(out[diag_key]) > d_cap:
+                out[diag_key] = out[diag_key][:d_cap]
+                out["inline_budget_trimmed"] = True
+
+    # 5. Final hard safety valve: shrink largest remaining list/dict/string fields until <= max_chars
+    guard_iters = 0
+    while _serialized_len(out) > max_chars and guard_iters < 18:
+        guard_iters += 1
+        out["inline_budget_trimmed"] = True
+        best_key = max(
+            (k for k in out if k not in ("verdict", "all_contracts_valid", "error", "center")),
+            key=lambda k: _serialized_len(out[k]),
+            default=None,
+        )
+        if best_key is None:
+            break
+        val = out[best_key]
+        if isinstance(val, list) and len(val) > 2:
+            out[best_key] = val[: max(2, len(val) // 2)]
+        elif isinstance(val, str) and len(val) > 400:
+            out[best_key] = val[: max(250, len(val) // 2)] + " ... [trimmed]"
+        elif isinstance(val, dict) and val:
+            sub_key = max(val, key=lambda sk: _serialized_len(val[sk]), default=None)
+            sub_val = val.get(sub_key) if sub_key is not None else None
+            if sub_key is not None and isinstance(sub_val, list) and len(sub_val) > 2:
+                out[best_key] = {**val, sub_key: sub_val[: max(2, len(sub_val) // 2)]}
+            elif len(val) > 2:
+                keys_keep = list(val.keys())[: max(2, len(val) // 2)]
+                out[best_key] = {k: val[k] for k in keys_keep}
+            else:
+                out.pop(best_key, None)
+        else:
+            out.pop(best_key, None)
+
+    return out
+
 
 def _get_brain(repo_path: str | None = None) -> "ProjectBrain":
     from .brain import ProjectBrain
@@ -95,7 +237,7 @@ def _get_brain(repo_path: str | None = None) -> "ProjectBrain":
 
 # ── Core 5 Power Tools (Default Lean Agent Surface) ──────────────────────────
 
-@mcp.tool()
+@_unstructured_endpoint()
 def brain_dossier(
     tasks: list[str] | str,
     impact_files: list[str] | None = None,
@@ -103,26 +245,27 @@ def brain_dossier(
     include_markdown: bool = True,
     repo_path: str | None = None,
 ) -> dict:
-    """Compile a self-contained <800-line Engineering Dossier in ONE call.
+    """Compile a self-contained inline Engineering Dossier (<8KB) in ONE call.
 
-    Use when investigating an unfamiliar multi-file flow, cross-layer bug, or architecture
-    question (prefer native `rg` / `read_file` when you already know the exact file or string).
-    Combines PDG/AST function slices, module globals, 1-3 hop bidirectional call chains,
-    route/state-flow maps, covering tests, and pinned AST invariants without writing files to disk.
+    Use when investigating an unfamiliar multi-file flow across a large repo (>30 files).
+    Skip this tool and use native `rg` + `read_file` directly when the repo/feature spans <=6 well-named
+    files or when reading small (<350-line) / monolithic single-component files.
     """
     task_list = [tasks] if isinstance(tasks, str) else list(tasks)
-    res = _get_brain(repo_path).compile_dossier(
-        task_list,
-        impact_files=impact_files,
-        zoom=zoom,
-        write_file=False,
-    )
-    if include_markdown or zoom:
-        return res
-    return {k: v for k, v in res.items() if k != "markdown"}
+    b = _get_brain(repo_path)
+    with b._op_lock:
+        res = b.compile_dossier(
+            task_list,
+            impact_files=impact_files,
+            zoom=zoom,
+            write_file=False,
+        )
+    if not (include_markdown or zoom):
+        res = {k: v for k, v in res.items() if k != "markdown"}
+    return _enforce_mcp_inline_budget(res)
 
 
-@mcp.tool()
+@_unstructured_endpoint()
 def brain_slice(
     targets: list[str] | str,
     focus: list[str] | str | None = None,
@@ -131,21 +274,24 @@ def brain_slice(
 ) -> dict:
     """Surgically read functions, classes, file skeletons, or intra-function PDG slices in <20ms.
 
-    Use instead of full-file reads when inspecting specific symbols or file outlines:
-      - Symbol name or qualified method: `"OrderService.validate"` or `"orders.py:validate"`
-      - File signature skeleton (bodies stripped): `"src/services/orders.py"`
-      - Line range: `"src/services/orders.py:100-160"`
-      - Intra-function PDG slice: pass `focus="discount_code"` to trace backward definitions,
-        forward uses, and enclosing control guards around a target variable or call.
+    When to use vs `read_file`:
+      - If a file is <=350 lines or you are auditing a giant React JSX monolith component end-to-end,
+        prefer `read_file` in 1 turn rather than slicing piecemeal.
+      - Use `brain_slice` for targeted symbols (`"orders.py:validate"`), file skeletons (`"src/orders.py"`),
+        monolith internal component maps, or variable PDG slices (`focus="discount_code"`).
+      - Cross-language identifier matching (`"send_email"` <-> `"sendEmail"`) is automatic.
     """
-    return _get_brain(repo_path).slice_symbols(
-        targets,
-        max_lines_per_symbol=max_lines_per_symbol,
-        focus=focus,
-    )
+    b = _get_brain(repo_path)
+    with b._op_lock:
+        res = b.slice_symbols(
+            targets,
+            max_lines_per_symbol=max_lines_per_symbol,
+            focus=focus,
+        )
+    return _enforce_mcp_inline_budget(res)
 
 
-@mcp.tool()
+@_unstructured_endpoint()
 def brain_explore(
     target: str,
     target_b: str | None = None,
@@ -154,25 +300,28 @@ def brain_explore(
     include_co_changes: bool = False,
     repo_path: str | None = None,
 ) -> dict:
-    """Navigate the code graph: trace callers/callees, shortest paths, or full-stack HTTP routes.
+    """Navigate the code graph (<8KB inline): trace callers/callees, shortest paths, or full-stack HTTP routes.
 
     Modes:
       1. Path between two symbols (`target` + `target_b`): shortest typed call/import/route chain.
-      2. Full-stack route trace (`target` starts with `/`, e.g. `"/api/orders"`):
-         traces UI fetch callers -> backend route handler -> service/database callees.
-      3. Symbol/file neighborhood (`target` only): `depth`-hop callers, callees, imports,
-         and optional git `co_changes` (`include_co_changes=True`).
+      2. Full-stack route trace (`target` starts with `/` or `"POST /api/..."`, e.g. `"/api/v1/orders"`):
+         verb-agnostic trace from UI `fetch`/axios/`${baseUrl}` callers -> router mount -> handler -> callees.
+      3. Symbol/file neighborhood (`target` only, `snake_case` <-> `camelCase` aware): `depth`-hop callers/callees.
+    Note: For small files (<=350 lines), prefer `read_file` directly over exploring file AST edges.
     """
-    return _get_brain(repo_path).explore(
-        target,
-        target_b=target_b,
-        edge_types=edge_types,
-        depth=depth,
-        include_co_changes=include_co_changes,
-    )
+    b = _get_brain(repo_path)
+    with b._op_lock:
+        res = b.explore(
+            target,
+            target_b=target_b,
+            edge_types=edge_types,
+            depth=depth,
+            include_co_changes=include_co_changes,
+        )
+    return _enforce_mcp_inline_budget(res)
 
 
-@mcp.tool()
+@_unstructured_endpoint()
 def brain_check(
     files_modified: list[str] | None = None,
     claims: list[list[str]] | None = None,
@@ -182,27 +331,28 @@ def brain_check(
     allow_governance_change: bool = False,
     repo_path: str | None = None,
 ) -> dict:
-    """Verification & blast-radius gate: check claims, edit plans, PR merge-base diffs, contracts, and invariants.
+    """Sub-2s verification, static bug audit & blast-radius gate (<8KB inline).
 
     Modes:
-      - Pre-edit plan gate (`plan_files=[...]`, `task="..."`): flags missing connected importers/tests.
-      - Post-edit / PR merge-base gate (`files_modified=[...]`, `base_ref="main"`, or git diff): checks syntax,
-        4-pillar cross-file arity/import/key/SQL contracts, deleted/renamed file consumers, architectural
-        boundary rules, governance tamper lock, downstream callers, co-change drift, and stale AST invariants.
-      - Fact-check claims (`claims=[["Router", "calls", "dispatch"]]`): returns `SUPPORTED`,
-        `REFUTED`, or `UNKNOWN` (never guesses on dynamic dispatch or partial ASTs).
+      - Post-edit / PR merge-base gate (`files_modified=[...]`, `base_ref="main"`, or git diff): checks AST validity,
+        cross-file arity/import/key/SQL contracts, React hook/undeclared-setter bugs, boundary rules, and callers.
+      - Clean-repo bug audit (no args on repos <=160 files): surfaces static 6D & cross-file contract violations.
+      - Pre-edit plan gate (`plan_files=[...]`, `task="..."`) or fact-check (`claims=[["A", "calls", "B"]]`).
     """
-    return _get_brain(repo_path).check(
-        files_modified=files_modified,
-        claims=claims,
-        plan_files=plan_files,
-        task=task,
-        base_ref=base_ref,
-        allow_governance_change=allow_governance_change,
-    )
+    b = _get_brain(repo_path)
+    with b._op_lock:
+        res = b.check(
+            files_modified=files_modified,
+            claims=claims,
+            plan_files=plan_files,
+            task=task,
+            base_ref=base_ref,
+            allow_governance_change=allow_governance_change,
+        )
+    return _enforce_mcp_inline_budget(res)
 
 
-@mcp.tool()
+@_unstructured_endpoint()
 def brain_remember(
     target: str = "",
     note: str = "",
@@ -221,19 +371,22 @@ def brain_remember(
       - Audit invariants: `brain_remember(action="list")` or `brain_remember(action="stale")`
       - Remove/refresh: `brain_remember(target="mem_1", action="forget")` or `action="refresh"`
     """
-    return _get_brain(repo_path).remember(
-        target=target,
-        note=note,
-        tags=tags,
-        forbid=forbid,
-        co_change=co_change,
-        action=action,
-    )
+    b = _get_brain(repo_path)
+    with b._op_lock:
+        res = b.remember(
+            target=target,
+            note=note,
+            tags=tags,
+            forbid=forbid,
+            co_change=co_change,
+            action=action,
+        )
+    return _enforce_mcp_inline_budget(res)
 
 
 # ── Auxiliary / Legacy Tools (`--full` Mode) ─────────────────────────────────
 
-@mcp.tool()
+@_unstructured_endpoint()
 def brain_learn(
     apply: bool = False,
     pin_hubs: bool = False,
@@ -244,16 +397,20 @@ def brain_learn(
     repo_path: str | None = None,
 ) -> dict:
     """Auto-discover zero-violation architectural `--forbid` boundaries, git co-change contracts, and hub symbols."""
-    return _get_brain(repo_path).learn(
-        apply=apply,
-        pin_hubs=pin_hubs,
-        max_rules=max_rules,
-        days=days,
-        min_cochanges=min_cochanges,
-        min_confidence=min_confidence,
-    )
+    b = _get_brain(repo_path)
+    with b._op_lock:
+        res = b.learn(
+            apply=apply,
+            pin_hubs=pin_hubs,
+            max_rules=max_rules,
+            days=days,
+            min_cochanges=min_cochanges,
+            min_confidence=min_confidence,
+        )
+    return _enforce_mcp_inline_budget(res)
 
-@mcp.tool()
+
+@_unstructured_endpoint()
 def brain_context(
     task: str,
     budget_tokens: int = 3000,
@@ -261,29 +418,38 @@ def brain_context(
     repo_path: str | None = None,
 ) -> dict:
     """Compile token-budgeted target slices and 1-hop neighbor signature skeletons."""
-    return _get_brain(repo_path).compile_context(task, budget_tokens=budget_tokens, top_n=top_n)
+    b = _get_brain(repo_path)
+    with b._op_lock:
+        res = b.compile_context(task, budget_tokens=budget_tokens, top_n=top_n)
+    return _enforce_mcp_inline_budget(res)
 
 
-@mcp.tool()
+@_unstructured_endpoint()
 def brain_stats(
     repo_path: str | None = None,
     reset: bool = False,
 ) -> dict:
     """Return index topology, guardrail interception scorecard, and resolution telemetry."""
-    return _get_brain(repo_path).stats(reset=reset)
+    b = _get_brain(repo_path)
+    with b._op_lock:
+        res = b.stats(reset=reset)
+    return _enforce_mcp_inline_budget(res)
 
 
-@mcp.tool()
+@_unstructured_endpoint()
 def brain_patch(
     spec: str,
     apply: bool = False,
     repo_path: str | None = None,
 ) -> dict:
     """Legacy AST symbol/anchor patch tool (only exposed in `--full` mode)."""
-    return _get_brain(repo_path).patch(spec, apply=apply)
+    b = _get_brain(repo_path)
+    with b._op_lock:
+        res = b.patch(spec, apply=apply)
+    return _enforce_mcp_inline_budget(res)
 
 
-@mcp.tool()
+@_unstructured_endpoint()
 def brain_run(
     raw_output: str = "",
     command: str = "",
@@ -293,16 +459,19 @@ def brain_run(
 ) -> dict:
     """Compress raw terminal/test output with Code Graph stack-trace frame resolution."""
     b = _get_brain(repo_path)
-    if command.strip():
-        parsed = parse_server_args(sys.argv[1:])
-        allow_exec = parsed.allow_exec or (os.environ.get("PROJECTBRAIN_ALLOW_EXEC") == "1")
-        if not allow_exec:
-            return {
-                "error": "Direct command execution over MCP is disabled by default for security. Pass `raw_output` to compress terminal/test logs, or set `PROJECTBRAIN_ALLOW_EXEC=1`.",
-                "exit_code": 126,
-            }
-        return b.run_command_compressed(command.strip(), timeout=timeout, max_lines=max_lines)
-    return b.compress_command_output(raw_output, max_lines=max_lines)
+    with b._op_lock:
+        if command.strip():
+            parsed = parse_server_args(sys.argv[1:])
+            allow_exec = parsed.allow_exec or (os.environ.get("PROJECTBRAIN_ALLOW_EXEC") == "1")
+            if not allow_exec:
+                return {
+                    "error": "Direct command execution over MCP is disabled by default for security. Pass `raw_output` to compress terminal/test logs, or set `PROJECTBRAIN_ALLOW_EXEC=1`.",
+                    "exit_code": 126,
+                }
+            res = b.run_command_compressed(command.strip(), timeout=timeout, max_lines=max_lines)
+        else:
+            res = b.compress_command_output(raw_output, max_lines=max_lines)
+    return _enforce_mcp_inline_budget(res)
 
 
 LEAN_CORE_TOOLS = {
@@ -334,6 +503,7 @@ def configure_mcp_tools(full_mode: bool = False) -> set[str]:
 
 
 def main(argv: list[str] | None = None) -> None:
+    os.environ.setdefault("PROJECTBRAIN_MCP_STDIO", "1")
     parsed = parse_server_args(argv if argv is not None else sys.argv[1:])
     full_mode = parsed.full or (os.environ.get("PROJECTBRAIN_FULL_TOOLS") == "1")
     configure_mcp_tools(full_mode=full_mode)

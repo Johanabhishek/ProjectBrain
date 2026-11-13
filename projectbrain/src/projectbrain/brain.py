@@ -4,6 +4,7 @@ import os
 import re
 import subprocess
 import sys
+import threading
 from pathlib import Path
 
 if hasattr(sys.stdout, "reconfigure"):
@@ -19,7 +20,7 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from . import frameworks, resolve
 from .classify import classify_file_functions
-from .graph import CodeGraph, fn_id, cls_id, file_id, route_id
+from .graph import CodeGraph, fn_id, cls_id, file_id, route_id, compact_explore_result, normalize_ident_key
 from .intent import classify_intent, LOCATE_SYMBOL, LOCATE_ROUTE, UNDERSTAND_FLOW, IMPACT_ANALYSIS, ADD_FEATURE
 from .ledger import SavingsLedger
 from .memory import RepoMemory
@@ -34,6 +35,7 @@ from .store import (
 from .slicer import (
     slice_lines,
     build_file_skeleton,
+    build_monolith_component_map,
     extract_file_globals_slice,
     snap_to_block_boundaries,
     format_boundary_header,
@@ -218,6 +220,7 @@ class ProjectBrain:
         self._all_indexed_files: set[str] | None = None
         self._blobs_ready: bool = False
         self._pending_parsed_files: dict[str, tuple] = {}
+        self._op_lock = threading.RLock()
 
     def _reset_partial_index(self) -> None:
         if getattr(self, "_is_partial_index", False):
@@ -492,6 +495,16 @@ class ProjectBrain:
             focus_terms = None
         pdg_max_lines = min(max_lines_per_symbol, 45) if (focus_terms and max_lines_per_symbol == 180) else max_lines_per_symbol
 
+        def _maybe_prepend_monolith_map(rel_p: str, ls: int, le: int, raw_code: str) -> str:
+            if focus_terms or summary_mode or (le - ls) < 220:
+                return raw_code
+            try:
+                f_lines = (self.root / rel_p).read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                return raw_code
+            cmap = build_monolith_component_map(f_lines, ls, le, rel_path=rel_p)
+            return f"{cmap}\n{raw_code}" if cmap else raw_code
+
         # Fast cold-start SQLite path: slice directly from `.projectbrain.db` in <5ms
         # without loading the entire repository index/graph into memory.
         if (
@@ -604,6 +617,7 @@ class ProjectBrain:
                     l_start, l_end = sh["line_start"], sh["line_end"]
                     code = slice_lines(self.root, rel, l_start, l_end, max_lines=pdg_max_lines, focus_terms=focus_terms)
                     self._ledger.commit_slice_intervals(rel, extract_emitted_intervals(code))
+                    code = _maybe_prepend_monolith_map(rel, l_start, l_end, code)
                     self._served_slices.add(sh["node_id"])
                     fast_slices.append({
                         "node_id": sh["node_id"],
@@ -715,6 +729,7 @@ class ProjectBrain:
                     l_end = nd.get("line_end", l_start)
                     code = slice_lines(self.root, rel, l_start, l_end, max_lines=pdg_max_lines, focus_terms=focus_terms)
                     self._ledger.commit_slice_intervals(rel, extract_emitted_intervals(code))
+                    code = _maybe_prepend_monolith_map(rel, l_start, l_end, code)
                     self._served_slices.add(t)
                     slices.append({
                         "node_id": t,
@@ -750,17 +765,22 @@ class ProjectBrain:
                 sym_query = parts[1]
 
             sym_lower = sym_query.lower()
+            sym_norm = normalize_ident_key(sym_query)
             found_any = False
             for rel, info in self._index.items():
                 if file_filter and file_filter not in rel.lower():
                     continue
                 for fn in info.get("functions", []):
                     qname = f"{fn['parent_class']}.{fn['name']}" if fn.get("parent_class") else fn["name"]
-                    if sym_lower in (fn["name"].lower(), qname.lower()):
+                    if (
+                        sym_lower in (fn["name"].lower(), qname.lower())
+                        or (len(sym_norm) >= 4 and sym_norm in (normalize_ident_key(fn["name"]), normalize_ident_key(qname)))
+                    ):
                         nid = fn_id(rel, fn["name"], fn.get("parent_class"))
                         l_start, l_end = fn.get("line_start", 1), fn.get("line_end", 1)
                         code = slice_lines(self.root, rel, l_start, l_end, max_lines=pdg_max_lines, focus_terms=focus_terms)
                         self._ledger.commit_slice_intervals(rel, extract_emitted_intervals(code))
+                        code = _maybe_prepend_monolith_map(rel, l_start, l_end, code)
                         self._served_slices.add(nid)
                         slices.append({
                             "node_id": nid,
@@ -857,7 +877,10 @@ class ProjectBrain:
           multi-hop neighborhood (`neighbors`) plus optional git co-changes.
         """
         target = target.strip()
-        if not self._index and not target.startswith("/") and self._is_db_fresh_fast(allow_zero_disk=True):
+        is_route_target = target.startswith("/") or bool(
+            re.match(r"^(?:GET|POST|PUT|DELETE|PATCH|OPTIONS|HEAD|ANY)\s+/", target, re.IGNORECASE)
+        )
+        if not self._index and not is_route_target and self._is_db_fresh_fast(allow_zero_disk=True):
             fast_res = self._db_store.explore_fast(
                 target, target_b=target_b, edge_types=edge_types, depth=depth,
             )
@@ -865,15 +888,15 @@ class ProjectBrain:
                 if include_co_changes and not target_b and "center" in fast_res:
                     rel_path = fast_res["center"].get("rel_path")
                     if rel_path:
-                        fast_res["co_changes"] = self.co_change_analysis(rel_path).get("co_changes", [])
+                        fast_res["co_changes"] = self.co_change_analysis(rel_path).get("co_changes", [])[:10]
                 return fast_res
 
         self._ensure_fresh()
 
         if target_b:
-            return self.find_relationship(target, target_b.strip())
+            return compact_explore_result(self.find_relationship(target, target_b.strip()))
 
-        if target.startswith("/"):
+        if is_route_target:
             return self.trace_flow(target)
 
         if not self._graph:
@@ -883,14 +906,40 @@ class ProjectBrain:
         if not node_id:
             matches = self._graph.find_nodes_by_name(target)
             if not matches:
-                return {"error": f"No graph node matching '{target}'", "nodes": [], "edges": []}
+                import difflib
+                t_norm = normalize_ident_key(target)
+                norm_map: dict[str, str] = {}
+                for nid, nd in self._graph.nodes.items():
+                    nm = nd.get("name") or ""
+                    if nm and nd.get("type") in ("fn", "cls"):
+                        nk = normalize_ident_key(nm)
+                        if nk:
+                            norm_map.setdefault(nk, f"{nd.get('rel_path', '')}:{nm}".lstrip(":"))
+                close_keys = difflib.get_close_matches(t_norm, list(norm_map.keys()), n=5, cutoff=0.5) if t_norm else []
+                did_you_mean = [norm_map[ck] for ck in close_keys]
+                q_stem = re.sub(r"\.[a-zA-Z0-9]+$", "", target.replace("\\", "/").split(":")[0]).lower()
+                closest_files = sorted(k for k in self._index if q_stem and q_stem in k.lower())[:5]
+                miss_res: dict = {"error": f"No graph node matching '{target}'", "nodes": [], "edges": []}
+                if did_you_mean:
+                    miss_res["did_you_mean"] = did_you_mean
+                if closest_files:
+                    miss_res["closest_files"] = closest_files
+                return miss_res
             node_id = matches[0]
 
-        res = self.get_neighbors(node_id, edge_types=edge_types, depth=depth)
-        if include_co_changes:
-            rel_path = self._graph.nodes.get(node_id, {}).get("rel_path")
-            if rel_path:
-                res["co_changes"] = self.co_change_analysis(rel_path).get("co_changes", [])
+        raw_res = self.get_neighbors(node_id, edge_types=edge_types, depth=depth)
+        res = compact_explore_result(raw_res)
+        rel_path = self._graph.nodes.get(node_id, {}).get("rel_path")
+        if rel_path:
+            f_sz = self._sizes.get(rel_path)
+            if f_sz is not None and f_sz <= 12_000:
+                est_lines = max(1, int(f_sz) // 34)
+                res["direct_read_hint"] = (
+                    f"'{rel_path}' is small (~{est_lines} lines, {int(f_sz)} bytes) — "
+                    f"read_file('{rel_path}') reads the full source directly in 1 turn."
+                )
+            if include_co_changes:
+                res["co_changes"] = self.co_change_analysis(rel_path).get("co_changes", [])[:10]
         return res
 
     def check(
@@ -2494,7 +2543,7 @@ class ProjectBrain:
 
     # ── Cross-Boundary Intelligence ─────────────────────────────────────────
 
-    def trace_flow(self, url_path: str, method: str = "GET") -> dict:
+    def trace_flow(self, url_path: str, method: str | None = None) -> dict:
         return _verify_trace_flow(self, url_path, method=method)
 
     @staticmethod
