@@ -1431,7 +1431,7 @@ def test_cli_init_hooks_and_lean_mcp_surface(tmp_path: Path):
     res = _run_init(tmp_path, write_mcp=False, write_rules=False, write_hooks=True)
     assert "wrote_.claude/settings.local.json_hooks" in res["actions"]
     assert (tmp_path / ".claude" / "settings.local.json").exists()
-    assert {"brain_dossier", "brain_context", "brain_slice", "brain_patch", "brain_check", "brain_remember"} == LEAN_CORE_TOOLS
+    assert {"brain_dossier", "brain_slice", "brain_explore", "brain_check", "brain_remember"} == LEAN_CORE_TOOLS
 
 
 def test_pure_graph_as_storage_zero_disk_retrieval(tmp_path: Path):
@@ -1503,16 +1503,16 @@ def test_v081_single_turn_dossier_terse_rules_and_6d_run_compressor(tmp_path: Pa
         encoding="utf-8",
     )
 
-    # 1. Verify `init --hooks` writes Terse Output Mode & Symbol-First Patching rules
+    # 1. Verify `init --hooks` writes non-intrusive rules that preserve native rg/read_file usage
     capsys.readouterr()
     rc_init = cli.main(["--path", str(tmp_path), "init", "--no-mcp", "--hooks"])
     assert rc_init == 0
     agents_txt = (tmp_path / "AGENTS.md").read_text(encoding="utf-8")
-    assert "Terse Output Mode" in agents_txt
-    assert "@replace_body <Symbol>" in agents_txt
+    assert "do NOT read large monolith files" not in agents_txt
+    assert "brain_dossier" in agents_txt
     assert "projectbrain run" in agents_txt
     hooks_json = json.loads((tmp_path / ".claude" / "settings.local.json").read_text(encoding="utf-8"))
-    assert len(hooks_json["hooks"]["PreToolUse"]) >= 2
+    assert len(hooks_json["hooks"]["PostToolUse"]) >= 1
 
     # 2. Verify default `projectbrain dossier` prints full markdown in 1 turn (no extra read_file required)
     capsys.readouterr()
@@ -1521,7 +1521,7 @@ def test_v081_single_turn_dossier_terse_rules_and_6d_run_compressor(tmp_path: Pa
     out_md = capsys.readouterr().out
     assert out_md.startswith("# ProjectBrain Complete Engineering Dossier")
     assert "compute_invoice_tax" in out_md
-    assert "@replace_body <Symbol>" in out_md
+    assert "brain_slice" in out_md
     assert (tmp_path / ".projectbrain_dossier.md").exists()
 
     # And `--json` still returns metadata dict
@@ -1636,7 +1636,7 @@ def test_codex_review_hardening_suite(tmp_path: Path, monkeypatch):
     assert claude_cfg["permissions"]["allow"] == ["Bash(pytest:*)"]
     pre_hooks = claude_cfg["hooks"]["PreToolUse"]
     assert any("team hook" in json.dumps(h) for h in pre_hooks)
-    assert sum(1 for h in pre_hooks if "[ProjectBrain]" in json.dumps(h)) == 2
+    assert len(claude_cfg["hooks"]["PostToolUse"]) == 1 and "hook post-edit" in json.dumps(claude_cfg["hooks"]["PostToolUse"])
 
     brain = ProjectBrain(str(tmp_path))
     brain.load()

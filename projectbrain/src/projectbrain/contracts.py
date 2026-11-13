@@ -121,6 +121,33 @@ def _infer_py_expr_type(
     return None, None, None
 
 
+def _collect_py_defs(stmts: list[ast.stmt], cls_out: list[ast.ClassDef], fn_out: list[ast.FunctionDef | ast.AsyncFunctionDef]) -> None:
+    for st in stmts:
+        if isinstance(st, ast.ClassDef):
+            cls_out.append(st)
+            _collect_py_defs(st.body, cls_out, fn_out)
+        elif isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            fn_out.append(st)
+            _collect_py_defs(st.body, cls_out, fn_out)
+        elif isinstance(st, (ast.If, ast.For, ast.AsyncFor, ast.While)):
+            _collect_py_defs(st.body, cls_out, fn_out)
+            if st.orelse:
+                _collect_py_defs(st.orelse, cls_out, fn_out)
+        elif isinstance(st, (ast.With, ast.AsyncWith)):
+            _collect_py_defs(st.body, cls_out, fn_out)
+        elif isinstance(st, ast.Try):
+            _collect_py_defs(st.body, cls_out, fn_out)
+            for h in st.handlers:
+                _collect_py_defs(h.body, cls_out, fn_out)
+            if st.orelse:
+                _collect_py_defs(st.orelse, cls_out, fn_out)
+            if st.finalbody:
+                _collect_py_defs(st.finalbody, cls_out, fn_out)
+        elif hasattr(ast, "Match") and isinstance(st, ast.Match):
+            for mc in st.cases:
+                _collect_py_defs(mc.body, cls_out, fn_out)
+
+
 def _analyze_python_ast_contracts(lines: list[str]) -> dict[int, dict]:
     """Universal Python AST intra-procedural dataflow analyzer for:
       1. Parameter & local variable nominal type propagation (`type_env`) and row-column tracking (`row_env`).
@@ -129,31 +156,35 @@ def _analyze_python_ast_contracts(lines: list[str]) -> dict[int, dict]:
     Returns a mapping from 1-based function start line to `{type_comparisons, return_dict_keys}`.
     """
     src = "\n".join(lines)
+    if "def " not in src:
+        return {}
     try:
         tree = ast.parse(src)
     except SyntaxError:
         return {}
 
-    cls_fields: dict[str, list[str]] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.ClassDef):
-            f_list: list[str] = []
-            for item in node.body:
-                if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
-                    fnm = item.target.id
-                    if not fnm.startswith("_") and fnm not in f_list:
-                        f_list.append(fnm)
-                elif isinstance(item, ast.Assign):
-                    for t in item.targets:
-                        if isinstance(t, ast.Name) and not t.id.startswith("_") and t.id not in f_list:
-                            f_list.append(t.id)
-            if f_list:
-                cls_fields[node.name] = f_list
+    cls_nodes: list[ast.ClassDef] = []
+    fn_nodes: list[ast.FunctionDef | ast.AsyncFunctionDef] = []
+    _collect_py_defs(tree.body, cls_nodes, fn_nodes)
 
+    cls_fields: dict[str, list[str]] = {}
+    for node in cls_nodes:
+        f_list: list[str] = []
+        for item in node.body:
+            if isinstance(item, ast.AnnAssign) and isinstance(item.target, ast.Name):
+                fnm = item.target.id
+                if not fnm.startswith("_") and fnm not in f_list:
+                    f_list.append(fnm)
+            elif isinstance(item, ast.Assign):
+                for t in item.targets:
+                    if isinstance(t, ast.Name) and not t.id.startswith("_") and t.id not in f_list:
+                        f_list.append(t.id)
+        if f_list:
+            cls_fields[node.name] = f_list
+
+    n_lines = len(lines)
     result: dict[int, dict] = {}
-    for node in ast.walk(tree):
-        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            continue
+    for node in fn_nodes:
         type_env: dict[str, str] = {}
         row_env: dict[str, str] = {}
         all_args = (
@@ -169,48 +200,64 @@ def _analyze_python_ast_contracts(lines: list[str]) -> dict[int, dict]:
         type_comparisons: list[dict] = []
         return_dict_keys: list[str] = []
         has_dynamic_dict_spread = False
+        fn_end = getattr(node, "end_lineno", None) or n_lines
+        fn_slice = lines[max(0, node.lineno - 1) : fn_end]
+        has_fn_eq = any("==" in ln_s or "!=" in ln_s for ln_s in fn_slice)
+        has_fn_ret = any("return" in ln_s for ln_s in fn_slice)
+        if not has_fn_eq and not has_fn_ret:
+            continue
+
+        def _walk_cmp(sub: ast.AST) -> None:
+            if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                return
+            if isinstance(sub, ast.Compare):
+                operands = [sub.left] + list(sub.comparators)
+                for op, left_e, right_e in zip(sub.ops, operands, operands[1:]):
+                    if not isinstance(op, (ast.Eq, ast.NotEq)):
+                        continue
+                    l_lbl, l_ty, l_col = _infer_py_expr_type(left_e, type_env, row_env)
+                    r_lbl, r_ty, r_col = _infer_py_expr_type(right_e, type_env, row_env)
+                    if l_col and r_ty in ("UUID", "datetime", "date", "Decimal", "bytes"):
+                        type_comparisons.append({
+                            "param": r_lbl or "expr",
+                            "param_type": r_ty,
+                            "row_key": l_col,
+                            "line": getattr(sub, "lineno", node.lineno),
+                        })
+                    elif r_col and l_ty in ("UUID", "datetime", "date", "Decimal", "bytes"):
+                        type_comparisons.append({
+                            "param": l_lbl or "expr",
+                            "param_type": l_ty,
+                            "row_key": r_col,
+                            "line": getattr(sub, "lineno", node.lineno),
+                        })
+                    elif (
+                        not l_col
+                        and not r_col
+                        and l_ty in _NOMINAL_DISJOINT_TYPES
+                        and r_ty in _NOMINAL_DISJOINT_TYPES
+                        and l_ty != r_ty
+                        and {l_ty, r_ty} != {"int", "float"}
+                    ):
+                        type_comparisons.append({
+                            "param": l_lbl or "lhs",
+                            "param_type": l_ty,
+                            "other_var": r_lbl or "rhs",
+                            "other_type": r_ty,
+                            "row_key": f"{r_lbl}:{r_ty}",
+                            "line": getattr(sub, "lineno", node.lineno),
+                        })
+            for ch in ast.iter_child_nodes(sub):
+                _walk_cmp(ch)
 
         def _check_expr_comparisons(stmt_node: ast.AST) -> None:
-            for sub in ast.walk(stmt_node):
-                if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
-                    continue
-                if isinstance(sub, ast.Compare):
-                    operands = [sub.left] + list(sub.comparators)
-                    for op, left_e, right_e in zip(sub.ops, operands, operands[1:]):
-                        if not isinstance(op, (ast.Eq, ast.NotEq)):
-                            continue
-                        l_lbl, l_ty, l_col = _infer_py_expr_type(left_e, type_env, row_env)
-                        r_lbl, r_ty, r_col = _infer_py_expr_type(right_e, type_env, row_env)
-                        if l_col and r_ty in ("UUID", "datetime", "date", "Decimal", "bytes"):
-                            type_comparisons.append({
-                                "param": r_lbl or "expr",
-                                "param_type": r_ty,
-                                "row_key": l_col,
-                                "line": getattr(sub, "lineno", node.lineno),
-                            })
-                        elif r_col and l_ty in ("UUID", "datetime", "date", "Decimal", "bytes"):
-                            type_comparisons.append({
-                                "param": l_lbl or "expr",
-                                "param_type": l_ty,
-                                "row_key": r_col,
-                                "line": getattr(sub, "lineno", node.lineno),
-                            })
-                        elif (
-                            not l_col
-                            and not r_col
-                            and l_ty in _NOMINAL_DISJOINT_TYPES
-                            and r_ty in _NOMINAL_DISJOINT_TYPES
-                            and l_ty != r_ty
-                            and {l_ty, r_ty} != {"int", "float"}
-                        ):
-                            type_comparisons.append({
-                                "param": l_lbl or "lhs",
-                                "param_type": l_ty,
-                                "other_var": r_lbl or "rhs",
-                                "other_type": r_ty,
-                                "row_key": f"{r_lbl}:{r_ty}",
-                                "line": getattr(sub, "lineno", node.lineno),
-                            })
+            if not has_fn_eq:
+                return
+            s_l = getattr(stmt_node, "lineno", 0)
+            e_l = getattr(stmt_node, "end_lineno", 0) or s_l
+            if s_l > 0 and not any("==" in ln_s or "!=" in ln_s for ln_s in lines[s_l - 1 : e_l]):
+                return
+            _walk_cmp(stmt_node)
 
         def _walk_stmt_block(stmts: list[ast.stmt]) -> None:
             nonlocal has_dynamic_dict_spread
@@ -218,33 +265,35 @@ def _analyze_python_ast_contracts(lines: list[str]) -> dict[int, dict]:
                 if isinstance(st, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
                     continue
                 if isinstance(st, ast.Assign):
-                    _check_expr_comparisons(st.value)
-                    _, rhs_ty, rhs_col = _infer_py_expr_type(st.value, type_env, row_env)
-                    for tgt in st.targets:
-                        if isinstance(tgt, ast.Name):
-                            if rhs_col:
-                                row_env[tgt.id] = rhs_col
-                                type_env[tgt.id] = "TEXT"
-                            else:
-                                row_env.pop(tgt.id, None)
-                                if rhs_ty:
-                                    type_env[tgt.id] = rhs_ty
-                elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
-                    if st.value:
+                    if has_fn_eq:
                         _check_expr_comparisons(st.value)
-                    ann_t = _norm_py_type_annotation(st.annotation)
-                    _, rhs_ty, rhs_col = (
-                        _infer_py_expr_type(st.value, type_env, row_env)
-                        if st.value is not None
-                        else (None, None, None)
-                    )
-                    if rhs_col and not ann_t:
-                        row_env[st.target.id] = rhs_col
-                        type_env[st.target.id] = "TEXT"
-                    else:
-                        row_env.pop(st.target.id, None)
-                        if ann_t or rhs_ty:
-                            type_env[st.target.id] = ann_t or rhs_ty  # type: ignore[assignment]
+                        _, rhs_ty, rhs_col = _infer_py_expr_type(st.value, type_env, row_env)
+                        for tgt in st.targets:
+                            if isinstance(tgt, ast.Name):
+                                if rhs_col:
+                                    row_env[tgt.id] = rhs_col
+                                    type_env[tgt.id] = "TEXT"
+                                else:
+                                    row_env.pop(tgt.id, None)
+                                    if rhs_ty:
+                                        type_env[tgt.id] = rhs_ty
+                elif isinstance(st, ast.AnnAssign) and isinstance(st.target, ast.Name):
+                    if has_fn_eq:
+                        if st.value:
+                            _check_expr_comparisons(st.value)
+                        ann_t = _norm_py_type_annotation(st.annotation)
+                        _, rhs_ty, rhs_col = (
+                            _infer_py_expr_type(st.value, type_env, row_env)
+                            if st.value is not None
+                            else (None, None, None)
+                        )
+                        if rhs_col and not ann_t:
+                            row_env[st.target.id] = rhs_col
+                            type_env[st.target.id] = "TEXT"
+                        else:
+                            row_env.pop(st.target.id, None)
+                            if ann_t or rhs_ty:
+                                type_env[st.target.id] = ann_t or rhs_ty  # type: ignore[assignment]
                 elif isinstance(st, ast.Return) and st.value is not None:
                     _check_expr_comparisons(st.value)
                     rv = st.value
@@ -401,6 +450,24 @@ def _split_top_level_params(raw: str) -> list[str] | None:
     return [p.strip() for p in parts if p.strip()]
 
 
+_JS_REL_IMP_RE = re.compile(r"import\s+\{([^}]+)\}\s+from\s+['\"]\.\.?\/[^'\"]+['\"]")
+_JS_LC_IDENT_RE = re.compile(r"^[a-z][a-zA-Z0-9_]*$")
+_JS_JSX_HANDLER_RE = re.compile(
+    r"\b(on[A-Z]\w*)\s*=\s*\{\s*(?:(?:async\s*)?(?:\([^)]*\)|[a-zA-Z_]\w*)\s*=>\s*\{?\s*)?([a-zA-Z_]\w*)\b"
+)
+_JS_USESTATE_LN_RE = re.compile(r"const\s+\[\s*([a-zA-Z_]\w*)\s*,\s*([a-zA-Z_]\w*)\s*\]\s*=\s*useState\b")
+_JS_EFF_LN_RE = re.compile(r"\b(useEffect|useLayoutEffect|useCallback)\s*\(")
+_JS_DEPS_TAIL_RE = re.compile(r",\s*\[\s*([^\]]*?)\s*\]\s*\)\s*;?\s*$")
+_JS_FN_DECL_LN_RE = re.compile(
+    r"^(?:export\s+)?(?:async\s+)?function\s+([a-zA-Z_]\w*)\s*\(([^)]*)\)\s*(?::\s*[^{]+)?\{|"
+    r"^(?:export\s+)?const\s+([a-zA-Z_]\w*)\s*=\s*(?:useCallback\s*\(\s*)?(?:async\s*)?\(([^)]*)\)\s*(?::\s*[^=]+)?=>\s*\{"
+)
+_JS_PARAM_ID_RE = re.compile(r"^(?:\.\.\.)?([a-zA-Z_$][\w$]*)")
+_JS_IGNORE_HANDLERS = (
+    "reset", "clear", "init", "load", "fetch", "sync", "measure", "resize", "scroll", "noop",
+)
+
+
 def _analyze_js_ts_ast_contracts(lines: list[str], ext: str) -> list[dict]:
     """Universal JS/TS/React static AST & lexical-closure contract analyzer:
       1. `premature_effect_event_handler`: Callback `H` bound to JSX `on[A-Z]*` prop is also invoked
@@ -426,32 +493,24 @@ def _analyze_js_ts_ast_contracts(lines: list[str], ext: str) -> list[dict]:
     jsx_handlers: dict[str, tuple[str, int]] = {}
 
     full_text = "\n".join(lines)
-    for m_imp in re.finditer(
-        r"import\s+\{([^}]+)\}\s+from\s+['\"]\.\.?\/[^'\"]+['\"]",
-        full_text,
-    ):
-        for spec in m_imp.group(1).split(","):
-            tok = spec.strip().split(" as ")[-1].strip()
-            if re.match(r"^[a-z][a-zA-Z0-9_]*$", tok):
-                rel_imported_syms.add(tok)
+    if "import " in full_text:
+        for m_imp in _JS_REL_IMP_RE.finditer(full_text):
+            for spec in m_imp.group(1).split(","):
+                tok = spec.strip().split(" as ")[-1].strip()
+                if _JS_LC_IDENT_RE.match(tok):
+                    rel_imported_syms.add(tok)
 
-    _IGNORE_HANDLERS = {
-        "reset", "clear", "init", "load", "fetch", "sync", "measure", "resize", "scroll", "noop",
-    }
-
-    for m_jh in re.finditer(
-        r"\b(on[A-Z]\w*)\s*=\s*\{\s*(?:(?:async\s*)?(?:\([^)]*\)|[a-zA-Z_]\w*)\s*=>\s*\{?\s*)?([a-zA-Z_]\w*)\b",
-        full_text,
-    ):
-        prop_nm, h_nm = m_jh.group(1), m_jh.group(2)
-        if prop_nm in ("onMouseEnter", "onMouseLeave", "onFocus", "onBlur"):
-            continue
-        if h_nm in ("true", "false", "null", "undefined", "e", "ev", "event", "if", "const", "let", "return") or any(
-            h_nm.lower().startswith(p) for p in _IGNORE_HANDLERS
-        ):
-            continue
-        jsx_ln = 1 + full_text.count("\n", 0, m_jh.start())
-        jsx_handlers.setdefault(h_nm, (prop_nm, jsx_ln))
+    if "={" in full_text or "= {" in full_text:
+        for m_jh in _JS_JSX_HANDLER_RE.finditer(full_text):
+            prop_nm, h_nm = m_jh.group(1), m_jh.group(2)
+            if prop_nm in ("onMouseEnter", "onMouseLeave", "onFocus", "onBlur"):
+                continue
+            if h_nm in ("true", "false", "null", "undefined", "e", "ev", "event", "if", "const", "let", "return") or (
+                h_nm.lower().startswith(_JS_IGNORE_HANDLERS)
+            ):
+                continue
+            jsx_ln = 1 + full_text.count("\n", 0, m_jh.start())
+            jsx_handlers.setdefault(h_nm, (prop_nm, jsx_ln))
 
     for i, ln in enumerate(lines):
         lnum = i + 1
@@ -459,61 +518,60 @@ def _analyze_js_ts_ast_contracts(lines: list[str], ext: str) -> list[dict]:
         if not st or st.startswith(("//", "/*")):
             continue
 
-        for m_st in re.finditer(r"const\s+\[\s*([a-zA-Z_]\w*)\s*,\s*([a-zA-Z_]\w*)\s*\]\s*=\s*useState\b", ln):
-            state_vars[m_st.group(1)] = (m_st.group(2), lnum)
-        m_eff = re.search(r"\b(useEffect|useLayoutEffect|useCallback)\s*\(", st)
-        if m_eff:
-            kind = m_eff.group(1)
-            end_i = _find_balanced_end(lines, i, "(", ")", max_scan=300)
-            eff_body = "\n".join(lines[i : end_i + 1])
-            tail = " ".join(lines[max(i, end_i - 4) : end_i + 1])
-            m_deps = re.search(r",\s*\[\s*([^\]]*?)\s*\]\s*\)\s*;?\s*$", tail)
-            deps_str = m_deps.group(1).strip() if m_deps is not None else None
-            effect_blocks.append({
-                "kind": kind,
-                "start_line": lnum,
-                "end_line": end_i + 1,
-                "deps": deps_str,
-                "body": eff_body,
-            })
+        if "useState" in ln:
+            for m_st in _JS_USESTATE_LN_RE.finditer(ln):
+                state_vars[m_st.group(1)] = (m_st.group(2), lnum)
+        if "use" in st and "(" in st:
+            m_eff = _JS_EFF_LN_RE.search(st)
+            if m_eff:
+                kind = m_eff.group(1)
+                end_i = _find_balanced_end(lines, i, "(", ")", max_scan=300)
+                eff_body = "\n".join(lines[i : end_i + 1])
+                tail = " ".join(lines[max(i, end_i - 4) : end_i + 1])
+                m_deps = _JS_DEPS_TAIL_RE.search(tail)
+                deps_str = m_deps.group(1).strip() if m_deps is not None else None
+                effect_blocks.append({
+                    "kind": kind,
+                    "start_line": lnum,
+                    "end_line": end_i + 1,
+                    "deps": deps_str,
+                    "body": eff_body,
+                })
 
-        m_fn = re.match(
-            r"^(?:export\s+)?(?:async\s+)?function\s+([a-zA-Z_]\w*)\s*\(([^)]*)\)\s*(?::\s*[^{]+)?\{|"
-            r"^(?:export\s+)?const\s+([a-zA-Z_]\w*)\s*=\s*(?:useCallback\s*\(\s*)?(?:async\s*)?\(([^)]*)\)\s*(?::\s*[^=]+)?=>\s*\{",
-            st,
-        )
-        if m_fn:
-            fn_nm = m_fn.group(1) or m_fn.group(3)
-            raw_params = (m_fn.group(2) if m_fn.group(1) else m_fn.group(4)) or ""
-            if fn_nm and fn_nm not in ("if", "for", "while", "switch", "catch"):
-                end_i = _find_balanced_end(lines, i, "{", "}", max_scan=2600)
-                span = (end_i + 1) - lnum
-                if span <= 220:
-                    parsed_params: list[tuple[str, bool]] = []
-                    params_unparsed = False
-                    if raw_params.strip():
-                        split_params = _split_top_level_params(raw_params)
-                        if split_params is None:
-                            params_unparsed = True
-                            split_params = []
-                        for p_clean in split_params:
-                            name_part = p_clean.split(":")[0]
-                            is_rest = p_clean.startswith("...")
-                            has_opt = is_rest or ("=" in p_clean.replace("=>", "")) or ("?" in name_part)
-                            m_pid = re.match(r"^(?:\.\.\.)?([a-zA-Z_$][\w$]*)", p_clean)
-                            if m_pid:
-                                parsed_params.append((m_pid.group(1), has_opt))
-                            else:
-                                parsed_params.append(("<destructured>", has_opt))
-                    local_fns[fn_nm] = {
-                        "name": fn_nm,
-                        "params": parsed_params,
-                        "params_unparsed": params_unparsed,
-                        "start_line": lnum,
-                        "end_line": end_i + 1,
-                        "span": span,
-                        "body": "\n".join(lines[i : end_i + 1]),
-                    }
+        if "{" in st and st.startswith(("export", "async", "function", "const")):
+            m_fn = _JS_FN_DECL_LN_RE.match(st)
+            if m_fn:
+                fn_nm = m_fn.group(1) or m_fn.group(3)
+                raw_params = (m_fn.group(2) if m_fn.group(1) else m_fn.group(4)) or ""
+                if fn_nm and fn_nm not in ("if", "for", "while", "switch", "catch"):
+                    end_i = _find_balanced_end(lines, i, "{", "}", max_scan=2600)
+                    span = (end_i + 1) - lnum
+                    if span <= 220:
+                        parsed_params: list[tuple[str, bool]] = []
+                        params_unparsed = False
+                        if raw_params.strip():
+                            split_params = _split_top_level_params(raw_params)
+                            if split_params is None:
+                                params_unparsed = True
+                                split_params = []
+                            for p_clean in split_params:
+                                name_part = p_clean.split(":")[0]
+                                is_rest = p_clean.startswith("...")
+                                has_opt = is_rest or ("=" in p_clean.replace("=>", "")) or ("?" in name_part)
+                                m_pid = _JS_PARAM_ID_RE.match(p_clean)
+                                if m_pid:
+                                    parsed_params.append((m_pid.group(1), has_opt))
+                                else:
+                                    parsed_params.append(("<destructured>", has_opt))
+                        local_fns[fn_nm] = {
+                            "name": fn_nm,
+                            "params": parsed_params,
+                            "params_unparsed": params_unparsed,
+                            "start_line": lnum,
+                            "end_line": end_i + 1,
+                            "span": span,
+                            "body": "\n".join(lines[i : end_i + 1]),
+                        }
 
     violations: list[dict] = []
 
@@ -643,62 +701,79 @@ def _analyze_js_ts_ast_contracts(lines: list[str], ext: str) -> list[dict]:
                         ),
                     })
 
-    # Law 4: Required-Parameter Arity Violation
+    # Law 4: Required-Parameter Arity Violation (O(L) single-pass call-line index)
+    arity_targets: dict[str, dict] = {}
     for fn_h in local_fns.values():
         if fn_h.get("params_unparsed"):
             continue
-        sym_nm = fn_h["name"]
-        required = 0
+        req_cnt = 0
         for _p_nm, p_opt in fn_h["params"]:
             if p_opt:
                 break
-            required += 1
-        if required < 2:
-            continue
-        decl_s, decl_e = fn_h["start_line"], fn_h["end_line"]
-        short_calls: list[tuple[int, int, str]] = []
-        full_call: tuple[int, str] | None = None
+            req_cnt += 1
+        if req_cnt >= 2:
+            arity_targets[fn_h["name"]] = {**fn_h, "required": req_cnt}
+
+    if arity_targets:
+        cand_lines_by_sym: dict[str, list[int]] = {k: [] for k in arity_targets}
+        _CALL_IDENT_PAT = re.compile(r"(?<![.\w$])([A-Za-z_$][\w$]*)\s*\(")
         for idx_ln, ln_txt in enumerate(lines):
-            c_ln = idx_ln + 1
-            if decl_s <= c_ln <= decl_e and c_ln == decl_s:
+            if "(" not in ln_txt:
                 continue
             st_ln = ln_txt.strip()
             if st_ln.startswith(("import ", "//", "/*", "*")):
                 continue
-            for m_c in re.finditer(rf"(?<![.\w$]){re.escape(sym_nm)}\s*\(", ln_txt):
-                if re.search(r"\bfunction\s*$", ln_txt[: m_c.start()]):
+            for m_ci in _CALL_IDENT_PAT.finditer(ln_txt):
+                cnm = m_ci.group(1)
+                if cnm in cand_lines_by_sym:
+                    cand_lines_by_sym[cnm].append(idx_ln)
+
+        for sym_nm, fn_h in arity_targets.items():
+            required = fn_h["required"]
+            decl_s, decl_e = fn_h["start_line"], fn_h["end_line"]
+            short_calls: list[tuple[int, int, str]] = []
+            full_call: tuple[int, str] | None = None
+            sym_rx = re.compile(rf"(?<![.\w$]){re.escape(sym_nm)}\s*\(")
+            for idx_ln in set(cand_lines_by_sym[sym_nm]):
+                c_ln = idx_ln + 1
+                if decl_s <= c_ln <= decl_e and c_ln == decl_s:
                     continue
-                open_pos = ln_txt.find("(", m_c.start())
-                combined_call = "\n".join(lines[idx_ln : min(n, idx_ln + 4)])[open_pos:]
-                end_pos = _balanced_paren_end(combined_call)
-                if end_pos <= 0:
-                    continue
-                inner_args = combined_call[1:end_pos]
-                if "..." in inner_args:
-                    continue
-                n_args = _count_call_args(inner_args)
-                snip = re.sub(r"\s+", " ", f"{sym_nm}({inner_args.strip()})")[:64]
-                if n_args < required:
-                    short_calls.append((c_ln, n_args, snip))
-                elif full_call is None:
-                    full_call = (c_ln, snip)
-        for c_ln, n_args, snip in short_calls[:2]:
-            missing = [p for p, _ in fn_h["params"][n_args:required]]
-            violations.append({
-                "kind": "missing_required_argument",
-                "symbol": sym_nm,
-                "line": c_ln,
-                "end_line": c_ln + 1,
-                "extra_pin_lines": [c_ln, decl_s] + ([full_call[0]] if full_call else []),
-                "inline_msg": (
-                    f"# >>> [6D-CONTRACT L{c_ln}] Arity: '{sym_nm}' declares {required} required param(s) at L{decl_s} "
-                    f"but is called with {n_args}; required param(s) [{', '.join(missing)}] will be undefined"
-                ),
-                "summary": (
-                    f"`{snip}` passes {n_args} arg(s) but `{sym_nm}` (`L{decl_s}`) declares {required} required "
-                    f"parameter(s); `{', '.join(missing)}` will be `undefined`."
-                ),
-            })
+                ln_txt = lines[idx_ln]
+                for m_c in sym_rx.finditer(ln_txt):
+                    if re.search(r"\bfunction\s*$", ln_txt[: m_c.start()]):
+                        continue
+                    open_pos = ln_txt.find("(", m_c.start())
+                    combined_call = "\n".join(lines[idx_ln : min(n, idx_ln + 4)])[open_pos:]
+                    end_pos = _balanced_paren_end(combined_call)
+                    if end_pos <= 0:
+                        continue
+                    inner_args = combined_call[1:end_pos]
+                    if "..." in inner_args:
+                        continue
+                    n_args = _count_call_args(inner_args)
+                    snip = re.sub(r"\s+", " ", f"{sym_nm}({inner_args.strip()})")[:64]
+                    if n_args < required:
+                        short_calls.append((c_ln, n_args, snip))
+                    elif full_call is None:
+                        full_call = (c_ln, snip)
+            short_calls.sort(key=lambda x: x[0])
+            for c_ln, n_args, snip in short_calls[:2]:
+                missing = [p for p, _ in fn_h["params"][n_args:required]]
+                violations.append({
+                    "kind": "missing_required_argument",
+                    "symbol": sym_nm,
+                    "line": c_ln,
+                    "end_line": c_ln + 1,
+                    "extra_pin_lines": [c_ln, decl_s] + ([full_call[0]] if full_call else []),
+                    "inline_msg": (
+                        f"# >>> [6D-CONTRACT L{c_ln}] Arity: '{sym_nm}' declares {required} required param(s) at L{decl_s} "
+                        f"but is called with {n_args}; required param(s) [{', '.join(missing)}] will be undefined"
+                    ),
+                    "summary": (
+                        f"`{snip}` passes {n_args} arg(s) but `{sym_nm}` (`L{decl_s}`) declares {required} required "
+                        f"parameter(s); `{', '.join(missing)}` will be `undefined`."
+                    ),
+                })
 
     # Law 5: Event-Listener Registration / Cleanup Pairing
     _ADD_PAT = re.compile(r"\.addEventListener\(\s*(['\"])([^'\"]+)\1\s*,\s*([A-Za-z_$][\w$]*)\s*[,)]")
@@ -742,6 +817,158 @@ def _analyze_js_ts_ast_contracts(lines: list[str], ext: str) -> list[dict]:
     return violations
 
 
+_4D_SPAN_NODE_TYPES = frozenset({
+    "function_declaration", "arrow_function", "function_definition",
+    "method_definition", "call_expression", "if_statement", "elif_clause",
+    "else_clause", "try_statement", "except_clause", "catch_clause",
+    "with_statement", "for_statement", "for_in_statement", "while_statement",
+    "match_statement", "case_clause", "switch_case", "switch_default",
+    "jsx_expression", "ternary_expression", "conditional_expression",
+})
+_4D_ASSIGN_NODE_TYPES = frozenset({
+    "assignment_expression", "augmented_assignment_expression",
+    "update_expression", "assignment", "augmented_assignment",
+})
+_4D_JS_RES_BUILTINS = frozenset({
+    "ok", "status", "statusText", "headers", "json", "text", "blob", "clone",
+    "then", "catch", "finally", "length", "map", "filter", "forEach", "slice",
+    "toString", "valueOf", "error", "errors", "detail", "message", "data",
+})
+_4D_W_CALL_NOISE = frozenset({
+    "if", "for", "while", "switch", "catch", "return", "function",
+    "useEffect", "useState", "useMemo", "useCallback",
+})
+_4D_WORD_RE = re.compile(r"\w+")
+_4D_IDENT_FULL_RE = re.compile(r"^[a-zA-Z_]\w*$")
+_4D_SIMPLE_IDENT_RE = re.compile(r"^\w+$")
+_4D_PROP_LHS_RE = re.compile(r"^(?:self|this|state|store|draft|window|globalThis)\.([a-zA-Z_]\w*)")
+_4D_USESTATE_RE = re.compile(r"const\s+\[\s*(\w+)\s*,\s*(\w+)\s*\]\s*=\s*useState")
+_4D_USEREF_RE = re.compile(r"const\s+(\w+)\s*=\s*useRef\b")
+_4D_SELF_ATTR_RE = re.compile(r"\bself\.([a-zA-Z_]\w*)\s*=")
+_4D_USEHOOK_RE = re.compile(r"const\s+\{([^}]+)\}\s*=\s*(?:use[A-Z]\w*|useStore)\s*\(")
+_4D_HOOK_ACT_RE = re.compile(r"^(?:set|update|add|remove|delete|toggle|clear|reset|mark)([A-Z]\w*)$")
+_4D_ZUSTAND_RE = re.compile(r"const\s+(\w+)\s*=\s*use\w*Store\s*\([^)]*=>\s*\w+\.(\w+)")
+_4D_ZUSTAND_ACT_RE = re.compile(r"^(?:set|update|add|remove|delete|toggle|clear|reset)([A-Z]\w*)$")
+
+_4D_CREATE_TBL_RE = re.compile(
+    r"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:[a-zA-Z_]\w*\.)?[\"`]?([a-zA-Z_][a-zA-Z0-9_]*)[\"`]?\s*\(",
+    re.IGNORECASE,
+)
+_4D_USESTATE_CALL_RE = re.compile(r"\buse(?:State|Ref)\s*(?:<[^>]*>)?\s*\(")
+_4D_USESTATE_NXT_RE = re.compile(r"\buse(?:State|Ref)\b")
+_4D_ST_DECL_RE = re.compile(
+    r"^([A-Z][A-Z0-9_]{2,}|[a-z_][a-z0-9_]*)\s*(?::\s*[^=]+)?=\s*(?:([A-Z][A-Za-z0-9_]*|[a-z_][a-z0-9_]*)\s*\(|(\{))"
+)
+_4D_UPPER_CFG_STR_RE = re.compile(r"['\"][A-Z][A-Z0-9_]{2,40}['\"]")
+_4D_EFF_RE = re.compile(r"\b(useEffect|useLayoutEffect|useMemo|useCallback)\s*\(")
+_4D_DEPS_RE = re.compile(r"\[([^\]]*)\]\s*\)")
+_4D_CASE_HDR_RE = re.compile(r"^(?:case\s+(['\"][^'\"]+['\"]|[a-zA-Z0-9_$.]+)\s*:)+")
+_4D_CASE_LBL_RE = re.compile(r"case\s+(['\"][^'\"]+['\"]|[a-zA-Z0-9_$.]+)\s*:")
+_4D_CASE_NXT_RE = re.compile(r"^case\s+(['\"][^'\"]+['\"]|[a-zA-Z0-9_$.]+)\s*:")
+_4D_CASE_BRK_RE = re.compile(r"^(?:case\s+|default\s*:)")
+_4D_FN_HDR_RE = re.compile(
+    r"^(?:export\s+)?(?:async\s+)?(?:function|def)\s+([a-zA-Z_]\w*)"
+    r"|^(?:export\s+)?const\s+([a-zA-Z_]\w*)\s*=\s*(?:async\s*)?\([^)]*\)\s*(?::\s*[^=]+)?=>\s*\{"
+    r"|^(?:public\s+|private\s+|protected\s+)?(?:async\s+)?([a-zA-Z_]\w*)\s*\([^;]*\)\s*(?::\s*[^{]+)?\{"
+)
+_4D_FN_IO_RE = re.compile(
+    r"\b(?:fetch|axios|setItem|getItem|[a-z]+Doc|execute|commit|prisma|supabase|dispatch|requests\.|httpx\.|aiohttp\.|redis\.|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|SELECT\s+|\w+\.(?:set|put|write|save|update|upsert)\s*\()\b",
+    re.IGNORECASE,
+)
+_4D_FN_VIEW_RE = re.compile(r"(?:</[A-Za-z]|/>)")
+_4D_IF_HDR_RE = re.compile(r"^(?:\}\s*)?(?:else\s+if|elif|if)\s*\(?([^):{]{3,75})\)?\s*[{:]\s*(?:#.*)?$")
+_4D_IF_IO_RE = re.compile(
+    r"\b(?:fetch|axios|setItem|getItem|execute|commit|prisma|supabase|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|SELECT\s+)\b",
+    re.IGNORECASE,
+)
+_4D_WITH_HDR_RE = re.compile(r"^(?:async\s+)?with\s+([^:]{3,65}):\s*(?:#.*)?$")
+_4D_WITH_IO_RE = re.compile(
+    r"\b(?:tx|db|conn|cursor|open|lock|session|execute|INSERT\s+INTO|UPDATE\s+|SELECT\s+)\b",
+    re.IGNORECASE,
+)
+_4D_TRY_HDR_RE = re.compile(r"^(?:try\s*[:{]|(?:except|catch)\s*\(?([^):{]{0,50})\)?\s*[:{])\s*(?:#.*)?$")
+_4D_TRY_IO_RE = re.compile(
+    r"\b(?:execute|commit|INSERT\s+INTO|UPDATE\s+|DELETE\s+FROM|SELECT\s+|fetch|axios)\b",
+    re.IGNORECASE,
+)
+_4D_EXEC_HDR_RE = re.compile(r"\b(?:conn|cur|cursor|db|session|pool|client|tx)\.(?:execute|executemany|query)\s*\(")
+_4D_EXEC_OP_RE = re.compile(
+    r"\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM|SELECT\b[\s\S]{1,100}?\bFROM|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?)\s+([a-zA-Z_][a-zA-Z0-9_]{2,})",
+    re.IGNORECASE,
+)
+_4D_JSX_HDR_RE = re.compile(r"^\{\s*([a-zA-Z0-9_!.?\s&=|]{3,45})\s*(?:&&|\?)\s*\(")
+_4D_WS_RE = re.compile(r"\s+")
+_4D_MAP_HDR_RE = re.compile(r"\{\s*([a-zA-Z_][\w.]*)\.map\s*\(")
+_4D_MAP_VIEW_RE = re.compile(r"(?:</[A-Za-z]|/>|<[A-Z])")
+
+_4D_ORM_RE = re.compile(
+    r"\b(?:prisma\.(\w+)\.(?:create|update|upsert|delete)|supabase\.from\(\s*['\"](\w+)['\"]\s*\)\.(?:insert|update|upsert|delete)|(\w+Store)\.setState)\b"
+)
+_4D_SQL_W_RE = re.compile(
+    r"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+([a-zA-Z_][a-zA-Z0-9_]{2,})\b",
+    re.IGNORECASE,
+)
+_4D_SQL_R_RE = re.compile(
+    r"\bSELECT\b[\s\S]{1,120}?\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]{2,})\b",
+    re.IGNORECASE,
+)
+_4D_CFG_KEY_RE = re.compile(r"['\"]([A-Z][A-Z0-9_]{2,40})['\"]")
+_4D_KV_RE = re.compile(
+    r"(?:getItem|setItem|removeItem|[a-zA-Z_][\w.]*\.(?:get|set|put|write|update|delete|setdefault|pop|setItem|getItem)|os\.getenv|getattr|setattr|[A-Z][A-Za-z0-9_]*(?:Attribute|Property|Descriptor))\(\s*['\"]([a-zA-Z0-9_.\-:]{2,40})['\"]"
+)
+_4D_DICT_K_RE = re.compile(
+    r"\b(?:[a-zA-Z_][\w.]*)\[\s*['\"]([a-zA-Z_][a-zA-Z0-9_.\-:]{2,40})['\"]\s*\](\s*=[^=])?"
+)
+_4D_EVT_W_RE = re.compile(r"\b(?:emit|publish|trigger|broadcast)\(\s*['\"]([a-zA-Z0-9_.:-]{3,40})['\"]")
+_4D_EVT_R_RE = re.compile(r"\b(?:on|once|subscribe|addEventListener|listen)\(\s*['\"]([a-zA-Z0-9_.:-]{3,40})['\"]")
+_4D_PY_ATTR_R_RE = re.compile(r"\b(?:self|cls|app|current_app|config|settings|request|session|g)\.([a-zA-Z_]\w*)\b(?!\s*\()")
+_4D_RAISE_RE = re.compile(r"\b(?:raise|throw\s+new|throw)\s+([A-Za-z_]\w*)")
+_4D_CATCH_RE = re.compile(r"\b(?:except|catch)\s*\(?([A-Za-z_]\w*)")
+_4D_STATUS_RE = re.compile(
+    r"\b(?:ApiError|HTTPException|status|status_code)\s*[\(=]\s*(?:status_code\s*=\s*)?(4\d\d|5\d\d)\b"
+    r"(?:\s*,\s*['\"]([a-zA-Z0-9_\-]+)['\"])?"
+)
+_4D_GUARD_RET_RE = re.compile(
+    r"\bif\b[^{:\n]*[:{]?\s*\n?\s*return\b(?:\s+(?:None|False|null|false|undefined|redirect\b))?"
+)
+_4D_REACTIVE_RE = re.compile(r"\b(?:useEffect|useLayoutEffect|onSnapshot|addEventListener|subscribe|on_event)\b")
+_4D_TIMER_RE = re.compile(r"\b(?:setTimeout|setInterval|requestAnimationFrame|asyncio\.sleep)\b")
+_4D_ASYNC_RE = re.compile(r"\b(?:async\s+def|async\s+function|async\s*\(|await\s+|Promise\.|\.then\()\b")
+_4D_JSX_COMP_RE = re.compile(r"<([A-Z][a-zA-Z0-9_]+)")
+_4D_W_CALLS_RE = re.compile(r"\b([a-z][a-zA-Z0-9_]{3,})\s*\(")
+_4D_SQL_INS_RE = re.compile(
+    r"\bINSERT\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]{2,})\s*\(([^)]+)\)\s*(?:VALUES|SELECT)\b",
+    re.IGNORECASE,
+)
+_4D_SQL_COL_RE = re.compile(r"^[a-zA-Z_][a-zA-Z0-9_]*$")
+_4D_DIALECT_INTERVAL_RE = re.compile(r"\binterval\s+'[^']+'", re.IGNORECASE)
+_4D_DIALECT_MAKE_INT_RE = re.compile(r"\bmake_interval\s*\(", re.IGNORECASE)
+_4D_DIALECT_ANY_RE = re.compile(r"=\s*ANY\s*\(\s*(?:%s|\$|\?)", re.IGNORECASE)
+_4D_DIALECT_ILIKE_RE = re.compile(r"\bILIKE\b")
+_4D_DIALECT_CAST_RE = re.compile(r"::(?:uuid|jsonb|timestamptz|inet|text\[\]|int\[\])\b", re.IGNORECASE)
+_4D_JSON_VAR_RE = re.compile(r"\b(?:const|let|var)\s+([a-zA-Z_]\w*)\s*=\s*await\s+\w+\.json\(\)")
+_4D_FETCH_RE = re.compile(
+    r"\bfetch\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?[`'\"](?:\$\{[^}]+\})?(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"](?:\s*,\s*\{([\s\S]{0,260}?)\})?"
+)
+_4D_FETCH_METHOD_RE = re.compile(r"\bmethod\s*:\s*['\"]([A-Za-z]+)['\"]")
+_4D_URL_PARAM_RE = re.compile(r"\$\{[^}]+\}|:[a-zA-Z_]\w*")
+_4D_HTTP_PY_RE = re.compile(
+    r"\b(?:requests|httpx)\.(get|post|put|delete|patch)\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?[`'\"](?:\$\{[^}]+\})?(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]",
+    re.IGNORECASE,
+)
+_4D_HTTP_JS_RE = re.compile(
+    r"\b(?:axios|api|client|http)\.(get|post|put|delete|patch)\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?[`'\"](?:\$\{[^}]+\})?(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]",
+    re.IGNORECASE,
+)
+_4D_FETCHONE_RE = re.compile(
+    r"\b([a-zA-Z_]\w*)\s*=\s*[\w.]+\.execute\(\s*(?:f?['\"]{1,3})\s*SELECT\s+([\s\S]+?)\s+FROM\s+([a-zA-Z_]\w*)\b[\s\S]*?\)\.fetchone\(\)",
+    re.IGNORECASE,
+)
+_4D_SQL_AS_RE = re.compile(r"\bAS\s+([a-zA-Z_]\w*)\s*$", re.IGNORECASE)
+_4D_RET_DICT_RE = re.compile(r"\breturn\s*\{([^{};]+)\}")
+_4D_DICT_KEY_COLON_RE = re.compile(r"['\"]([a-zA-Z_]\w*)['\"]\s*:")
+
+
 def extract_4d_coordinate_matrix(
     lines: list[str],
     line_start: int = 1,
@@ -760,91 +987,94 @@ def extract_4d_coordinate_matrix(
     n = len(lines)
     s_idx = max(0, line_start - 1)
     e_idx = min(n, line_end if line_end is not None else n)
+    ext_l = ext.lower()
 
     ast_span_by_start: dict[int, int] = {}
     ast_mutations_by_line: dict[int, list[str]] = {}
-    py_ast_contracts: dict[int, dict] = _analyze_python_ast_contracts(lines) if ext.lower() == ".py" else {}
+    py_ast_contracts: dict[int, dict] = _analyze_python_ast_contracts(lines) if ext_l == ".py" else {}
     js_ast_contracts: list[dict] = (
         _analyze_js_ts_ast_contracts(lines, ext)
-        if ext.lower() in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+        if ext_l in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
         else []
     )
-    parser = get_parser(ext.lower())
+    parser = get_parser(ext_l)
     if (tree is not None or parser is not None) and n > 0:
         try:
             if tree is None and parser is not None:
                 src_bytes = "\n".join(lines).encode("utf-8", errors="replace")
                 tree = parser.parse(src_bytes)
             stack = [tree.root_node]
-            _SPAN_NODE_TYPES = {
-                "function_declaration", "arrow_function", "function_definition",
-                "method_definition", "call_expression", "if_statement", "elif_clause",
-                "else_clause", "try_statement", "except_clause", "catch_clause",
-                "with_statement", "for_statement", "for_in_statement", "while_statement",
-                "match_statement", "case_clause", "switch_case", "switch_default",
-                "jsx_expression", "ternary_expression", "conditional_expression",
-            }
-            _ASSIGN_NODE_TYPES = {
-                "assignment_expression", "augmented_assignment_expression",
-                "update_expression", "assignment", "augmented_assignment",
-            }
             while stack:
                 nd = stack.pop()
                 nd_type = nd.type
-                s_ln = nd.start_point[0] + 1
-                e_ln = nd.end_point[0] + 1
-                if nd_type in _SPAN_NODE_TYPES and e_ln > s_ln:
-                    prev_e = ast_span_by_start.get(s_ln, 0)
-                    if (e_ln - s_ln) <= 2500 and e_ln > prev_e:
-                        ast_span_by_start[s_ln] = e_ln
-                if nd_type in _ASSIGN_NODE_TYPES:
+                if nd_type in _4D_SPAN_NODE_TYPES:
+                    s_ln = nd.start_point[0] + 1
+                    e_ln = nd.end_point[0] + 1
+                    if e_ln > s_ln:
+                        prev_e = ast_span_by_start.get(s_ln, 0)
+                        if (e_ln - s_ln) <= 2500 and e_ln > prev_e:
+                            ast_span_by_start[s_ln] = e_ln
+                elif nd_type in _4D_ASSIGN_NODE_TYPES:
+                    s_ln = nd.start_point[0] + 1
                     lhs = nd.child_by_field_name("left") or (nd.children[0] if nd.children else None)
                     if lhs is not None:
                         lhs_txt = lhs.text.decode("utf-8", errors="replace").strip()
-                        m_prop = re.match(r"^(?:self|this|state|store|draft|window|globalThis)\.([a-zA-Z_]\w*)", lhs_txt)
+                        m_prop = _4D_PROP_LHS_RE.match(lhs_txt)
                         if m_prop:
                             prop_name = m_prop.group(1)
                             if not prop_name.startswith("_"):
                                 ast_mutations_by_line.setdefault(s_ln, []).append(prop_name)
-                if nd.children:
-                    stack.extend(nd.children)
+                if nd.named_child_count:
+                    stack.extend(c for c in nd.named_children if c.named_child_count)
         except Exception:
             pass
 
     state_vars: dict[str, str] = {}
-    for ln in lines:
-        for m_st in re.finditer(r"const\s+\[\s*(\w+)\s*,\s*(\w+)\s*\]\s*=\s*useState", ln):
-            state_vars[m_st.group(1)] = m_st.group(2)
-        for m_rf in re.finditer(r"const\s+(\w+)\s*=\s*useRef\b", ln):
-            rv = m_rf.group(1)
-            state_vars[rv] = f"{rv}\\.current\\s*="
-        for m_py in re.finditer(r"\bself\.([a-zA-Z_]\w*)\s*=", ln):
-            pv = m_py.group(1)
-            if not pv.startswith("_"):
-                state_vars[pv] = f"self\\.{pv}\\s*="
-        m_hk = re.search(r"const\s+\{([^}]+)\}\s*=\s*(?:use[A-Z]\w*|useStore)\s*\(", ln)
-        if m_hk:
-            for raw_tok in m_hk.group(1).split(","):
-                tok = raw_tok.split(":")[-1].split("=")[0].strip()
-                if not re.match(r"^[a-zA-Z_]\w*$", tok):
-                    continue
-                m_act = re.match(r"^(?:set|update|add|remove|delete|toggle|clear|reset|mark)([A-Z]\w*)$", tok)
+    self_writes_by_line: dict[int, list[str]] = {}
+    file_has_sql = False
+    file_has_orm = False
+    for ln_idx, ln in enumerate(lines, 1):
+        if not file_has_sql and any(kw in ln or kw.lower() in ln for kw in ("SELECT ", "INSERT ", "UPDATE ", "DELETE ", "INTERVAL ")):
+            file_has_sql = True
+        if not file_has_orm and ("prisma." in ln or "supabase." in ln or ".setState" in ln):
+            file_has_orm = True
+        if "useState" in ln:
+            for m_st in _4D_USESTATE_RE.finditer(ln):
+                state_vars[m_st.group(1)] = m_st.group(2)
+        if "useRef" in ln:
+            for m_rf in _4D_USEREF_RE.finditer(ln):
+                rv = m_rf.group(1)
+                state_vars[rv] = f"{rv}\\.current\\s*="
+        if "self." in ln and "=" in ln:
+            for m_py in _4D_SELF_ATTR_RE.finditer(ln):
+                pv = m_py.group(1)
+                if not pv.startswith("_"):
+                    state_vars.setdefault(pv, "__self_attr__")
+                    self_writes_by_line.setdefault(ln_idx, []).append(pv)
+        if "const" in ln and "use" in ln:
+            m_hk = _4D_USEHOOK_RE.search(ln)
+            if m_hk:
+                for raw_tok in m_hk.group(1).split(","):
+                    tok = raw_tok.split(":")[-1].split("=")[0].strip()
+                    if not _4D_IDENT_FULL_RE.match(tok):
+                        continue
+                    m_act = _4D_HOOK_ACT_RE.match(tok)
+                    if m_act:
+                        target_k = m_act.group(1)[0].lower() + m_act.group(1)[1:]
+                        state_vars[target_k] = tok
+                    elif tok == "dispatch":
+                        state_vars["dispatch"] = "dispatch"
+                    elif tok not in state_vars:
+                        state_vars[tok] = f"__readonly_{tok}__"
+            m_zs = _4D_ZUSTAND_RE.search(ln)
+            if m_zs:
+                local_nm = m_zs.group(1)
+                m_act = _4D_ZUSTAND_ACT_RE.match(local_nm)
                 if m_act:
                     target_k = m_act.group(1)[0].lower() + m_act.group(1)[1:]
-                    state_vars[target_k] = tok
-                elif tok == "dispatch":
-                    state_vars["dispatch"] = "dispatch"
-                elif tok not in state_vars:
-                    state_vars[tok] = f"__readonly_{tok}__"
-        m_zs = re.search(r"const\s+(\w+)\s*=\s*use\w*Store\s*\([^)]*=>\s*\w+\.(\w+)", ln)
-        if m_zs:
-            local_nm = m_zs.group(1)
-            m_act = re.match(r"^(?:set|update|add|remove|delete|toggle|clear|reset)([A-Z]\w*)$", local_nm)
-            if m_act:
-                target_k = m_act.group(1)[0].lower() + m_act.group(1)[1:]
-                state_vars[target_k] = local_nm
-            elif local_nm not in state_vars:
-                state_vars[local_nm] = f"__readonly_{local_nm}__"
+                    state_vars[target_k] = local_nm
+                elif local_nm not in state_vars:
+                    state_vars[local_nm] = f"__readonly_{local_nm}__"
 
     def _py_block_end(start_i: int, max_scan: int = 400) -> int:
         base_ind = len(lines[start_i]) - len(lines[start_i].lstrip())
@@ -868,22 +1098,19 @@ def extract_4d_coordinate_matrix(
             i += 1
             continue
 
-        m_ct = re.search(
-            r"\bCREATE\s+TABLE\s+(?:IF\s+NOT\s+EXISTS\s+)?(?:[a-zA-Z_]\w*\.)?[\"`]?([a-zA-Z_][a-zA-Z0-9_]*)[\"`]?\s*\(",
-            st,
-            re.IGNORECASE,
-        )
-        if m_ct:
-            tbl_nm = m_ct.group(1)
-            end_i = _find_balanced_end(lines, i, "(", ")", max_scan=120)
-            raw_blocks.append(("SCHEMA", f"table:{tbl_nm}", lnum, end_i + 1))
-            i = end_i + 1
-            continue
-        if re.search(r"\buse(?:State|Ref)\s*(?:<[^>]*>)?\s*\(", st):
+        if ("CREATE" in st or "create" in st) and ("TABLE" in st or "table" in st):
+            m_ct = _4D_CREATE_TBL_RE.search(st)
+            if m_ct:
+                tbl_nm = m_ct.group(1)
+                end_i = _find_balanced_end(lines, i, "(", ")", max_scan=120)
+                raw_blocks.append(("SCHEMA", f"table:{tbl_nm}", lnum, end_i + 1))
+                i = end_i + 1
+                continue
+        if "use" in st and "(" in st and _4D_USESTATE_CALL_RE.search(st):
             b_start = lnum
             while i + 1 < e_idx:
                 nxt = lines[i + 1].strip()
-                if re.search(r"\buse(?:State|Ref)\b", nxt) or not nxt or nxt.startswith("//"):
+                if (nxt and "use" in nxt and _4D_USESTATE_NXT_RE.search(nxt)) or not nxt or nxt.startswith("//"):
                     i += 1
                 else:
                     break
@@ -891,85 +1118,82 @@ def extract_4d_coordinate_matrix(
             i += 1
             continue
 
-        m_st_decl = re.match(
-            r"^([A-Z][A-Z0-9_]{2,}|[a-z_][a-z0-9_]*)\s*(?::\s*[^=]+)?=\s*(?:([A-Z][A-Za-z0-9_]*|[a-z_][a-z0-9_]*)\s*\(|(\{))",
-            st,
-        )
-        if m_st_decl and len(lines[i]) - len(lines[i].lstrip()) <= 4:
-            attr_nm = m_st_decl.group(1)
-            rhs_fn = m_st_decl.group(2) or ""
-            has_upper_cfg_str = bool(re.search(r"['\"][A-Z][A-Z0-9_]{2,40}['\"]", st))
-            is_descriptor_call = bool(
-                rhs_fn
-                and (
-                    has_upper_cfg_str
-                    or rhs_fn.endswith(("Attribute", "Property", "Descriptor", "Field", "Column", "Dict"))
-                    or rhs_fn in ("field", "column", "mapped_column", "property")
+        if "=" in st and (len(ln) - len(ln.lstrip()) <= 4):
+            m_st_decl = _4D_ST_DECL_RE.match(st)
+            if m_st_decl:
+                attr_nm = m_st_decl.group(1)
+                rhs_fn = m_st_decl.group(2) or ""
+                has_upper_cfg_str = bool(_4D_UPPER_CFG_STR_RE.search(st))
+                is_descriptor_call = bool(
+                    rhs_fn
+                    and (
+                        has_upper_cfg_str
+                        or rhs_fn.endswith(("Attribute", "Property", "Descriptor", "Field", "Column", "Dict"))
+                        or rhs_fn in ("field", "column", "mapped_column", "property")
+                    )
                 )
-            )
-            if attr_nm.isupper() or "config" in attr_nm.lower() or is_descriptor_call:
-                if "{" in st and "}" not in st:
-                    end_i = _find_balanced_end(lines, i, "{", "}", max_scan=90)
-                elif "(" in st and ")" not in st:
-                    end_i = _find_balanced_end(lines, i, "(", ")", max_scan=90)
-                else:
-                    end_i = i
-                raw_blocks.append(("STATE", f"state:{attr_nm}", lnum, end_i + 1))
-                i = end_i + 1
+                if attr_nm.isupper() or "config" in attr_nm.lower() or is_descriptor_call:
+                    if "{" in st and "}" not in st:
+                        end_i = _find_balanced_end(lines, i, "{", "}", max_scan=90)
+                    elif "(" in st and ")" not in st:
+                        end_i = _find_balanced_end(lines, i, "(", ")", max_scan=90)
+                    else:
+                        end_i = i
+                    raw_blocks.append(("STATE", f"state:{attr_nm}", lnum, end_i + 1))
+                    i = end_i + 1
+                    continue
+
+        if "use" in st and "(" in st:
+            m_eff = _4D_EFF_RE.search(st)
+            if m_eff:
+                kind = m_eff.group(1)
+                end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _find_balanced_end(lines, i, "(", ")", max_scan=300)
+                tail = " ".join(lines[max(i, end_i - 3) : end_i + 1])
+                m_deps = _4D_DEPS_RE.search(tail)
+                deps = m_deps.group(1).strip() if m_deps else ""
+                role = "EFFECT" if "Effect" in kind else "ACTION"
+                raw_blocks.append((role, f"{kind}[{deps[:36]}]", lnum, end_i + 1))
+                i = (end_i + 1) if (end_i - i) < 12 else (i + 1)
                 continue
 
-        m_eff = re.search(r"\b(useEffect|useLayoutEffect|useMemo|useCallback)\s*\(", st)
-        if m_eff:
-            kind = m_eff.group(1)
-            end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _find_balanced_end(lines, i, "(", ")", max_scan=300)
-            tail = " ".join(lines[max(i, end_i - 3) : end_i + 1])
-            m_deps = re.search(r"\[([^\]]*)\]\s*\)", tail)
-            deps = m_deps.group(1).strip() if m_deps else ""
-            role = "EFFECT" if "Effect" in kind else "ACTION"
-            raw_blocks.append((role, f"{kind}[{deps[:36]}]", lnum, end_i + 1))
-            i = (end_i + 1) if (end_i - i) < 12 else (i + 1)
-            continue
+        if st.startswith("case"):
+            m_case = _4D_CASE_HDR_RE.match(st)
+            if m_case:
+                case_labels = _4D_CASE_LBL_RE.findall(st)
+                while i + 1 < e_idx and _4D_CASE_NXT_RE.match(lines[i + 1].strip()):
+                    i += 1
+                    case_labels.extend(_4D_CASE_LBL_RE.findall(lines[i].strip()))
+                lbl_str = "|".join(c.strip("'\"") for c in case_labels[:3])
+                b_depth = 0
+                p_depth = 0
+                end_i = i
+                for k in range(i, min(e_idx, i + 2500)):
+                    k_st = lines[k].strip()
+                    if k > i and b_depth == 0 and p_depth == 0 and (
+                        k_st.startswith(("case", "default")) and _4D_CASE_BRK_RE.match(k_st)
+                    ):
+                        end_i = k - 1
+                        break
+                    for ch in k_st:
+                        if ch == "{":
+                            b_depth += 1
+                        elif ch == "}":
+                            b_depth -= 1
+                        elif ch == "(":
+                            p_depth += 1
+                        elif ch == ")":
+                            p_depth -= 1
+                    if b_depth < 0:
+                        end_i = max(i, k - 1)
+                        break
+                    end_i = k
+                sample = "\n".join(lines[lnum - 1 : min(end_i + 1, lnum + 35)])
+                role = "VIEW" if ("<" in sample or "return" in sample) else "ACTION"
+                raw_blocks.append((role, f"case:{lbl_str}", lnum, end_i + 1))
+                i = max(i + 1, end_i + 1 if (end_i - i) <= 120 else i + 1)
+                continue
 
-        m_case = re.match(r"^(?:case\s+(['\"][^'\"]+['\"]|[a-zA-Z0-9_$.]+)\s*:)+", st)
-        if m_case:
-            case_labels = re.findall(r"case\s+(['\"][^'\"]+['\"]|[a-zA-Z0-9_$.]+)\s*:", st)
-            while i + 1 < e_idx and re.match(r"^case\s+(['\"][^'\"]+['\"]|[a-zA-Z0-9_$.]+)\s*:", lines[i + 1].strip()):
-                i += 1
-                case_labels.extend(re.findall(r"case\s+(['\"][^'\"]+['\"]|[a-zA-Z0-9_$.]+)\s*:", lines[i].strip()))
-            lbl_str = "|".join(c.strip("'\"") for c in case_labels[:3])
-            b_depth = 0
-            p_depth = 0
-            end_i = i
-            for k in range(i, min(e_idx, i + 2500)):
-                k_st = lines[k].strip()
-                if k > i and b_depth == 0 and p_depth == 0 and (
-                    re.match(r"^(?:case\s+|default\s*:)", k_st)
-                ):
-                    end_i = k - 1
-                    break
-                for ch in k_st:
-                    if ch == "{":
-                        b_depth += 1
-                    elif ch == "}":
-                        b_depth -= 1
-                    elif ch == "(":
-                        p_depth += 1
-                    elif ch == ")":
-                        p_depth -= 1
-                if b_depth < 0:
-                    end_i = max(i, k - 1)
-                    break
-                end_i = k
-            sample = "\n".join(lines[lnum - 1 : min(end_i + 1, lnum + 35)])
-            role = "VIEW" if ("<" in sample or "return" in sample) else "ACTION"
-            raw_blocks.append((role, f"case:{lbl_str}", lnum, end_i + 1))
-            i = max(i + 1, end_i + 1 if (end_i - i) <= 120 else i + 1)
-            continue
-
-        m_fn = re.match(
-            r"^(?:export\s+)?(?:async\s+)?(?:function|def)\s+([a-zA-Z_]\w*)|^(?:export\s+)?const\s+([a-zA-Z_]\w*)\s*=\s*(?:async\s*)?\([^)]*\)\s*(?::\s*[^=]+)?=>\s*\{|^(?:public\s+|private\s+|protected\s+)?(?:async\s+)?([a-zA-Z_]\w*)\s*\([^;]*\)\s*(?::\s*[^{]+)?\{",
-            st,
-        )
+        m_fn = _4D_FN_HDR_RE.match(st) if ("(" in st or "def " in st) else None
         if m_fn:
             fn_name = m_fn.group(1) or m_fn.group(2) or m_fn.group(3)
             if fn_name not in ("if", "for", "while", "switch", "catch", "constructor"):
@@ -980,13 +1204,9 @@ def extract_4d_coordinate_matrix(
                 span = (end_i + 1) - lnum
                 if span <= 200:
                     body_txt = "\n".join(lines[i : end_i + 1])
-                    if re.search(
-                        r"\b(?:fetch|axios|setItem|getItem|[a-z]+Doc|execute|commit|prisma|supabase|dispatch|requests\.|httpx\.|aiohttp\.|redis\.|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|SELECT\s+|\w+\.(?:set|put|write|save|update|upsert)\s*\()\b",
-                        body_txt,
-                        re.IGNORECASE,
-                    ):
+                    if _4D_FN_IO_RE.search(body_txt):
                         role = "IO"
-                    elif re.search(r"(?:</[A-Za-z]|/>)", body_txt) and "return" in body_txt:
+                    elif "<" in body_txt and "return" in body_txt and _4D_FN_VIEW_RE.search(body_txt):
                         role = "VIEW"
                     else:
                         role = "ACTION"
@@ -994,7 +1214,7 @@ def extract_4d_coordinate_matrix(
                     i = (end_i + 1) if span < 8 else (i + 1)
                     continue
 
-        m_if = re.match(r"^(?:\}\s*)?(?:else\s+if|elif|if)\s*\(?([^):{]{3,75})\)?\s*[{:]\s*(?:#.*)?$", st)
+        m_if = _4D_IF_HDR_RE.match(st) if ("if" in st and (st.endswith(("{", ":")) or "#" in st)) else None
         if m_if:
             cond = m_if.group(1).strip()
             if st.endswith("{"):
@@ -1008,11 +1228,7 @@ def extract_4d_coordinate_matrix(
             span = (end_i + 1) - lnum
             if 4 <= span <= 220:
                 sample = "\n".join(lines[i : min(end_i + 1, i + 30)])
-                if re.search(
-                    r"\b(?:fetch|axios|setItem|getItem|execute|commit|prisma|supabase|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|SELECT\s+)\b",
-                    sample,
-                    re.IGNORECASE,
-                ):
+                if _4D_IF_IO_RE.search(sample):
                     role = "IO"
                 elif "<" in sample and "return" in sample:
                     role = "VIEW"
@@ -1022,41 +1238,39 @@ def extract_4d_coordinate_matrix(
                 i = (end_i + 1) if span <= 5 else (i + 1)
                 continue
 
-        m_with = re.match(r"^(?:async\s+)?with\s+([^:]{3,65}):\s*(?:#.*)?$", st)
-        if m_with:
-            ctx_expr = m_with.group(1).strip()
-            end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _py_block_end(i, max_scan=250)
-            span = (end_i + 1) - lnum
-            if 3 <= span <= 220:
-                sample = "\n".join(lines[i : min(end_i + 1, i + 30)])
-                role = "IO" if re.search(r"\b(?:tx|db|conn|cursor|open|lock|session|execute|INSERT\s+INTO|UPDATE\s+|SELECT\s+)\b", sample, re.IGNORECASE) else "ACTION"
-                raw_blocks.append((role, f"with[{ctx_expr[:36]}]", lnum, end_i + 1))
-                i = i + 1
-                continue
+        if st.startswith(("with", "async")) and ":" in st:
+            m_with = _4D_WITH_HDR_RE.match(st)
+            if m_with:
+                ctx_expr = m_with.group(1).strip()
+                end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _py_block_end(i, max_scan=250)
+                span = (end_i + 1) - lnum
+                if 3 <= span <= 220:
+                    sample = "\n".join(lines[i : min(end_i + 1, i + 30)])
+                    role = "IO" if _4D_WITH_IO_RE.search(sample) else "ACTION"
+                    raw_blocks.append((role, f"with[{ctx_expr[:36]}]", lnum, end_i + 1))
+                    i = i + 1
+                    continue
 
-        m_try = re.match(r"^(?:try\s*[:{]|(?:except|catch)\s*\(?([^):{]{0,50})\)?\s*[:{])\s*(?:#.*)?$", st)
-        if m_try:
-            is_catch = st.startswith(("except", "catch"))
-            end_i = _find_balanced_end(lines, i, "{", "}", max_scan=200) if st.endswith("{") else _py_block_end(i, max_scan=200)
-            span = (end_i + 1) - lnum
-            if 3 <= span <= 180:
-                sample = "\n".join(lines[i : min(end_i + 1, i + 25)])
-                role = "IO" if re.search(r"\b(?:execute|commit|INSERT\s+INTO|UPDATE\s+|DELETE\s+FROM|SELECT\s+|fetch|axios)\b", sample, re.IGNORECASE) else "ACTION"
-                lbl = f"catch[{(m_try.group(1) or 'all').strip()[:32]}]" if is_catch else "try_block"
-                raw_blocks.append((role, lbl, lnum, end_i + 1))
-                i = (end_i + 1) if (is_catch and span <= 6) else (i + 1)
-                continue
+        if st.startswith(("try", "except", "catch")):
+            m_try = _4D_TRY_HDR_RE.match(st)
+            if m_try:
+                is_catch = st.startswith(("except", "catch"))
+                end_i = _find_balanced_end(lines, i, "{", "}", max_scan=200) if st.endswith("{") else _py_block_end(i, max_scan=200)
+                span = (end_i + 1) - lnum
+                if 3 <= span <= 180:
+                    sample = "\n".join(lines[i : min(end_i + 1, i + 25)])
+                    role = "IO" if _4D_TRY_IO_RE.search(sample) else "ACTION"
+                    lbl = f"catch[{(m_try.group(1) or 'all').strip()[:32]}]" if is_catch else "try_block"
+                    raw_blocks.append((role, lbl, lnum, end_i + 1))
+                    i = (end_i + 1) if (is_catch and span <= 6) else (i + 1)
+                    continue
 
-        if re.search(r"\b(?:conn|cur|cursor|db|session|pool|client|tx)\.(?:execute|executemany|query)\s*\(", st):
+        if "." in st and "(" in st and _4D_EXEC_HDR_RE.search(st):
             end_i = _find_balanced_end(lines, i, "(", ")", max_scan=80)
             span = (end_i + 1) - lnum
             if 2 <= span <= 80:
                 sql_sample = "\n".join(lines[i : end_i + 1])
-                m_op = re.search(
-                    r"\b(INSERT\s+INTO|UPDATE|DELETE\s+FROM|SELECT\b[\s\S]{1,100}?\bFROM|CREATE\s+TABLE(?:\s+IF\s+NOT\s+EXISTS)?)\s+([a-zA-Z_][a-zA-Z0-9_]{2,})",
-                    sql_sample,
-                    re.IGNORECASE,
-                )
+                m_op = _4D_EXEC_OP_RE.search(sql_sample)
                 if m_op:
                     raw_verb = m_op.group(1).strip().upper()
                     verb = "SELECT" if raw_verb.startswith("SELECT") else raw_verb.split()[0]
@@ -1065,286 +1279,304 @@ def extract_4d_coordinate_matrix(
                     i = end_i + 1
                     continue
 
-        m_jsx = re.match(r"^\{\s*([a-zA-Z0-9_!.?\s&=|]{3,45})\s*(?:&&|\?)\s*\(", st)
-        if m_jsx:
-            cond = re.sub(r"\s+", " ", m_jsx.group(1).strip())
-            end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _find_balanced_end(lines, i, "{", "}", max_scan=350)
-            if 5 <= (end_i + 1 - lnum) <= 160:
-                raw_blocks.append(("VIEW", f"jsx[{cond[:36]}]", lnum, end_i + 1))
-                i = end_i + 1
-                continue
-
-        m_map = re.search(r"\{\s*([a-zA-Z_][\w.]*)\.map\s*\(", st)
-        if m_map:
-            arr_nm = m_map.group(1)
-            end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _find_balanced_end(lines, i, "{", "}", max_scan=220)
-            span_m = (end_i + 1) - lnum
-            if 4 <= span_m <= 180:
-                sample_m = "\n".join(lines[i : min(end_i + 1, i + 25)])
-                if re.search(r"(?:</[A-Za-z]|/>|<[A-Z])", sample_m):
-                    raw_blocks.append(("VIEW", f"jsx[{arr_nm}.map]", lnum, end_i + 1))
+        if st.startswith("{") and "(" in st:
+            m_jsx = _4D_JSX_HDR_RE.match(st)
+            if m_jsx:
+                cond = _4D_WS_RE.sub(" ", m_jsx.group(1).strip())
+                end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _find_balanced_end(lines, i, "{", "}", max_scan=350)
+                if 5 <= (end_i + 1 - lnum) <= 160:
+                    raw_blocks.append(("VIEW", f"jsx[{cond[:36]}]", lnum, end_i + 1))
                     i = end_i + 1
                     continue
 
+        if "{" in st and ".map" in st:
+            m_map = _4D_MAP_HDR_RE.search(st)
+            if m_map:
+                arr_nm = m_map.group(1)
+                end_i = (ast_span_by_start[lnum] - 1) if lnum in ast_span_by_start else _find_balanced_end(lines, i, "{", "}", max_scan=220)
+                span_m = (end_i + 1) - lnum
+                if 4 <= span_m <= 180:
+                    sample_m = "\n".join(lines[i : min(end_i + 1, i + 25)])
+                    if _4D_MAP_VIEW_RE.search(sample_m):
+                        raw_blocks.append(("VIEW", f"jsx[{arr_nm}.map]", lnum, end_i + 1))
+                        i = end_i + 1
+                        continue
+
         i += 1
 
+    # Pre-compile non-self state_vars once per file; use O(1) set intersection per block
+    setter_specs: list[tuple[str, str, re.Pattern[str] | None]] = []
+    state_var_order: list[str] = list(state_vars.keys())
+    state_var_set: set[str] = set(state_var_order)
+    for var, setter_pat in state_vars.items():
+        if setter_pat in ("__self_attr__", f"__readonly_{var}__") or setter_pat.startswith("__readonly_"):
+            continue
+        if _4D_SIMPLE_IDENT_RE.match(setter_pat):
+            setter_specs.append((var, setter_pat, None))
+        else:
+            setter_specs.append((var, var, re.compile(rf"\b{setter_pat}\b")))
+
+    http_client_rx = _4D_HTTP_PY_RE if ext_l == ".py" else _4D_HTTP_JS_RE
     cells: list[dict] = []
     for role, scope, s, e in raw_blocks:
         chunk = "\n".join(lines[s - 1 : e])
+        chunk_words = set(_4D_WORD_RE.findall(chunk))
+        has_quotes = ("'" in chunk) or ('"' in chunk)
+        has_paren = "(" in chunk
+        up_chunk = chunk.upper() if file_has_sql else ""
+
         z_write: list[str] = []
-        z_read: list[str] = []
-        for var, setter_pat in state_vars.items():
-            if not setter_pat.startswith("__readonly_") and re.search(rf"\b{setter_pat}\b", chunk):
-                z_write.append(var)
-            elif re.search(rf"\b{var}\b", chunk):
-                z_read.append(var)
+        z_write_set: set[str] = set()
         for ln_no in range(s, e + 1):
-            for ast_w in ast_mutations_by_line.get(ln_no, []):
-                if ast_w not in z_write:
+            for sw in self_writes_by_line.get(ln_no, ()):
+                if sw not in z_write_set:
+                    z_write_set.add(sw)
+                    z_write.append(sw)
+        if setter_specs:
+            for var, setter_anchor, setter_rx in setter_specs:
+                if setter_anchor in chunk_words and (setter_rx is None or setter_rx.search(chunk)):
+                    if var not in z_write_set:
+                        z_write_set.add(var)
+                        z_write.append(var)
+        z_read: list[str] = []
+        if state_var_set and (chunk_words & state_var_set):
+            for var in state_var_order:
+                if var in chunk_words and var not in z_write_set:
+                    z_read.append(var)
+        for ln_no in range(s, e + 1):
+            for ast_w in ast_mutations_by_line.get(ln_no, ()):
+                if ast_w not in z_write_set:
+                    z_write_set.add(ast_w)
                     z_write.append(ast_w)
-        for m_orm in re.finditer(
-            r"\b(?:prisma\.(\w+)\.(?:create|update|upsert|delete)|supabase\.from\(\s*['\"](\w+)['\"]\s*\)\.(?:insert|update|upsert|delete)|(\w+Store)\.setState)\b",
-            chunk,
-        ):
-            orm_target = m_orm.group(1) or m_orm.group(2) or m_orm.group(3)
-            if orm_target and orm_target not in z_write:
-                z_write.append(orm_target)
-        for m_sql_w in re.finditer(
-            r"\b(?:INSERT\s+INTO|UPDATE|DELETE\s+FROM)\s+([a-zA-Z_][a-zA-Z0-9_]{2,})\b",
-            chunk,
-            re.IGNORECASE,
-        ):
-            tbl = m_sql_w.group(1)
-            if tbl.lower() not in ("set", "values", "where", "table") and tbl not in z_write:
-                z_write.append(tbl)
-        for m_sql_r in re.finditer(
-            r"\bSELECT\b[\s\S]{1,120}?\bFROM\s+([a-zA-Z_][a-zA-Z0-9_]{2,})\b",
-            chunk,
-            re.IGNORECASE,
-        ):
-            tbl = m_sql_r.group(1)
-            if tbl not in z_write and tbl not in z_read:
-                z_read.append(tbl)
+        if file_has_orm and ("prisma." in chunk or "supabase." in chunk or ".setState" in chunk):
+            for m_orm in _4D_ORM_RE.finditer(chunk):
+                orm_target = m_orm.group(1) or m_orm.group(2) or m_orm.group(3)
+                if orm_target and orm_target not in z_write:
+                    z_write.append(orm_target)
+        if "INSERT" in up_chunk or "UPDATE" in up_chunk or "DELETE" in up_chunk:
+            for m_sql_w in _4D_SQL_W_RE.finditer(chunk):
+                tbl = m_sql_w.group(1)
+                if tbl.lower() not in ("set", "values", "where", "table") and tbl not in z_write:
+                    z_write.append(tbl)
+        if "SELECT" in up_chunk and "FROM" in up_chunk:
+            for m_sql_r in _4D_SQL_R_RE.finditer(chunk):
+                tbl = m_sql_r.group(1)
+                if tbl not in z_write and tbl not in z_read:
+                    z_read.append(tbl)
         if role == "STATE" and scope.startswith("state:"):
             st_attr = scope.split(":", 1)[1]
             if st_attr not in z_write:
                 z_write.append(st_attr)
-            for m_cfg_k in re.finditer(r"['\"]([A-Z][A-Z0-9_]{2,40})['\"]", chunk):
-                cfg_k = m_cfg_k.group(1)
-                if cfg_k not in z_write:
-                    z_write.append(cfg_k)
-        for m_kv in re.finditer(
-            r"(?:getItem|setItem|removeItem|[a-zA-Z_][\w.]*\.(?:get|set|put|write|update|delete|setdefault|pop|setItem|getItem)|os\.getenv|getattr|setattr|[A-Z][A-Za-z0-9_]*(?:Attribute|Property|Descriptor))\(\s*['\"]([a-zA-Z0-9_.\-:]{2,40})['\"]",
-            chunk,
-        ):
-            k_name = m_kv.group(1)
-            full_m = m_kv.group(0)
-            if any(w in full_m for w in (".set", "setItem", "removeItem", ".put", ".write", ".update", ".delete", "setattr", "Attribute(", "Property(", "Descriptor(")):
-                if k_name not in z_write:
-                    z_write.append(k_name)
-            elif k_name not in z_read:
-                z_read.append(k_name)
-        for m_dk in re.finditer(
-            r"\b(?:[a-zA-Z_][\w.]*)\[\s*['\"]([a-zA-Z_][a-zA-Z0-9_.\-:]{2,40})['\"]\s*\](\s*=[^=])?",
-            chunk,
-        ):
-            k_name = m_dk.group(1)
-            is_assign = bool(m_dk.group(2))
-            if is_assign:
-                if k_name not in z_write:
-                    z_write.append(k_name)
-            elif k_name not in z_write and k_name not in z_read:
-                z_read.append(k_name)
-        for m_ev_w in re.finditer(r"\b(?:emit|publish|trigger|broadcast)\(\s*['\"]([a-zA-Z0-9_.:-]{3,40})['\"]", chunk):
-            ev_key = f"evt:{m_ev_w.group(1)}"
-            if ev_key not in z_write:
-                z_write.append(ev_key)
-        for m_ev_r in re.finditer(r"\b(?:on|once|subscribe|addEventListener|listen)\(\s*['\"]([a-zA-Z0-9_.:-]{3,40})['\"]", chunk):
-            ev_key = f"evt:{m_ev_r.group(1)}"
-            if ev_key not in z_read:
-                z_read.append(ev_key)
-        for m_py_r in re.finditer(r"\b(?:self|cls|app|current_app|config|settings|request|session|g)\.([a-zA-Z_]\w*)\b(?!\s*\()", chunk):
-            attr = m_py_r.group(1)
-            if not attr.startswith("_") and attr not in z_write and attr not in z_read:
-                z_read.append(attr)
+            if has_quotes:
+                for m_cfg_k in _4D_CFG_KEY_RE.finditer(chunk):
+                    cfg_k = m_cfg_k.group(1)
+                    if cfg_k not in z_write:
+                        z_write.append(cfg_k)
+        if has_quotes and has_paren:
+            for m_kv in _4D_KV_RE.finditer(chunk):
+                k_name = m_kv.group(1)
+                full_m = m_kv.group(0)
+                if any(w in full_m for w in (".set", "setItem", "removeItem", ".put", ".write", ".update", ".delete", "setattr", "Attribute(", "Property(", "Descriptor(")):
+                    if k_name not in z_write:
+                        z_write.append(k_name)
+                elif k_name not in z_read:
+                    z_read.append(k_name)
+        if has_quotes and "[" in chunk:
+            for m_dk in _4D_DICT_K_RE.finditer(chunk):
+                k_name = m_dk.group(1)
+                is_assign = bool(m_dk.group(2))
+                if is_assign:
+                    if k_name not in z_write:
+                        z_write.append(k_name)
+                elif k_name not in z_write and k_name not in z_read:
+                    z_read.append(k_name)
+        if has_quotes and has_paren:
+            if chunk_words & {"emit", "publish", "trigger", "broadcast"}:
+                for m_ev_w in _4D_EVT_W_RE.finditer(chunk):
+                    ev_key = f"evt:{m_ev_w.group(1)}"
+                    if ev_key not in z_write:
+                        z_write.append(ev_key)
+            if chunk_words & {"on", "once", "subscribe", "addEventListener", "listen"}:
+                for m_ev_r in _4D_EVT_R_RE.finditer(chunk):
+                    ev_key = f"evt:{m_ev_r.group(1)}"
+                    if ev_key not in z_read:
+                        z_read.append(ev_key)
+        if "." in chunk and (chunk_words & {"self", "cls", "app", "current_app", "config", "settings", "request", "session", "g"}):
+            for m_py_r in _4D_PY_ATTR_R_RE.finditer(chunk):
+                attr = m_py_r.group(1)
+                if not attr.startswith("_") and attr not in z_write and attr not in z_read:
+                    z_read.append(attr)
 
         e_exit: list[str] = []
-        for m_ex in re.finditer(r"\b(?:raise|throw\s+new|throw)\s+([A-Za-z_]\w*)", chunk):
-            exc = m_ex.group(1)
-            if exc not in ("new", "return", "from") and f"throw:{exc}" not in e_exit:
-                e_exit.append(f"throw:{exc}")
-        for m_ct in re.finditer(r"\b(?:except|catch)\s*\(?([A-Za-z_]\w*)", chunk):
-            exc = m_ct.group(1)
-            if exc not in ("as",) and f"catch:{exc}" not in e_exit:
-                e_exit.append(f"catch:{exc}")
-        for m_st in re.finditer(
-            r"\b(?:ApiError|HTTPException|status|status_code)\s*[\(=]\s*(?:status_code\s*=\s*)?(4\d\d|5\d\d)\b"
-            r"(?:\s*,\s*['\"]([a-zA-Z0-9_\-]+)['\"])?",
-            chunk,
-        ):
-            st_code = f"status:{m_st.group(1)}"
-            if st_code not in e_exit:
-                e_exit.append(st_code)
-            if m_st.group(2):
-                err_tag = f"err:{m_st.group(2).lower()}"
-                if err_tag not in e_exit:
-                    e_exit.append(err_tag)
-        if re.search(r"\bif\b[^{:\n]*[:{]?\s*\n?\s*return\b(?:\s+(?:None|False|null|false|undefined|redirect\b))?", chunk):
+        if "raise" in chunk_words or "throw" in chunk_words:
+            for m_ex in _4D_RAISE_RE.finditer(chunk):
+                exc = m_ex.group(1)
+                if exc not in ("new", "return", "from") and f"throw:{exc}" not in e_exit:
+                    e_exit.append(f"throw:{exc}")
+        if "except" in chunk_words or "catch" in chunk_words:
+            for m_ct in _4D_CATCH_RE.finditer(chunk):
+                exc = m_ct.group(1)
+                if exc not in ("as",) and f"catch:{exc}" not in e_exit:
+                    e_exit.append(f"catch:{exc}")
+        if ("4" in chunk or "5" in chunk) and (chunk_words & {"ApiError", "HTTPException", "status", "status_code"}):
+            for m_st in _4D_STATUS_RE.finditer(chunk):
+                st_code = f"status:{m_st.group(1)}"
+                if st_code not in e_exit:
+                    e_exit.append(st_code)
+                if m_st.group(2):
+                    err_tag = f"err:{m_st.group(2).lower()}"
+                    if err_tag not in e_exit:
+                        e_exit.append(err_tag)
+        if "if" in chunk_words and "return" in chunk_words and _4D_GUARD_RET_RE.search(chunk):
             if "guard_return" not in e_exit:
                 e_exit.append("guard_return")
 
-        if role == "EFFECT" or re.search(r"\b(?:useEffect|useLayoutEffect|onSnapshot|addEventListener|subscribe|on_event)\b", chunk):
+        if role == "EFFECT" or (
+            (chunk_words & {"useEffect", "useLayoutEffect", "onSnapshot", "addEventListener", "subscribe", "on_event"})
+            and _4D_REACTIVE_RE.search(chunk)
+        ):
             t_mode = "REACTIVE"
-        elif re.search(r"\b(?:setTimeout|setInterval|requestAnimationFrame|asyncio\.sleep)\b", chunk):
+        elif (
+            (chunk_words & {"setTimeout", "setInterval", "requestAnimationFrame", "asyncio"})
+            and _4D_TIMER_RE.search(chunk)
+        ):
             t_mode = "TIMER"
-        elif re.search(r"\b(?:async\s+def|async\s+function|async\s*\(|await\s+|Promise\.|\.then\()\b", chunk):
+        elif (
+            ("async" in chunk_words or "await" in chunk_words or "Promise" in chunk_words or "then" in chunk_words)
+            and _4D_ASYNC_RE.search(chunk)
+        ):
             t_mode = "ASYNC"
         else:
             t_mode = "SYNC"
 
-        w_comps = sorted(set(re.findall(r"<([A-Z][a-zA-Z0-9_]+)", chunk)))
-        w_calls = sorted(
-            {
-                m.group(1)
-                for m in re.finditer(r"\b([a-z][a-zA-Z0-9_]{3,})\s*\(", chunk)
-                if m.group(1) not in ("if", "for", "while", "switch", "catch", "return", "function", "useEffect", "useState", "useMemo", "useCallback")
-            }
+        w_comps = sorted(set(_4D_JSX_COMP_RE.findall(chunk))) if "<" in chunk else []
+        w_calls = (
+            sorted(
+                {
+                    m.group(1)
+                    for m in _4D_W_CALLS_RE.finditer(chunk)
+                    if m.group(1) not in _4D_W_CALL_NOISE
+                }
+            )
+            if has_paren
+            else []
         )
         sql_inserts: list[dict] = []
-        if "INSERT" in chunk or "insert" in chunk:
-            for m_ins in re.finditer(
-                r"\bINSERT\s+INTO\s+([a-zA-Z_][a-zA-Z0-9_]{2,})\s*\(([^)]+)\)\s*(?:VALUES|SELECT)\b",
-                chunk,
-                re.IGNORECASE,
-            ):
+        if "INSERT" in up_chunk:
+            for m_ins in _4D_SQL_INS_RE.finditer(chunk):
                 ins_tbl = m_ins.group(1)
                 ins_cols = [
                     c.strip().strip('"`')
                     for c in m_ins.group(2).split(",")
-                    if re.match(r"^[a-zA-Z_][a-zA-Z0-9_]*$", c.strip().strip('"`'))
+                    if _4D_SQL_COL_RE.match(c.strip().strip('"`'))
                 ]
                 if ins_cols:
                     ins_line = s + chunk.count("\n", 0, m_ins.start())
                     sql_inserts.append({"table": ins_tbl, "cols": ins_cols, "line": ins_line})
         sql_dialects: list[str] = []
-        if re.search(r"\binterval\s+'[^']+'", chunk, re.IGNORECASE):
-            sql_dialects.append("interval_literal")
-        if re.search(r"\bmake_interval\s*\(", chunk, re.IGNORECASE):
-            sql_dialects.append("make_interval")
-        if re.search(r"=\s*ANY\s*\(\s*(?:%s|\$|\?)", chunk, re.IGNORECASE):
+        if "INTERVAL" in up_chunk:
+            if "'" in chunk and _4D_DIALECT_INTERVAL_RE.search(chunk):
+                sql_dialects.append("interval_literal")
+            if "MAKE_INTERVAL" in up_chunk and _4D_DIALECT_MAKE_INT_RE.search(chunk):
+                sql_dialects.append("make_interval")
+        if "ANY" in up_chunk and "=" in chunk and _4D_DIALECT_ANY_RE.search(chunk):
             sql_dialects.append("any_array")
-        if re.search(r"\bILIKE\b", chunk):
+        if "ILIKE" in chunk_words and _4D_DIALECT_ILIKE_RE.search(chunk):
             sql_dialects.append("ilike_operator")
-        if re.search(r"::(?:uuid|jsonb|timestamptz|inet|text\[\]|int\[\])\b", chunk, re.IGNORECASE):
+        if "::" in chunk and _4D_DIALECT_CAST_RE.search(chunk):
             sql_dialects.append("postgres_typecast")
 
-        _JS_RES_BUILTINS = {
-            "ok", "status", "statusText", "headers", "json", "text", "blob", "clone",
-            "then", "catch", "finally", "length", "map", "filter", "forEach", "slice",
-            "toString", "valueOf", "error", "errors", "detail", "message", "data",
-        }
         expected_res_keys: list[str] = []
-        for m_jvar in re.finditer(r"\b(?:const|let|var)\s+([a-zA-Z_]\w*)\s*=\s*await\s+\w+\.json\(\)", chunk):
-            jvar = m_jvar.group(1)
-            for m_prop in re.finditer(rf"\b{re.escape(jvar)}\.([a-zA-Z_]\w*)\b", chunk[m_jvar.end() :]):
-                pk = m_prop.group(1)
-                line_end_pos = chunk.find("\n", m_jvar.end() + m_prop.start())
-                line_start_pos = chunk.rfind("\n", 0, m_jvar.end() + m_prop.start()) + 1
-                prop_line_txt = chunk[line_start_pos : (line_end_pos if line_end_pos != -1 else len(chunk))]
-                if "||" in prop_line_txt or "??" in prop_line_txt:
-                    continue
-                if pk not in _JS_RES_BUILTINS and pk not in expected_res_keys:
-                    expected_res_keys.append(pk)
+        if ".json()" in chunk and "await" in chunk_words:
+            for m_jvar in _4D_JSON_VAR_RE.finditer(chunk):
+                jvar = m_jvar.group(1)
+                for m_prop in re.finditer(rf"\b{re.escape(jvar)}\.([a-zA-Z_]\w*)\b", chunk[m_jvar.end() :]):
+                    pk = m_prop.group(1)
+                    line_end_pos = chunk.find("\n", m_jvar.end() + m_prop.start())
+                    line_start_pos = chunk.rfind("\n", 0, m_jvar.end() + m_prop.start()) + 1
+                    prop_line_txt = chunk[line_start_pos : (line_end_pos if line_end_pos != -1 else len(chunk))]
+                    if "||" in prop_line_txt or "??" in prop_line_txt:
+                        continue
+                    if pk not in _4D_JS_RES_BUILTINS and pk not in expected_res_keys:
+                        expected_res_keys.append(pk)
 
         http_calls: list[dict] = []
-        for m_fe in re.finditer(
-            r"\bfetch\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?[`'\"](?:\$\{[^}]+\})?(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"](?:\s*,\s*\{([\s\S]{0,260}?)\})?",
-            chunk,
-        ):
-            raw_u = m_fe.group(1).split("?")[0]
-            opts_u = m_fe.group(2) or ""
-            m_verb = re.search(r"\bmethod\s*:\s*['\"]([A-Za-z]+)['\"]", opts_u)
-            verb_u = m_verb.group(1).upper() if m_verb else "GET"
-            norm_u = re.sub(r"\$\{[^}]+\}|:[a-zA-Z_]\w*", "{*}", raw_u).rstrip("/") or "/"
-            fe_line = s + chunk.count("\n", 0, m_fe.start())
-            hc_entry: dict = {"method": verb_u, "url": raw_u, "norm_url": norm_u, "line": fe_line}
-            if expected_res_keys:
-                hc_entry["expected_keys"] = expected_res_keys[:8]
-            http_calls.append(hc_entry)
-        _http_client_rx = (
-            r"\b(?:requests|httpx)\.(get|post|put|delete|patch)\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?[`'\"](?:\$\{[^}]+\})?(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]"
-            if ext.lower() == ".py"
-            else r"\b(?:axios|api|client|http)\.(get|post|put|delete|patch)\s*\(\s*(?:[a-zA-Z_]\w*\s*\+\s*)?[`'\"](?:\$\{[^}]+\})?(\/[a-zA-Z0-9_/\-${}:.]+)[`'\"]"
+        if "fetch" in chunk_words:
+            for m_fe in _4D_FETCH_RE.finditer(chunk):
+                raw_u = m_fe.group(1).split("?")[0]
+                opts_u = m_fe.group(2) or ""
+                m_verb = _4D_FETCH_METHOD_RE.search(opts_u)
+                verb_u = m_verb.group(1).upper() if m_verb else "GET"
+                norm_u = _4D_URL_PARAM_RE.sub("{*}", raw_u).rstrip("/") or "/"
+                fe_line = s + chunk.count("\n", 0, m_fe.start())
+                hc_entry: dict = {"method": verb_u, "url": raw_u, "norm_url": norm_u, "line": fe_line}
+                if expected_res_keys:
+                    hc_entry["expected_keys"] = expected_res_keys[:8]
+                http_calls.append(hc_entry)
+        has_http_client = (
+            ("REQUESTS." in up_chunk or "HTTPX." in up_chunk)
+            if ext_l == ".py"
+            else any(k in up_chunk for k in ("AXIOS.", "API.", "CLIENT.", "HTTP."))
         )
-        for m_ax in re.finditer(
-            _http_client_rx,
-            chunk,
-            re.IGNORECASE,
-        ):
-            verb_u = m_ax.group(1).upper()
-            raw_u = m_ax.group(2).split("?")[0]
-            norm_u = re.sub(r"\$\{[^}]+\}|:[a-zA-Z_]\w*", "{*}", raw_u).rstrip("/") or "/"
-            ax_line = s + chunk.count("\n", 0, m_ax.start())
-            hc_entry_ax: dict = {"method": verb_u, "url": raw_u, "norm_url": norm_u, "line": ax_line}
-            if expected_res_keys:
-                hc_entry_ax["expected_keys"] = expected_res_keys[:8]
-            http_calls.append(hc_entry_ax)
+        if has_http_client:
+            for m_ax in http_client_rx.finditer(chunk):
+                verb_u = m_ax.group(1).upper()
+                raw_u = m_ax.group(2).split("?")[0]
+                norm_u = _4D_URL_PARAM_RE.sub("{*}", raw_u).rstrip("/") or "/"
+                ax_line = s + chunk.count("\n", 0, m_ax.start())
+                hc_entry_ax: dict = {"method": verb_u, "url": raw_u, "norm_url": norm_u, "line": ax_line}
+                if expected_res_keys:
+                    hc_entry_ax["expected_keys"] = expected_res_keys[:8]
+                http_calls.append(hc_entry_ax)
 
         type_comparisons: list[dict] = []
         sql_select_violations: list[dict] = []
         return_dict_keys: list[str] = []
         if scope.startswith("fn:"):
-            if ext.lower() == ".py" and s in py_ast_contracts:
+            if ext_l == ".py" and s in py_ast_contracts:
                 type_comparisons.extend(py_ast_contracts[s].get("type_comparisons", []))
                 return_dict_keys.extend(py_ast_contracts[s].get("return_dict_keys", []))
-            for m_sel in (
-                re.finditer(
-                    r"\b([a-zA-Z_]\w*)\s*=\s*[\w.]+\.execute\(\s*(?:f?['\"]{1,3})\s*SELECT\s+([\s\S]+?)\s+FROM\s+([a-zA-Z_]\w*)\b[\s\S]*?\)\.fetchone\(\)",
-                    chunk,
-                    re.IGNORECASE,
-                )
-                if "fetchone" in chunk
-                else ()
-            ):
-                r_var = m_sel.group(1)
-                raw_c_str = m_sel.group(2)
-                sel_tbl = m_sel.group(3)
-                if "*" in raw_c_str or "(" in raw_c_str:
-                    continue
-                proj_cols: list[str] = []
-                for c_part in raw_c_str.split(","):
-                    cp = c_part.strip()
-                    m_as = re.search(r"\bAS\s+([a-zA-Z_]\w*)\s*$", cp, re.IGNORECASE)
-                    if m_as:
-                        proj_cols.append(m_as.group(1))
-                    else:
-                        base_c = cp.split("::")[0].strip().split(".")[-1].strip().strip('"`')
-                        if re.match(r"^[a-zA-Z_]\w*$", base_c):
-                            proj_cols.append(base_c)
-                if not proj_cols:
-                    continue
-                proj_low = {c.lower() for c in proj_cols}
-                tail_chunk = chunk[m_sel.end() :]
-                m_reassign = re.search(rf"\b{re.escape(r_var)}\s*=\s*", tail_chunk)
-                if m_reassign:
-                    tail_chunk = tail_chunk[: m_reassign.start()]
-                for m_rk in re.finditer(rf"\b{re.escape(r_var)}\[\s*['\"]([a-zA-Z_]\w*)['\"]\s*\]", tail_chunk):
-                    rk = m_rk.group(1)
-                    if rk.lower() not in proj_low:
-                        rk_line = s + chunk.count("\n", 0, m_sel.end() + m_rk.start())
-                        sql_select_violations.append({
-                            "var": r_var,
-                            "read_key": rk,
-                            "projected_cols": proj_cols,
-                            "table": sel_tbl,
-                            "line": rk_line,
-                        })
+            if "FETCHONE" in up_chunk:
+                for m_sel in _4D_FETCHONE_RE.finditer(chunk):
+                    r_var = m_sel.group(1)
+                    raw_c_str = m_sel.group(2)
+                    sel_tbl = m_sel.group(3)
+                    if "*" in raw_c_str or "(" in raw_c_str:
+                        continue
+                    proj_cols: list[str] = []
+                    for c_part in raw_c_str.split(","):
+                        cp = c_part.strip()
+                        m_as = _4D_SQL_AS_RE.search(cp)
+                        if m_as:
+                            proj_cols.append(m_as.group(1))
+                        else:
+                            base_c = cp.split("::")[0].strip().split(".")[-1].strip().strip('"`')
+                            if _4D_IDENT_FULL_RE.match(base_c):
+                                proj_cols.append(base_c)
+                    if not proj_cols:
+                        continue
+                    proj_low = {c.lower() for c in proj_cols}
+                    tail_chunk = chunk[m_sel.end() :]
+                    m_reassign = re.search(rf"\b{re.escape(r_var)}\s*=\s*", tail_chunk)
+                    if m_reassign:
+                        tail_chunk = tail_chunk[: m_reassign.start()]
+                    for m_rk in re.finditer(rf"\b{re.escape(r_var)}\[\s*['\"]([a-zA-Z_]\w*)['\"]\s*\]", tail_chunk):
+                        rk = m_rk.group(1)
+                        if rk.lower() not in proj_low:
+                            rk_line = s + chunk.count("\n", 0, m_sel.end() + m_rk.start())
+                            sql_select_violations.append({
+                                "var": r_var,
+                                "read_key": rk,
+                                "projected_cols": proj_cols,
+                                "table": sel_tbl,
+                                "line": rk_line,
+                            })
 
-            if ext.lower() == ".py" and not return_dict_keys and s not in py_ast_contracts:
-                ret_blocks = re.findall(r"\breturn\s*\{([^{};]+)\}", chunk)
+            if ext_l == ".py" and not return_dict_keys and s not in py_ast_contracts and "return" in chunk_words and "{" in chunk:
+                ret_blocks = _4D_RET_DICT_RE.findall(chunk)
                 if ret_blocks and not any("**" in rb for rb in ret_blocks):
                     for rb in ret_blocks:
-                        for mk in re.finditer(r"['\"]([a-zA-Z_]\w*)['\"]\s*:", rb):
+                        for mk in _4D_DICT_KEY_COLON_RE.finditer(rb):
                             k_str = mk.group(1)
                             if k_str not in return_dict_keys:
                                 return_dict_keys.append(k_str)
@@ -1623,37 +1855,7 @@ def compile_6d_contract_diagnostics(
     """
     from .brain import DEPRIORITY_DIRS, _TEST_QUERY_TERMS, _extract_keywords, _is_test_file
 
-    schemas_by_table: dict[str, list[tuple[str, dict]]] = {}
-    all_sql_alters: dict[str, list[dict]] = {}
-    sqlite_adapters: list[tuple[str, str]] = []
-    for rel in sorted(brain._index.keys()):
-        info = brain._index[rel]
-        for tbl, sc in (info.get("sql_schemas") or {}).items():
-            sc_copy = {
-                "name": sc.get("name", tbl),
-                "line_start": sc.get("line_start", 1),
-                "line_end": sc.get("line_end", 1),
-                "all_cols": list(sc.get("all_cols", [])),
-                "required_cols": list(sc.get("required_cols", [])),
-                "defaulted_cols": list(sc.get("defaulted_cols", [])),
-                "fields": list(sc.get("fields", [])),
-            }
-            schemas_by_table.setdefault(tbl.lower(), []).append((rel, sc_copy))
-        sql_alters_map = info.get("sql_alters") or {}
-        if isinstance(sql_alters_map, dict):
-            for alt_tbl, ops in sql_alters_map.items():
-                all_sql_alters.setdefault(alt_tbl.lower(), []).extend(ops)
-        if rel.endswith(".py") and "sqlite3" in info.get("imports", []):
-            src_txt = brain._get_file_text(rel)
-            if src_txt and ("def execute" in src_txt or "_translate_sql" in src_txt):
-                sqlite_adapters.append((rel, src_txt))
-    if all_sql_alters and schemas_by_table:
-        for alt_tbl_low, ops in all_sql_alters.items():
-            for _, sc_copy in schemas_by_table.get(alt_tbl_low, []):
-                apply_sql_alters_to_schema(sc_copy, ops)
     t_low = task.lower()
-    q_terms = [t for t in brain._expand_keywords_with_aliases(_extract_keywords(task)) if len(t) >= 4]
-    q_wants_tests_diag = bool(set(q_terms) & _TEST_QUERY_TERMS)
     is_explanatory_q = bool(re.match(r"^\s*(?:how|where|what|which)\b", t_low)) and not any(
         w in t_low for w in ("bug", "bugs", "broken", "mismatch", "violation", "failing", "crash", "error", "fails", "fail")
     )
@@ -1661,6 +1863,44 @@ def compile_6d_contract_diagnostics(
         brain._last_line_annotations = {}
         brain._last_pin_lines = {}
         return [], []
+
+    idx_ver = (len(brain._index), sum(id(v) for v in brain._index.values()))
+    if getattr(brain, "_cached_6d_schema_ver", None) == idx_ver and hasattr(brain, "_cached_6d_schema_data"):
+        schemas_by_table, sqlite_adapters = brain._cached_6d_schema_data
+    else:
+        schemas_by_table = {}
+        all_sql_alters: dict[str, list[dict]] = {}
+        sqlite_adapters = []
+        for rel in sorted(brain._index.keys()):
+            info = brain._index[rel]
+            for tbl, sc in (info.get("sql_schemas") or {}).items():
+                sc_copy = {
+                    "name": sc.get("name", tbl),
+                    "line_start": sc.get("line_start", 1),
+                    "line_end": sc.get("line_end", 1),
+                    "all_cols": list(sc.get("all_cols", [])),
+                    "required_cols": list(sc.get("required_cols", [])),
+                    "defaulted_cols": list(sc.get("defaulted_cols", [])),
+                    "fields": list(sc.get("fields", [])),
+                }
+                schemas_by_table.setdefault(tbl.lower(), []).append((rel, sc_copy))
+            sql_alters_map = info.get("sql_alters") or {}
+            if isinstance(sql_alters_map, dict):
+                for alt_tbl, ops in sql_alters_map.items():
+                    all_sql_alters.setdefault(alt_tbl.lower(), []).extend(ops)
+            if rel.endswith(".py") and "sqlite3" in info.get("imports", []):
+                src_txt = brain._get_file_text(rel)
+                if src_txt and ("def execute" in src_txt or "_translate_sql" in src_txt):
+                    sqlite_adapters.append((rel, src_txt))
+        if all_sql_alters and schemas_by_table:
+            for alt_tbl_low, ops in all_sql_alters.items():
+                for _, sc_copy in schemas_by_table.get(alt_tbl_low, []):
+                    apply_sql_alters_to_schema(sc_copy, ops)
+        brain._cached_6d_schema_data = (schemas_by_table, sqlite_adapters)
+        brain._cached_6d_schema_ver = idx_ver
+
+    q_terms = [t for t in brain._expand_keywords_with_aliases(_extract_keywords(task)) if len(t) >= 4]
+    q_wants_tests_diag = bool(set(q_terms) & _TEST_QUERY_TERMS)
     wants_all_repo_diag = (not strict_focus) and (not is_explanatory_q) and any(
         w in t_low
         for w in ("bug", "bugs", "broken", "fail", "failing", "db", "database", "sql", "sqlite", "postgres", "connect", "insert", "schema", "mismatch", "violation")
@@ -1698,8 +1938,21 @@ def compile_6d_contract_diagnostics(
             or (rel not in focus_files and bool({p.lower() for p in Path(rel).parts[:-1]} & DEPRIORITY_DIRS))
         ):
             continue
-        cells = brain._index[rel].get("cells_4d") or []
-        cells_sorted = sorted(cells, key=lambda c: c.get("span", 9999))
+        raw_cells = brain._index[rel].get("cells_4d")
+        if not raw_cells:
+            continue
+        relevant_cells = [
+            c for c in raw_cells
+            if c.get("sql_inserts")
+            or (sqlite_adapters and (c.get("sql_dialects") or c.get("E_exit")))
+            or c.get("type_comparisons")
+            or c.get("sql_select_violations")
+            or c.get("http_calls")
+            or c.get("js_ast_contracts")
+        ]
+        if not relevant_cells:
+            continue
+        cells_sorted = sorted(relevant_cells, key=lambda c: c.get("span", 9999))
         for cell in cells_sorted:
             scope = cell.get("X_scope", "")
             c_line = cell.get("line_start", 1)
@@ -2014,6 +2267,218 @@ def _extract_balanced_call_args(
     return None
 
 
+def _py_scope_binds_name(
+    rel: str,
+    src: str,
+    fn_name: str,
+    fn_line_lo: int,
+    call_line: int,
+    name: str,
+    cache: dict,
+) -> bool:
+    """Return True if `name` is a parameter or local binding (assignment / def / class / loop / with target)
+    of the Python function `fn_name` defined at or after `fn_line_lo` and enclosing `call_line`.
+
+    Uses CPython's own `symtable` scope analysis, so names that are only *referenced* (globals, imports
+    at module level) return False. Local `import` bindings are excluded on purpose; they are handled by
+    the explicit import-path check in `_verify_call_site`.
+    """
+    import symtable
+
+    if not fn_name:
+        return False
+    top = cache.get(rel, False)
+    if top is False:
+        try:
+            top = symtable.symtable(src, rel, "exec")
+        except (SyntaxError, ValueError):
+            top = None
+        cache[rel] = top
+    if top is None:
+        return False
+
+    best = None
+    stack = [top]
+    while stack:
+        tbl = stack.pop()
+        try:
+            children = tbl.get_children()
+        except Exception:
+            children = []
+        stack.extend(children)
+        if tbl.get_type() != "function" or tbl.get_name() != fn_name:
+            continue
+        ln = tbl.get_lineno()
+        if fn_line_lo and ln < fn_line_lo:
+            continue
+        if ln > call_line:
+            continue
+        if best is None or ln < best.get_lineno():
+            best = tbl
+    if best is None:
+        return False
+    try:
+        sym = best.lookup(name)
+    except KeyError:
+        return False
+    if sym.is_parameter():
+        return True
+    if sym.is_local() and not sym.is_imported() and (sym.is_assigned() or sym.is_namespace()):
+        return True
+    return False
+
+
+def _resolve_receiver_class(scope_txt: str, recv: str) -> str | None:
+    """Resolve the class of local receiver `recv` from the most recent `recv = ClassName(...)` or
+    `recv: ClassName` binding in `scope_txt`. Returns the bare class name, or None if unresolved.
+
+    Only constructor-looking callees (identifier starting with an uppercase letter) are accepted, so factory
+    calls such as `recv = make_session()` remain unresolved (UNKNOWN) instead of being guessed.
+    """
+    best_pos = -1
+    best_cls: str | None = None
+    r = re.escape(recv)
+    for m in re.finditer(rf"(?<![\w.]){r}\s*(?::\s*[\w.\[\], |]+?)?\s*=\s*([A-Za-z_][\w.]*)\s*\(", scope_txt):
+        cand = m.group(1).rsplit(".", 1)[-1]
+        if m.start() > best_pos:
+            best_pos = m.start()
+            best_cls = cand if cand[:1].isupper() else None
+    for m in re.finditer(rf"(?<![\w.]){r}\s*:\s*(?:\"|')?([A-Za-z_][\w.]*)", scope_txt):
+        if m.start() > best_pos:
+            cand = m.group(1).rsplit(".", 1)[-1]
+            best_pos = m.start()
+            best_cls = cand if cand[:1].isupper() else None
+    return best_cls
+
+
+# Optional diagnostics sink: set to a list to record why call sites were treated as UNKNOWN.
+SKIP_LOG: list | None = None
+
+
+def _log_skip(rule: str, caller_rel: str, call_line: int) -> None:
+    if SKIP_LOG is not None:
+        SKIP_LOG.append((rule, caller_rel, call_line))
+
+
+def _py_import_bindings(rel: str, src: str, cache: dict) -> dict[str, tuple[str, int, str | None]]:
+    """Map each name bound by an import in `src` to `(module_dotted, level, imported_attr)`.
+
+    Follows Python semantics: `import a.b.c` binds `a` (to package `a`); `import a.b as x` binds `x` to `a.b`;
+    `from P import n as m` binds `m` to attribute `n` of `P` (relative `level` preserved).
+    """
+    key = ("bindings", rel)
+    if key in cache:
+        return cache[key]
+    out: dict[str, tuple[str, int, str | None]] = {}
+    try:
+        tree = ast.parse(src)
+    except (SyntaxError, ValueError):
+        cache[key] = out
+        return out
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            for a in node.names:
+                if a.asname:
+                    out[a.asname] = (a.name, 0, None)
+                else:
+                    top = a.name.split(".", 1)[0]
+                    out.setdefault(top, (top, 0, None))
+        elif isinstance(node, ast.ImportFrom):
+            for a in node.names:
+                if a.name == "*":
+                    continue
+                out[a.asname or a.name] = (node.module or "", node.level or 0, a.name)
+    cache[key] = out
+    return out
+
+
+def _py_module_file(brain: "ProjectBrain", dotted: str, level: int, caller_rel: str, cache: dict) -> str | None:
+    """Resolve a (possibly relative) dotted module path to an indexed `.py` / `__init__.py` file."""
+    key = ("mod", dotted, level, str(Path(caller_rel).parent) if level else "")
+    if key in cache:
+        return cache[key]
+    keys = getattr(brain, "_all_indexed_files", None) or brain._index
+    res: str | None = None
+    if level:
+        base = Path(caller_rel).parent
+        for _ in range(level - 1):
+            base = base.parent
+        parts = [p for p in dotted.split(".") if p]
+        stem = "/".join([*base.parts, *parts])
+        for cand in (f"{stem}.py", f"{stem}/__init__.py"):
+            cand = cand.lstrip("/")
+            if cand in keys:
+                res = cand
+                break
+    elif dotted:
+        tail = dotted.replace(".", "/")
+        for k in keys:
+            if k in (f"{tail}.py", f"{tail}/__init__.py") or k.endswith((f"/{tail}.py", f"/{tail}/__init__.py")):
+                if res is None or len(k) < len(res):
+                    res = k
+    cache[key] = res
+    return res
+
+
+def _py_follow_defn(brain: "ProjectBrain", rel: str | None, name: str, max_hops: int = 6) -> str | None:
+    """Follow `from X import name` re-export chains starting at module `rel` until a file that defines a
+    top-level function `name` is reached. Returns that file, or None if the chain cannot be resolved."""
+    seen: set[str] = set()
+    get_info = getattr(brain, "_get_file_info", None)
+    for _ in range(max_hops):
+        if not rel or rel in seen:
+            return None
+        seen.add(rel)
+        info = (get_info(rel) if get_info is not None else brain._index.get(rel)) or {}
+        if any(
+            f.get("name") == name and not f.get("parent_class") and not f.get("is_nested")
+            for f in info.get("functions", [])
+        ):
+            return rel
+        sym_map = (getattr(brain, "_symbol_imports", {}) or {}).get(rel)
+        if sym_map is None:
+            sym_map = info.get("_resolved_sym_map") or {}
+        rel = sym_map.get(name)
+    return None
+
+
+def _resolve_bare_name_defn(brain: "ProjectBrain", caller_rel: str, caller_src: str, name: str, cache: dict) -> str | None:
+    if not caller_rel.endswith(".py"):
+        return None
+    b = _py_import_bindings(caller_rel, caller_src, cache).get(name)
+    if b is None:
+        info = brain._index.get(caller_rel) or {}
+        if any(f.get("name") == name and not f.get("parent_class") and not f.get("is_nested") for f in info.get("functions", [])):
+            return caller_rel
+        return None
+    mod, level, attr = b
+    if attr is None:
+        return None
+    return _py_follow_defn(brain, _py_module_file(brain, mod, level, caller_rel, cache), attr)
+
+
+def _resolve_qualified_defn(
+    brain: "ProjectBrain", caller_rel: str, caller_src: str, prefix: str, name: str, cache: dict
+) -> str | None:
+    if not caller_rel.endswith(".py"):
+        return None
+    segs = prefix.split(".")
+    b = _py_import_bindings(caller_rel, caller_src, cache).get(segs[0])
+    if b is None:
+        return None
+    mod, level, attr = b
+    if attr is None:
+        # Unaliased `import a.b.c` binds `a`, so the access path is the prefix itself;
+        # aliased `import a.b as x` binds `x` to module `a.b`.
+        dotted = prefix if mod == segs[0] else ".".join([mod, *segs[1:]])
+    else:
+        dotted = ".".join([p for p in (mod, attr, *segs[1:]) if p])
+    mod_file = _py_module_file(brain, dotted, level, caller_rel, cache)
+    if not mod_file:
+        return None
+    return _py_follow_defn(brain, mod_file, name)
+
+
 def verify_cross_file_contracts(
     brain: "ProjectBrain",
     focus_rels: set[str],
@@ -2041,6 +2506,8 @@ def verify_cross_file_contracts(
 
     info_cache: dict[str, dict] = {}
     text_cache: dict[str, str] = {}
+    _symtable_cache: dict[str, object] = {}
+    _resolve_cache: dict = {}
 
     def _get_text(rel: str) -> str:
         if rel in text_cache:
@@ -2056,6 +2523,8 @@ def verify_cross_file_contracts(
             return info_cache[rel]
         if patched_texts and rel in patched_texts:
             inf = parse(patched_texts[rel], Path(rel).suffix.lower())
+        elif hasattr(brain, "_get_file_info"):
+            inf = brain._get_file_info(rel) or {}
         else:
             inf = brain._index.get(rel, {})
         info_cache[rel] = inf
@@ -2173,6 +2642,15 @@ def verify_cross_file_contracts(
         arity = callee_fn.get("arity_spec")
         if not arity or not caller_rel or not call_line:
             return
+        # Lexical scoping: a nested function is only callable from inside its enclosing function.
+        callee_nested_in_caller = False
+        if callee_fn.get("is_nested"):
+            if caller_rel != callee_rel:
+                return
+            fn_l_start = callee_fn.get("line_start", 0)
+            if caller_l_start and caller_l_end and not (caller_l_start < fn_l_start <= caller_l_end):
+                return
+            callee_nested_in_caller = True
         decs = callee_fn.get("decorators") or []
         if any(_FRAMEWORK_DECORATOR_RE.search(d) for d in decs):
             return
@@ -2197,6 +2675,50 @@ def verify_cross_file_contracts(
                     if mod_tail and mod_tail not in callee_rel:
                         return
                 if mod_stem_chk and re.search(rf"\b{re.escape(mod_stem_chk)}\b", imp_names) and imp_mod.endswith("." + mod_stem_chk):
+                    return
+
+        caller_simple = (caller_name or "").rsplit(".", 1)[-1]
+
+        # (a) Bare call `name(...)`: if `name` is a parameter or a local binding of the calling
+        #     function (resolved via the CPython `symtable`), the static callee edge is unreliable -> UNKNOWN.
+        if not is_meth and "." not in qual_expr and not callee_nested_in_caller and caller_rel.endswith(".py"):
+            if _py_scope_binds_name(
+                caller_rel, caller_src, caller_simple, caller_l_start, call_line, callee_fn["name"], _symtable_cache
+            ):
+                _log_skip("a_local_binding", caller_rel, call_line)
+                return
+            # Bare name: resolve the caller's own import binding and follow re-exports to the defining file.
+            if caller_rel != callee_rel:
+                final_rel = _resolve_bare_name_defn(brain, caller_rel, caller_src, callee_fn["name"], _resolve_cache)
+                if final_rel and final_rel != callee_rel:
+                    _log_skip("a_import_elsewhere", caller_rel, call_line)
+                    return
+
+        # (b) Module-qualified call `pkg.name(...)`: resolve `pkg` from the caller's import statements with
+        #     Python binding semantics (`import a.b` binds `a`), then follow re-exports of `name`. Only when this
+        #     resolves to a *different* defining file than the edge claims is the verdict UNKNOWN.
+        if not is_meth and "." in qual_expr and caller_rel != callee_rel:
+            q_prefix = qual_expr.rsplit(".", 1)[0]
+            final_rel = _resolve_qualified_defn(brain, caller_rel, caller_src, q_prefix, callee_fn["name"], _resolve_cache)
+            if final_rel and final_rel != callee_rel:
+                _log_skip("b_qualifier_elsewhere", caller_rel, call_line)
+                return
+
+        # (c) Method call on a non-`self` receiver `recv.method(...)`: resolve the receiver's class from
+        #     `recv = ClassName(...)` or a `recv: ClassName` annotation in the calling function. If it cannot
+        #     be resolved, or resolves to a different class than the edge's target, the verdict is UNKNOWN.
+        if is_meth and "." in qual_expr:
+            recv_expr = qual_expr.rsplit(".", 1)[0]
+            owner_cls = callee_fn.get("parent_class") or ""
+            if recv_expr not in ("self", "cls", owner_cls) and not recv_expr.startswith("super("):
+                if not re.fullmatch(r"[A-Za-z_]\w*", recv_expr):
+                    _log_skip("c_receiver_complex", caller_rel, call_line)
+                    return
+                lo = max(1, caller_l_start or 1)
+                scope_txt = "\n".join(c_lines[lo - 1 : call_line])
+                resolved_cls = _resolve_receiver_class(scope_txt, recv_expr)
+                if not resolved_cls or resolved_cls != owner_cls:
+                    _log_skip("c_receiver_unresolved" if not resolved_cls else "c_receiver_other_class", caller_rel, call_line)
                     return
         end_idx = min(len(c_lines), call_line + 25)
         if caller_l_end and caller_l_end >= call_line:
@@ -2321,6 +2843,15 @@ def verify_cross_file_contracts(
                 if ofn.get("return_keys"):
                     old_ret_map[oq] = set(ofn["return_keys"])
 
+            file_was_edited = bool(patched_texts and f_rel in patched_texts) or bool(
+                old_info
+                and (
+                    old_info.get("interface_hash") != new_info.get("interface_hash")
+                    or [x.get("ast_hash") for x in old_info.get("functions", [])]
+                    != [x.get("ast_hash") for x in new_info.get("functions", [])]
+                )
+            )
+
             new_fn_map = {
                 (fn.get("parent_class"), fn["name"]): fn
                 for fn in new_info.get("functions", [])
@@ -2340,7 +2871,7 @@ def verify_cross_file_contracts(
                     caller_nd = brain._graph.nodes.get(e_in["src"], {})
                     caller_rel = caller_nd.get("rel_path", "")
                     call_line = e_in.get("line", 0)
-                    if not (patched_texts and iface_unchanged and caller_rel not in focus_rels):
+                    if not (file_was_edited and iface_unchanged and caller_rel not in focus_rels):
                         _verify_call_site(
                             caller_rel,
                             caller_nd.get("name", ""),
@@ -2351,7 +2882,9 @@ def verify_cross_file_contracts(
                             caller_l_start=caller_nd.get("line_start", 0),
                             caller_l_end=caller_nd.get("line_end", 0),
                         )
-                    if fn.get("return_keys"):
+                    if fn.get("return_keys") and not (
+                        file_was_edited and iface_unchanged and not removed_ret_keys and caller_rel not in focus_rels
+                    ):
                         _verify_return_keys_for_caller(
                             caller_rel,
                             caller_nd.get("name", ""),
@@ -2460,12 +2993,43 @@ def verify_cross_file_contracts(
                                 )
 
     # 2B. Broken Explicit Symbol Imports (`from X import Y` / `import { Y } from './X'`)
-    file_set = set(brain._index.keys()) | set(focus_rels)
-    module_index = getattr(brain, "_python_module_index", None) or resolve.build_python_module_index(brain._index)
-    combined_index = {**brain._index, **{r: _get_info(r) for r in focus_rels}}
+    base_file_set = getattr(brain, "_all_indexed_files", None)
+    file_set = (set(base_file_set) if base_file_set is not None else set(brain._index.keys())) | set(focus_rels)
+    module_index = getattr(brain, "_python_module_index", None) or resolve.build_python_module_index(file_set)
+
+    class _LazyIndexView:
+        def get(self, k: str, default: object = None) -> object:
+            inf = _get_info(k)
+            return inf if inf else default
+
+    combined_index = _LazyIndexView() if getattr(brain, "_is_partial_index", False) else {
+        **brain._index,
+        **{r: _get_info(r) for r in focus_rels},
+    }
+    def _top_defined_syms(inf: dict) -> set[str]:
+        return (
+            {f["name"] for f in inf.get("functions", []) if not f.get("parent_class")}
+            | {c["name"] for c in inf.get("classes", [])}
+            | set(inf.get("exports", []))
+            | {k for k in (inf.get("import_bindings") or {}) if not k.startswith("__star__")}
+        )
+
     files_to_check_imports: set[str] = set(focus_rels)
     for r in focus_rels:
-        files_to_check_imports.update(brain._imported_by.get(r, []))
+        old_r = resolved_pre.get(r, {})
+        new_r = _get_info(r)
+        r_edited = bool(patched_texts and r in patched_texts) or bool(
+            old_r
+            and (
+                old_r.get("interface_hash") != new_r.get("interface_hash")
+                or [x.get("ast_hash") for x in old_r.get("functions", [])]
+                != [x.get("ast_hash") for x in new_r.get("functions", [])]
+                or [x.get("ast_hash") for x in old_r.get("classes", [])]
+                != [x.get("ast_hash") for x in new_r.get("classes", [])]
+            )
+        )
+        if not r_edited or not old_r or bool(_top_defined_syms(old_r) - _top_defined_syms(new_r)):
+            files_to_check_imports.update(brain._imported_by.get(r, []))
 
     for imp_rel in sorted(files_to_check_imports):
         imp_info = _get_info(imp_rel)

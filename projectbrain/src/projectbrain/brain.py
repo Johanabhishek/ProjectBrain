@@ -23,10 +23,14 @@ from .graph import CodeGraph, fn_id, cls_id, file_id, route_id
 from .intent import classify_intent, LOCATE_SYMBOL, LOCATE_ROUTE, UNDERSTAND_FLOW, IMPACT_ANALYSIS, ADD_FEATURE
 from .ledger import SavingsLedger
 from .memory import RepoMemory
-from .parsers import parse, parse_with_tree, apply_sql_alters_to_schema, compute_file_interface_hash
-from .patcher import apply_patch_spec
+from .parsers import (
+    parse, parse_with_tree, parse_files_parallel, apply_sql_alters_to_schema,
+    compute_file_interface_hash, _is_minified_src, _is_unexpanded_symlink_src as _is_unexpanded_symlink,
+)
 from .session import SessionManager
-from .store import SQLiteIndexStore
+from .store import (
+    SQLiteIndexStore, LazyFileIndex, pack_symbol_imports, unpack_symbol_imports, compute_stats_summary,
+)
 from .slicer import (
     slice_lines,
     build_file_skeleton,
@@ -73,18 +77,14 @@ from .contracts import (
     compile_6d_contract_diagnostics as _compile_6d_contract_diagnostics_fn,
     verify_cross_file_contracts,
 )
-from .dossier import (
-    compile_evidence_packet,
-    compile_engineering_dossier,
-    score_symbol_for_query as _score_symbol_for_query_fn,
-    score_class_for_query as _score_class_for_query_fn,
-)
+from .hooks import _file_diag_lines
 from .verify import (
     verify_claim as _verify_claim_fn,
     support_evidence as _verify_support_evidence,
     verify_batch as _verify_batch_fn,
     verify_plan as _verify_plan_fn,
     impact as _verify_impact_fn,
+    load_neighborhood_for_check as _load_neighborhood_for_check_fn,
     trace_flow as _verify_trace_flow,
     url_matches as _verify_url_matches,
     co_change_analysis as _verify_co_change_analysis,
@@ -160,6 +160,8 @@ DEPRIORITY_DIRS = {
     "docs", "doc", "documentation",
     "samples", "sample",
     "fixtures", "fixture",
+    "eval", "evals",
+    "benchmarks", "benchmark",
 }
 
 STOPWORDS = {
@@ -196,6 +198,7 @@ class ProjectBrain:
         self._behaviors: dict[str, dict[str, str]] = {}
         self._ast_hashes: dict[str, str] = {}
         self._z_write_sets: dict[str, set[str]] = {}
+        self._trans_effect_sets: dict[str, set[str]] = {}
         self._cell_4d_tokens: dict[str, set[str]] = {}
         self._session_manager = SessionManager()
         self._memory = RepoMemory(self.root)
@@ -210,6 +213,33 @@ class ProjectBrain:
         self._git_head_cache: dict[str, dict | None] = {}
         self._last_line_annotations: dict[str, dict[int, list[str]]] = {}
         self._last_pin_lines: dict[str, set[int]] = {}
+        self._is_partial_index: bool = False
+        self._all_indexed_files: set[str] | None = None
+        self._blobs_ready: bool = False
+        self._pending_parsed_files: dict[str, tuple] = {}
+
+    def _reset_partial_index(self) -> None:
+        if getattr(self, "_is_partial_index", False):
+            self._index = {}
+            self._graph = None
+            self._is_partial_index = False
+            self._all_indexed_files = None
+            self._blobs_ready = False
+
+    def _get_file_info(self, rel_path: str) -> dict | None:
+        if rel_path in self._index:
+            return self._index[rel_path]
+        if getattr(self, "_is_partial_index", False) and self._db_store.db_path.exists():
+            f_hit = self._db_store.get_file_fast(rel_path)
+            if f_hit and f_hit.get("info") is not None:
+                inf = {**f_hit["info"], "mtime": f_hit.get("mtime")}
+                self._index[rel_path] = inf
+                if "_resolved_sym_map" in inf:
+                    self._symbol_imports.setdefault(rel_path, inf["_resolved_sym_map"])
+                if "_resolved_targets" in inf:
+                    self._import_targets.setdefault(rel_path, inf["_resolved_targets"])
+                return inf
+        return None
 
     def _get_git_head_info(self, rel_path: str) -> dict | None:
         """Retrieve and parse `HEAD:<rel_path>` from Git when available and different from disk."""
@@ -245,6 +275,21 @@ class ProjectBrain:
     def _capture_pre_edit_snapshots(self, candidate_files: list[str] | None = None) -> None:
         """Before `_ensure_fresh()` overwrites `self._index`, preserve pre-edit file AST info for modified files."""
         if not self._index:
+            if candidate_files and self._db_store.db_path.exists():
+                for f in candidate_files:
+                    r = self._normalize_rel(str(f))
+                    if not r or r in self._pre_edit_index:
+                        continue
+                    f_hit = self._db_store.get_file_fast(r)
+                    if not f_hit or not f_hit.get("info"):
+                        continue
+                    fpath = self.root / r
+                    try:
+                        st = fpath.stat()
+                        if f_hit.get("mtime") is None or st.st_mtime != f_hit.get("mtime"):
+                            self._pre_edit_index[r] = dict(f_hit["info"])
+                    except OSError:
+                        self._pre_edit_index[r] = dict(f_hit["info"])
             return
         rels_to_check: list[str] = []
         if candidate_files:
@@ -294,6 +339,7 @@ class ProjectBrain:
         deduplicate_session: bool = True,
     ) -> dict:
         """Compile a surgical, token-budgeted Evidence Packet for an agent task."""
+        from .dossier import compile_evidence_packet
         return compile_evidence_packet(
             self,
             task,
@@ -308,14 +354,17 @@ class ProjectBrain:
         impact_files: list[str] | None = None,
         out_path: str | None = None,
         zoom: bool = False,
+        write_file: bool = True,
     ) -> dict:
         """Compile a self-contained, zero-follow-up Engineering Dossier across one or more tasks."""
+        from .dossier import compile_engineering_dossier
         return compile_engineering_dossier(
             self,
             tasks,
             impact_files=impact_files,
             out_path=out_path,
             zoom=zoom,
+            write_file=write_file,
         )
 
     def patch(
@@ -326,6 +375,7 @@ class ProjectBrain:
         fuzzy_window: int = 8,
     ) -> dict:
         """Apply or dry-run a Surgical Anchor Patch spec and return unified diff + syntax verification."""
+        from .patcher import apply_patch_spec
         diff_path = Path(diff_out) if diff_out else (self.root / ".projectbrain_patch.diff")
         res = apply_patch_spec(
             self.root,
@@ -393,11 +443,31 @@ class ProjectBrain:
             res["all_contracts_valid"] = False
         return res
 
+    def _is_db_fresh_fast(self, allow_zero_disk: bool = False) -> bool:
+        """Verify in ~25ms that `.projectbrain.db` is version-compatible and matches disk mtimes without hydrating."""
+        if (
+            not self._db_store.db_path.exists()
+            or self._cache_path.exists()
+            or not self._db_store.is_compatible_meta(SCHEMA_VERSION, PARSER_VERSION, GRAPH_VERSION)
+        ):
+            return False
+        snap = self._db_store.get_indexed_mtimes_fast()
+        if snap is None:
+            return False
+        db_mtimes, db_skipped = snap
+        current = {rel: mtime for rel, _, mtime in self._walk_entries()}
+        if not current and db_mtimes:
+            return allow_zero_disk
+        if current.keys() != (set(db_mtimes.keys()) | db_skipped):
+            return False
+        return not any(current[rel] != db_mtimes[rel] for rel in db_mtimes if rel in current)
+
     def slice_symbols(
         self,
         targets: list[str] | str,
         max_lines_per_symbol: int = 180,
         summary_mode: bool = False,
+        focus: list[str] | str | None = None,
     ) -> dict:
         """Surgically slice specific symbols or files without reading full files.
 
@@ -407,9 +477,19 @@ class ProjectBrain:
           - A bare symbol name: `"verify_claim"` or `"CodeGraph.build"`
           - A file range: `"src/brain.py:100-150"`
           - A file path (returns its signature skeleton): `"src/brain.py"`
+
+        Optional `focus`: variable or call identifier(s) for intra-function PDG slicing
+        (traces backward definitions, forward uses, and enclosing control guards).
         """
         if isinstance(targets, (str, Path)):
             targets = [str(targets)]
+        if isinstance(focus, str):
+            focus_terms: list[str] | None = [s.strip() for s in re.split(r"[,;\s]+", focus) if s.strip()] or None
+        elif isinstance(focus, list):
+            focus_terms = [str(s).strip() for s in focus if str(s).strip()] or None
+        else:
+            focus_terms = None
+        pdg_max_lines = min(max_lines_per_symbol, 45) if (focus_terms and max_lines_per_symbol == 180) else max_lines_per_symbol
 
         # Fast cold-start SQLite path: slice directly from `.projectbrain.db` in <5ms
         # without loading the entire repository index/graph into memory.
@@ -421,6 +501,25 @@ class ProjectBrain:
         ):
             fast_slices: list[dict] = []
             fast_ok = True
+            db_fresh_checked: bool | None = None
+
+            def _emit_fast_missing(raw_t: str, sym_q: str, f_filt: str | None = None) -> bool:
+                nonlocal db_fresh_checked
+                if db_fresh_checked is None:
+                    db_fresh_checked = self._is_db_fresh_fast(allow_zero_disk=False)
+                if not db_fresh_checked:
+                    return False
+                did_you_mean, pkg_matches = self._db_store.suggest_missing_target_fast(raw_t, sym_q, file_filter=f_filt)
+                hint = f" Did you mean: {', '.join(did_you_mean)}?" if did_you_mean else (
+                    f" Closest indexed files: {', '.join(pkg_matches)}" if pkg_matches else ""
+                )
+                fast_slices.append({
+                    "target": raw_t,
+                    "error": f"Symbol or file '{raw_t}' not found in index.{hint}",
+                    "did_you_mean": did_you_mean,
+                })
+                return True
+
             for raw_target in targets:
                 t = raw_target.strip()
                 if not t:
@@ -428,10 +527,12 @@ class ProjectBrain:
                 range_m = re.match(r"^(.+?):(\d+)-(\d+)$", t)
                 if range_m:
                     fpath, s_line, e_line = range_m.group(1), int(range_m.group(2)), int(range_m.group(3))
-                    f_hit = self._db_store.get_file_fast(self._normalize_rel(fpath) or fpath)
+                    f_hit = self._db_store.get_file_fast(self._normalize_rel(fpath) or fpath, include_info=False)
                     if not f_hit:
-                        fast_ok = False
-                        break
+                        if not _emit_fast_missing(t, t):
+                            fast_ok = False
+                            break
+                        continue
                     rel = f_hit["rel_path"]
                     disk_p = self.root / rel
                     if not disk_p.exists() or disk_p.stat().st_mtime != f_hit["mtime"]:
@@ -439,8 +540,10 @@ class ProjectBrain:
                         break
                     f_lines = disk_p.read_text(encoding="utf-8", errors="replace").splitlines()
                     s_line, e_line = snap_to_block_boundaries(f_lines, s_line, e_line)
-                    span_len = max_lines_per_symbol if summary_mode else max(max_lines_per_symbol, min(400, e_line - s_line + 1))
-                    code = slice_lines(self.root, rel, s_line, e_line, max_lines=span_len)
+                    span_len = pdg_max_lines if focus_terms else (
+                        max_lines_per_symbol if summary_mode else max(max_lines_per_symbol, min(400, e_line - s_line + 1))
+                    )
+                    code = slice_lines(self.root, rel, s_line, e_line, max_lines=span_len, focus_terms=focus_terms)
                     self._ledger.commit_slice_intervals(rel, extract_emitted_intervals(code))
                     fast_slices.append({
                         "target": t,
@@ -457,8 +560,10 @@ class ProjectBrain:
                 if t.startswith("file:"):
                     f_hit = self._db_store.get_file_fast(t[5:])
                     if not f_hit:
-                        fast_ok = False
-                        break
+                        if not _emit_fast_missing(t, t[5:]):
+                            fast_ok = False
+                            break
+                        continue
                     rel = f_hit["rel_path"]
                     skel = build_file_skeleton(rel, f_hit["info"], root=self.root)
                     fast_slices.append({"node_id": t, "rel_path": rel, "symbol": rel, "name": rel, "skeleton": skel, "code": skel})
@@ -485,8 +590,10 @@ class ProjectBrain:
 
                 sym_hits = self._db_store.find_symbols_fast(sym_query, file_filter=file_filter)
                 if not sym_hits:
-                    fast_ok = False
-                    break
+                    if not _emit_fast_missing(t, sym_query, file_filter):
+                        fast_ok = False
+                        break
+                    continue
                 for sh in sym_hits:
                     rel = sh["rel_path"]
                     disk_p = self.root / rel
@@ -494,7 +601,7 @@ class ProjectBrain:
                         fast_ok = False
                         break
                     l_start, l_end = sh["line_start"], sh["line_end"]
-                    code = slice_lines(self.root, rel, l_start, l_end, max_lines=max_lines_per_symbol)
+                    code = slice_lines(self.root, rel, l_start, l_end, max_lines=pdg_max_lines, focus_terms=focus_terms)
                     self._ledger.commit_slice_intervals(rel, extract_emitted_intervals(code))
                     self._served_slices.add(sh["node_id"])
                     fast_slices.append({
@@ -547,7 +654,7 @@ class ProjectBrain:
                         f_lines = (self.root / rel).read_text(encoding="utf-8", errors="replace").splitlines()
                     except OSError:
                         f_lines = []
-                    if f_lines:
+                    if f_lines and not focus_terms:
                         s_line, e_line = snap_to_block_boundaries(f_lines, s_line, e_line)
                         plan = self._ledger.plan_slice_intervals(rel, s_line, e_line, len(f_lines), commit=False)
                         unseen = plan["unseen_intervals"]
@@ -583,8 +690,10 @@ class ProjectBrain:
                             self._ledger.commit_slice_intervals(rel, emitted_ivs)
                             code = "\n".join(parts_out)
                     else:
-                        span_len = max_lines_per_symbol if summary_mode else max(max_lines_per_symbol, min(400, e_line - s_line + 1))
-                        code = slice_lines(self.root, rel, s_line, e_line, max_lines=span_len)
+                        span_len = pdg_max_lines if focus_terms else (
+                            max_lines_per_symbol if summary_mode else max(max_lines_per_symbol, min(400, e_line - s_line + 1))
+                        )
+                        code = slice_lines(self.root, rel, s_line, e_line, max_lines=span_len, focus_terms=focus_terms)
                     slices.append({
                         "target": t,
                         "rel_path": rel,
@@ -603,7 +712,7 @@ class ProjectBrain:
                 if nd.get("type") in ("fn", "cls") and rel:
                     l_start = nd.get("line_start", 1)
                     l_end = nd.get("line_end", l_start)
-                    code = slice_lines(self.root, rel, l_start, l_end, max_lines=max_lines_per_symbol)
+                    code = slice_lines(self.root, rel, l_start, l_end, max_lines=pdg_max_lines, focus_terms=focus_terms)
                     self._ledger.commit_slice_intervals(rel, extract_emitted_intervals(code))
                     self._served_slices.add(t)
                     slices.append({
@@ -649,7 +758,7 @@ class ProjectBrain:
                     if sym_lower in (fn["name"].lower(), qname.lower()):
                         nid = fn_id(rel, fn["name"], fn.get("parent_class"))
                         l_start, l_end = fn.get("line_start", 1), fn.get("line_end", 1)
-                        code = slice_lines(self.root, rel, l_start, l_end, max_lines=max_lines_per_symbol)
+                        code = slice_lines(self.root, rel, l_start, l_end, max_lines=pdg_max_lines, focus_terms=focus_terms)
                         self._ledger.commit_slice_intervals(rel, extract_emitted_intervals(code))
                         self._served_slices.add(nid)
                         slices.append({
@@ -668,7 +777,7 @@ class ProjectBrain:
                     if sym_lower == cls["name"].lower():
                         nid = cls_id(rel, cls["name"])
                         l_start, l_end = cls.get("line_start", 1), cls.get("line_end", 1)
-                        code = slice_lines(self.root, rel, l_start, l_end, max_lines=max_lines_per_symbol)
+                        code = slice_lines(self.root, rel, l_start, l_end, max_lines=pdg_max_lines, focus_terms=focus_terms)
                         self._ledger.commit_slice_intervals(rel, extract_emitted_intervals(code))
                         self._served_slices.add(nid)
                         slices.append({
@@ -746,8 +855,19 @@ class ProjectBrain:
         - Otherwise: resolves `target` to its graph node(s) and returns its
           multi-hop neighborhood (`neighbors`) plus optional git co-changes.
         """
-        self._ensure_fresh()
         target = target.strip()
+        if not self._index and not target.startswith("/") and self._is_db_fresh_fast(allow_zero_disk=True):
+            fast_res = self._db_store.explore_fast(
+                target, target_b=target_b, edge_types=edge_types, depth=depth,
+            )
+            if fast_res is not None:
+                if include_co_changes and not target_b and "center" in fast_res:
+                    rel_path = fast_res["center"].get("rel_path")
+                    if rel_path:
+                        fast_res["co_changes"] = self.co_change_analysis(rel_path).get("co_changes", [])
+                return fast_res
+
+        self._ensure_fresh()
 
         if target_b:
             return self.find_relationship(target, target_b.strip())
@@ -781,7 +901,17 @@ class ProjectBrain:
     ) -> dict:
         """Unified verification gate: checks claims, validates edit plans, and analyzes impact + 6D contracts."""
         self._capture_pre_edit_snapshots(files_modified)
-        self._ensure_fresh()
+        fast_check_scope = bool(files_modified and not claims and not plan_files)
+        if fast_check_scope:
+            if not self._index:
+                if not self._load_neighborhood_for_check(files_modified):
+                    self.load()
+            if not self._index:
+                self.index()
+            else:
+                self.incremental_index(candidate_files=files_modified)
+        else:
+            self._ensure_fresh()
         out: dict = {}
 
         if claims:
@@ -816,21 +946,116 @@ class ProjectBrain:
                     pass
 
         if effective_modified:
-            imp_res = self.impact(effective_modified)
+            norm_focus = {self._normalize_rel(str(f)) for f in effective_modified}
+            valid_focus = {r for r in norm_focus if r in self._index}
+            imp_res = self.impact(effective_modified, _already_fresh=fast_check_scope)
+            diags = list(imp_res.get("contract_diagnostics", []))
+
+            syntax_errs: list[str] = []
+            for r in sorted(valid_focus):
+                if self._index.get(r, {}).get("parse_status") == "partial":
+                    for msg in _file_diag_lines(self.root, r):
+                        syntax_errs.append(msg)
+                        if msg not in diags:
+                            diags.insert(0, msg)
+
+            b_violations = self._memory.check_boundary_violations(
+                self._index, self._import_targets, self._graph, focus_rels=valid_focus,
+            )
+            for bv in b_violations:
+                if bv["message"] not in diags:
+                    diags.append(bv["message"])
+
+            focus_node_ids: set[str] = set()
+            if self._graph:
+                self._graph._ensure_registries()
+                for r in valid_focus:
+                    focus_node_ids.update(self._graph._nodes_by_file.get(r, set()))
+            matched_memories = self._memory.get_notes_for(valid_focus, focus_node_ids, self._ast_hashes)
+            stale_memories = [m for m in matched_memories if m.get("stale")]
+
+            all_valid = len(diags) == 0
+            imp_res["contract_diagnostics"] = diags
+            imp_res["all_contracts_valid"] = all_valid
+            if not all_valid:
+                imp_res["verdict"] = "UNSAFE_CONTRACT_VIOLATION"
+
             out["impact_analysis"] = imp_res
-            out["contract_diagnostics"] = imp_res.get("contract_diagnostics", [])
-            out["all_contracts_valid"] = imp_res.get("all_contracts_valid", True)
+            out["contract_diagnostics"] = diags
+            out["boundary_violations"] = b_violations
+            if syntax_errs:
+                out["syntax_errors"] = syntax_errs
+            if matched_memories:
+                out["memories"] = matched_memories
+            if stale_memories:
+                out["stale_memories"] = stale_memories
+            out["all_contracts_valid"] = all_valid
             out["verdict"] = imp_res.get("verdict", "SAFE_TO_PROCEED")
+        elif not claims and not plan_files:
+            # Repo-wide boundary & stale-invariant audit when check() runs with no modified files
+            b_violations = self._memory.check_boundary_violations(
+                self._index, self._import_targets, self._graph, focus_rels=None,
+            )
+            if b_violations:
+                out["boundary_violations"] = b_violations
+                out["contract_diagnostics"] = [bv["message"] for bv in b_violations]
+                out["all_contracts_valid"] = False
+                out["verdict"] = "UNSAFE_CONTRACT_VIOLATION"
+            else:
+                out["all_contracts_valid"] = True
+            stale_all = [m for m in self._memory.list_all(self._ast_hashes) if m.get("stale")]
+            if stale_all:
+                out["stale_memories"] = stale_all
 
         if not files_modified and not claims and not plan_files:
             out["health"] = self.health()
 
         return out
 
-    def remember(self, target: str, note: str, tags: list[str] | None = None) -> dict:
-        """Save an AST-anchored architectural invariant or note in `.projectbrain_memory.json`."""
+    def remember(
+        self,
+        target: str = "",
+        note: str = "",
+        tags: list[str] | None = None,
+        *,
+        forbid: str | None = None,
+        action: str = "save",
+    ) -> dict:
+        """Manage AST-anchored architectural invariants & boundary rules in `.projectbrain_memory.json`."""
+        act = (action or "save").strip().lower()
+        if act == "list":
+            return self.list_memories()
+        if act == "stale":
+            res = self.list_memories()
+            stale = [m for m in res["memories"] if m.get("stale")]
+            return {"memories": stale, "count": len(stale), "boundary_rules": res["boundary_rules"]}
+        if act == "forget":
+            key = (target or forbid or note).strip()
+            if not key:
+                return {"error": "Provide `target` (id, symbol, file, or rule) to forget."}
+            return {"status": "removed", **self._memory.forget(key)}
+
         self._ensure_fresh()
+        if act == "refresh":
+            updated = self._memory.refresh_hashes(self._ast_hashes, target.strip() or None)
+            return {"status": "refreshed", "updated_count": updated}
+
+        if forbid:
+            rule = self._memory.add_boundary_rule(forbid, reason=note)
+            current_violations = self._memory.check_boundary_violations(
+                self._index, self._import_targets, self._graph, focus_rels=None,
+            )
+            rule_violations = [v for v in current_violations if v.get("rule_id") == rule.get("id")]
+            return {
+                "status": "saved_boundary_rule",
+                "boundary_rule": rule,
+                "existing_violations": rule_violations,
+            }
+
         target = target.strip()
+        if not target or not note.strip():
+            return {"error": "Provide both `target` and `note` (or `forbid='<src_glob> -> <dst_glob>'`)."}
+
         node_id = target
         rel_path = ""
         ast_hash = ""
@@ -856,9 +1081,31 @@ class ProjectBrain:
         return {"status": "saved", "memory": entry}
 
     def list_memories(self) -> dict:
+        if not self._index and self._is_db_fresh_fast(allow_zero_disk=True):
+            raw_notes = getattr(self._memory, "_notes", [])
+            nids = [m.get("target_id", "") for m in raw_notes if m.get("target_id")]
+            fast_hashes = self._db_store.get_ast_hashes_fast(nids) if nids else {}
+            notes = self._memory.list_all(fast_hashes)
+            rules = self._memory.list_boundary_rules()
+            stale_count = sum(1 for m in notes if m.get("stale"))
+            return {
+                "memories": notes,
+                "count": len(notes),
+                "stale_count": stale_count,
+                "boundary_rules": rules,
+                "boundary_rules_count": len(rules),
+            }
         self._ensure_fresh()
         notes = self._memory.list_all(self._ast_hashes)
-        return {"memories": notes, "count": len(notes)}
+        rules = self._memory.list_boundary_rules()
+        stale_count = sum(1 for m in notes if m.get("stale"))
+        return {
+            "memories": notes,
+            "count": len(notes),
+            "stale_count": stale_count,
+            "boundary_rules": rules,
+            "boundary_rules_count": len(rules),
+        }
 
     def _normalize_rel(self, file_path: str) -> str:
         try:
@@ -875,7 +1122,9 @@ class ProjectBrain:
         cells_4d: list[dict] | None = None,
         local_idf: dict[str, float] | None = None,
     ) -> float:
-        return _score_symbol_for_query_fn(self, fn, keywords, behaviors, routes, cells_4d=cells_4d, local_idf=local_idf)
+        from .dossier import score_symbol_for_query
+        self._ensure_blobs()
+        return score_symbol_for_query(self, fn, keywords, behaviors, routes, cells_4d=cells_4d, local_idf=local_idf)
 
     def _contract_in_query_scope(self, rel: str, scope_text: str, summary: str, terms: list[str]) -> bool:
         return _contract_in_query_scope_fn(self, rel, scope_text, summary, terms)
@@ -889,7 +1138,9 @@ class ProjectBrain:
         return _compile_6d_contract_diagnostics_fn(self, task, focus_files, strict_focus=strict_focus)
 
     def _score_class_for_query(self, cls: dict, keywords: list[str]) -> float:
-        return _score_class_for_query_fn(self, cls, keywords)
+        from .dossier import score_class_for_query
+        self._ensure_blobs()
+        return score_class_for_query(self, cls, keywords)
 
     # ── Session management ──────────────────────────────────────────────────
 
@@ -957,21 +1208,27 @@ class ProjectBrain:
         """Parse all Python and JS/TS files under root and cache the result."""
         import time as _time
 
+        self._reset_partial_index()
         if not self._index and self._db_store.db_path.exists() and not self._cache_path.exists():
             self.load()
 
-        prev_index = dict(self._index)
+        prev_index = self._index
         prev_sizes = dict(self._sizes)
         prev_skipped = dict(self._skipped)
         prev_graph = self._graph
+        prev_stats = getattr(self, "_cached_stats_summary", None)
 
         self._index = {}
         self._sizes = {}
         self._skipped = {}
+        self._cached_stats_summary = None
         self._source_cache.clear()
 
         now_ts = _time.time()
         any_changed = False
+        dirty_items: list[tuple[str, Path, str, float, int]] = []
+        walk_order: list[tuple[str, str]] = []
+        is_lazy_prev = isinstance(prev_index, LazyFileIndex)
 
         for path in self._walk():
             rel = str(path.relative_to(self.root)).replace("\\", "/")
@@ -986,8 +1243,9 @@ class ProjectBrain:
                 continue
 
             is_settled = (now_ts - st.st_mtime) > 2.0
-            if is_settled and rel in prev_index and st.st_mtime == prev_index[rel].get("mtime") and st.st_size == prev_sizes.get(rel):
-                self._index[rel] = prev_index[rel]
+            prev_mt = prev_index.get_mtime(rel) if is_lazy_prev else (prev_index[rel].get("mtime") if rel in prev_index else None)
+            if is_settled and prev_mt is not None and st.st_mtime == prev_mt and st.st_size == prev_sizes.get(rel):
+                walk_order.append(("clean_idx", rel))
                 self._sizes[rel] = st.st_size
                 continue
             if is_settled and rel in prev_skipped:
@@ -995,37 +1253,32 @@ class ProjectBrain:
                 continue
 
             any_changed = True
-            try:
-                source = path.read_text(encoding="utf-8", errors="ignore")
-            except OSError as e:
-                self._skipped[rel] = f"read_error:{e.__class__.__name__}"
-                continue
+            walk_order.append(("dirty", rel))
+            dirty_items.append((rel, path, ext, st.st_mtime, st.st_size))
 
-            if _is_minified(source):
-                self._skipped[rel] = "minified_or_generated"
-                continue
-
-            info, ts_tree = parse_with_tree(source, ext)
-            info.setdefault("routes", []).extend(frameworks.infer_file_based_routes(rel, info))
-            info["cells_4d"] = extract_4d_coordinate_matrix(source.splitlines(), ext=ext, tree=ts_tree)
-            info["mtime"] = st.st_mtime
-            self._index[rel] = info
-            self._sizes[rel] = st.st_size
-
+        parsed_idx, parsed_sz, parsed_skip = parse_files_parallel(dirty_items, MINIFIED_LINE_THRESHOLD)
+        self._skipped.update(parsed_skip)
         if (
             not any_changed
             and prev_index
-            and set(self._index.keys()) == set(prev_index.keys())
+            and {r for _, r in walk_order} == set(prev_index.keys())
             and set(self._skipped.keys()) == set(prev_skipped.keys())
             and prev_graph is not None
             and self._db_store.db_path.exists()
             and not self._cache_path.exists()
         ):
+            self._index = prev_index
+            self._sizes = prev_sizes
             self._graph = prev_graph
-            if not self._blobs:
-                self._build_blobs()
-                self._sync_interprocedural_effects()
+            self._cached_stats_summary = prev_stats
             return self.stats()
+
+        for kind, rel in walk_order:
+            if kind == "clean_idx":
+                self._index[rel] = prev_index[rel]
+            elif rel in parsed_idx:
+                self._index[rel] = parsed_idx[rel]
+                self._sizes[rel] = parsed_sz[rel]
 
         self._build_blobs(recompute_imports=True)
         self._graph = CodeGraph.build(
@@ -1034,12 +1287,16 @@ class ProjectBrain:
             symbol_imports=self._symbol_imports,
         )
         self._sync_interprocedural_effects()
+        self._blobs_ready = True
+        self._cached_stats_summary = compute_stats_summary(self._index)
         self._db_store.write_full(
             {
                 "schema_version": SCHEMA_VERSION,
                 "parser_version": PARSER_VERSION,
                 "graph_version": GRAPH_VERSION,
                 "root": str(self.root),
+                "stats_summary": self._cached_stats_summary,
+                "symbol_imports_b85": pack_symbol_imports(self._symbol_imports),
             },
             self._index,
             self._sizes,
@@ -1051,8 +1308,13 @@ class ProjectBrain:
                 legacy.unlink(missing_ok=True)
         return self.stats()
 
+    def _load_neighborhood_for_check(self, candidate_files: list[str]) -> bool:
+        return _load_neighborhood_for_check_fn(self, candidate_files)
+
     def load(self) -> bool:
         """Load a previously saved index from disk (SQLite .projectbrain.db primary)."""
+        self._is_partial_index = False
+        self._all_indexed_files = None
         data = None
         db_exists = self._db_store.db_path.exists()
         json_exists = self._cache_path.exists()
@@ -1073,7 +1335,7 @@ class ProjectBrain:
                 json_header_ok = False
         use_sqlite = db_exists and (not json_exists or json_header_ok)
         if use_sqlite:
-            data = self._db_store.load_all()
+            data = self._db_store.load_all(lazy_files=True)
 
         if data is None:
             if not json_exists:
@@ -1085,34 +1347,95 @@ class ProjectBrain:
 
         if not self._is_compatible_cache(data):
             return False
-        self._index = {
-            rel: {**entry.get("info", {}), "mtime": entry.get("mtime")}
-            for rel, entry in data.get("files", {}).items()
-        }
-        self._sizes = {
-            rel: entry.get("size") for rel, entry in data.get("files", {}).items()
-        }
+        if "lazy_index" in data:
+            self._index, self._sizes = data["lazy_index"], data["sizes"]
+        else:
+            self._index = {rel: {**entry.get("info", {}), "mtime": entry.get("mtime")} for rel, entry in data.get("files", {}).items()}
+            self._sizes = {rel: entry.get("size") for rel, entry in data.get("files", {}).items()}
         self._skipped = data.get("skipped", {})
-        self._build_blobs()
+        self._cached_stats_summary = data.get("stats_summary")
         if data.get("graph_json"):
             self._graph = CodeGraph.from_json(data["graph_json"])
         elif self._graph_path.exists():
             self._graph = CodeGraph.from_json(self._graph_path.read_text(encoding="utf-8"))
         else:
-            self._graph = CodeGraph.build(
-                self._index,
-                import_targets=self._import_targets,
-                symbol_imports=self._symbol_imports,
-            )
-        self._sync_interprocedural_effects()
+            self._graph = None
+        self._wire_loaded_imports(data)
+        if self._graph is None:
+            self._graph = CodeGraph.build(self._index, import_targets=self._import_targets, symbol_imports=self._symbol_imports)
         return True
 
+    def _wire_loaded_imports(self, data: dict | None = None) -> None:
+        """Fast <8ms hydration of AST hashes and pre-resolved import maps without building TF-IDF blobs."""
+        self._blobs_ready, self._doc_freq = False, None
+        for attr in (
+            "_blobs", "_token_sets", "_import_token_sets", "_body_token_sets", "_defn_sets",
+            "_z_write_sets", "_z_read_sets", "_trans_effect_sets", "_cell_4d_tokens",
+            "_const_aliases", "_idf", "_behaviors", "_ast_hashes", "_import_targets",
+            "_symbol_imports", "_imported_by",
+        ):
+            setattr(self, attr, {})
+        if data is not None and "lazy_index" in data and "symbol_imports_b85" in data and self._graph is not None:
+            self._python_module_index = {}
+            for nid, nd in self._graph.nodes.items():
+                if nd.get("ast_hash"):
+                    self._ast_hashes[nid] = nd["ast_hash"]
+            for rp in self._index:
+                self._import_targets[rp], self._symbol_imports[rp] = [], {}
+            for dst_r, src_r in data.get("file_imports") or ():
+                if src_r in self._import_targets:
+                    self._import_targets[src_r].append(dst_r)
+                self._imported_by.setdefault(dst_r, []).append(src_r)
+            for rp, sm in unpack_symbol_imports(data.get("symbol_imports_b85")).items():
+                self._symbol_imports[rp] = sm
+            self._importer_counts = {rp: len(self._imported_by.get(rp, ())) for rp in self._index}
+            return
+        need_resolve = any("_resolved_targets" not in inf or "_resolved_sym_map" not in inf for inf in self._index.values())
+        file_set = set(self._index) if need_resolve else set()
+        module_index = resolve.build_python_module_index(self._index) if need_resolve else {}
+        self._python_module_index = module_index
+        for rel_path, info in self._index.items():
+            for f in info.get("functions", []):
+                if f.get("ast_hash"):
+                    self._ast_hashes[fn_id(rel_path, f["name"], f.get("parent_class"))] = f["ast_hash"]
+            for c in info.get("classes", []):
+                if c.get("ast_hash"):
+                    self._ast_hashes[cls_id(rel_path, c["name"])] = c["ast_hash"]
+            if need_resolve:
+                targets, sym_map = resolve.resolve_file_imports_and_symbols(
+                    rel_path, info, file_set, module_index, index=self._index,
+                )
+                info["_resolved_targets"] = targets
+                info["_resolved_sym_map"] = sym_map
+            else:
+                targets = info.get("_resolved_targets", [])
+                sym_map = info.get("_resolved_sym_map", {})
+            self._import_targets[rel_path] = targets
+            self._symbol_imports[rel_path] = sym_map
+            for target in targets:
+                self._imported_by.setdefault(target, []).append(rel_path)
+        self._importer_counts = {
+            rel_path: len(self._imported_by.get(rel_path, []))
+            for rel_path in self._index
+        }
+
+    def _ensure_blobs(self) -> None:
+        """Lazily build TF-IDF lexical blobs and transitive 6D effect tokens on first lexical query."""
+        if self._index and not self._blobs_ready and not getattr(self, "_is_partial_index", False):
+            self._build_blobs(recompute_imports=False)
+            self._sync_interprocedural_effects()
+            self._blobs_ready = True
+
     def _sync_interprocedural_effects(self, target_rels: set[str] | None = None) -> None:
-        """Fold transitive_z_write and exit_contracts from CodeGraph fn nodes back into file search sets."""
+        """Fold local exit_contracts into file tokens and transitive callee effects into `_trans_effect_sets`."""
         if not self._graph:
             return
         new_toks_by_file: dict[str, set[str]] = {}
+        if not hasattr(self, "_trans_effect_sets"):
+            self._trans_effect_sets = {}
         if target_rels is not None:
+            for r in target_rels:
+                self._trans_effect_sets.pop(r, None)
             self._graph._ensure_registries()
             candidate_nids = [
                 nid
@@ -1121,6 +1444,7 @@ class ProjectBrain:
                 if nid in self._graph.nodes
             ]
         else:
+            self._trans_effect_sets = {}
             candidate_nids = list(self._graph.nodes.keys())
         for nid in candidate_nids:
             nd = self._graph.nodes[nid]
@@ -1129,22 +1453,20 @@ class ProjectBrain:
             rel = nd.get("rel_path", "")
             if not rel or rel not in self._index:
                 continue
-            zw_set = self._z_write_sets.setdefault(rel, set())
             tok_set = self._token_sets.setdefault(rel, set())
+            trans_set = self._trans_effect_sets.setdefault(rel, set())
             added = new_toks_by_file.setdefault(rel, set())
             for zw in nd.get("transitive_z_write", []):
                 zw_l = zw.lower()
-                if zw_l not in tok_set:
+                if zw_l not in tok_set and zw_l not in trans_set:
                     added.add(zw_l)
-                zw_set.add(zw_l)
-                tok_set.add(zw_l)
+                trans_set.add(zw_l)
                 for sub_t in _tokenize_symbol(zw):
                     if len(sub_t) >= 3:
-                        if sub_t not in tok_set:
+                        if sub_t not in tok_set and sub_t not in trans_set:
                             added.add(sub_t)
-                        zw_set.add(sub_t)
-                        tok_set.add(sub_t)
-            for ex in nd.get("exit_contracts", []) + nd.get("transitive_exits", []):
+                        trans_set.add(sub_t)
+            for ex in nd.get("exit_contracts", []):
                 ex_clean = ex.split(":", 1)[-1].lower()
                 if len(ex_clean) >= 3:
                     if ex_clean not in tok_set:
@@ -1155,6 +1477,17 @@ class ProjectBrain:
                             if sub_t not in tok_set:
                                 added.add(sub_t)
                             tok_set.add(sub_t)
+            for ex in nd.get("transitive_exits", []):
+                ex_clean = ex.split(":", 1)[-1].lower()
+                if len(ex_clean) >= 3:
+                    if ex_clean not in tok_set and ex_clean not in trans_set:
+                        added.add(ex_clean)
+                    trans_set.add(ex_clean)
+                    for sub_t in _tokenize_symbol(ex.split(":", 1)[-1]):
+                        if len(sub_t) >= 3:
+                            if sub_t not in tok_set and sub_t not in trans_set:
+                                added.add(sub_t)
+                            trans_set.add(sub_t)
         n_files = max(len(self._index), 1)
         for rel, toks in new_toks_by_file.items():
             if toks:
@@ -1294,6 +1627,7 @@ class ProjectBrain:
         self._ast_hashes = {}
         self._z_write_sets = {}
         self._z_read_sets: dict[str, set[str]] = {}
+        self._trans_effect_sets = {}
         self._cell_4d_tokens = {}
         self._const_aliases: dict[str, list[str]] = {}
         doc_freq: dict[str, int] = {}
@@ -1345,6 +1679,7 @@ class ProjectBrain:
             for rel_path in self._index
         }
         self._behaviors = {}
+        self._blobs_ready = True
 
     def _get_file_behaviors(self, rel_path: str) -> dict[str, str]:
         """Lazily compute and cache behavioral roles per file on demand."""
@@ -1361,6 +1696,51 @@ class ProjectBrain:
     def _update_blobs_incremental(self, changed_rels: set[str], deleted_rels: set[str], has_added_or_deleted: bool = False) -> None:
         """Incrementally update per-file blobs, IDF, imports, and behaviors in O(delta) time."""
         doc_freq = getattr(self, "_doc_freq", None)
+        if not self._blobs_ready and not getattr(self, "_is_partial_index", False):
+            # Fast O(delta) import & AST-hash update without triggering full-repo TF-IDF blob synthesis
+            affected_t: set[str] = set()
+            for rel in deleted_rels | changed_rels:
+                self._behaviors.pop(rel, None)
+                self._importer_counts.pop(rel, None)
+                for old_t in self._import_targets.pop(rel, []):
+                    affected_t.add(old_t)
+                    imp_list = self._imported_by.get(old_t)
+                    if imp_list and rel in imp_list:
+                        imp_list.remove(rel)
+                self._symbol_imports.pop(rel, None)
+                if rel in deleted_rels:
+                    self._imported_by.pop(rel, None)
+            file_set_f = set(self._index)
+            if has_added_or_deleted or not getattr(self, "_python_module_index", None):
+                self._python_module_index = resolve.build_python_module_index(file_set_f)
+            mod_idx = self._python_module_index
+            for rel in changed_rels:
+                info = self._index.get(rel)
+                if not info:
+                    continue
+                for f in info.get("functions", []):
+                    if f.get("ast_hash"):
+                        self._ast_hashes[fn_id(rel, f["name"], f.get("parent_class"))] = f["ast_hash"]
+                for c in info.get("classes", []):
+                    if c.get("ast_hash"):
+                        self._ast_hashes[cls_id(rel, c["name"])] = c["ast_hash"]
+                targets, sym_map = resolve.resolve_file_imports_and_symbols(
+                    rel, info, file_set_f, mod_idx, index=self._index,
+                )
+                info["_resolved_targets"] = targets
+                info["_resolved_sym_map"] = sym_map
+                self._import_targets[rel] = targets
+                self._symbol_imports[rel] = sym_map
+                for target in targets:
+                    affected_t.add(target)
+                    imp_list = self._imported_by.setdefault(target, [])
+                    if rel not in imp_list:
+                        imp_list.append(rel)
+                self._importer_counts[rel] = len(self._imported_by.get(rel, []))
+            for t in affected_t:
+                if t in self._index:
+                    self._importer_counts[t] = len(self._imported_by.get(t, []))
+            return
         if doc_freq is None:
             self._build_blobs()
             return
@@ -1381,6 +1761,8 @@ class ProjectBrain:
             self._defn_sets.pop(rel, None)
             self._z_write_sets.pop(rel, None)
             self._z_read_sets.pop(rel, None)
+            if hasattr(self, "_trans_effect_sets"):
+                self._trans_effect_sets.pop(rel, None)
             self._cell_4d_tokens.pop(rel, None)
             self._behaviors.pop(rel, None)
             self._importer_counts.pop(rel, None)
@@ -1395,10 +1777,27 @@ class ProjectBrain:
                 self._imported_by.pop(rel, None)
 
         _JSX_EXTS = {".tsx", ".jsx"}
-        file_set = set(self._index)
+        if self._all_indexed_files is not None:
+            self._all_indexed_files.difference_update(deleted_rels)
+            self._all_indexed_files.update(changed_rels)
+            file_set = set(self._all_indexed_files)
+        else:
+            file_set = set(self._index)
         if has_added_or_deleted or not getattr(self, "_python_module_index", None):
-            self._python_module_index = resolve.build_python_module_index(self._index)
+            self._python_module_index = resolve.build_python_module_index(file_set)
         module_index = self._python_module_index
+
+        if getattr(self, "_is_partial_index", False):
+            _owner = self
+
+            class _LazySelfIndex:
+                def get(self, k: str, default: object = None) -> object:
+                    inf = _owner._get_file_info(k)
+                    return inf if inf is not None else default
+
+            resolve_index_view: object = _LazySelfIndex()
+        else:
+            resolve_index_view = self._index
 
         for rel in changed_rels:
             info = self._index.get(rel)
@@ -1409,7 +1808,7 @@ class ProjectBrain:
                 doc_freq[tok] = doc_freq.get(tok, 0) + 1
                 touched_tokens.add(tok)
             targets, sym_map = resolve.resolve_file_imports_and_symbols(
-                rel, info, file_set, module_index, index=self._index,
+                rel, info, file_set, module_index, index=resolve_index_view,
             )
             info["_resolved_targets"] = targets
             info["_resolved_sym_map"] = sym_map
@@ -1480,29 +1879,79 @@ class ProjectBrain:
         known_keys = set(self._index.keys()) | set(self._skipped.keys())
         if current.keys() != known_keys:
             return True
-        return any(current[rel] != self._index[rel].get("mtime") for rel in self._index if rel in current)
+        is_lazy = isinstance(self._index, LazyFileIndex)
+        return any(
+            current[rel] != (self._index.get_mtime(rel) if is_lazy else self._index[rel].get("mtime"))
+            for rel in self._index if rel in current
+        )
 
-    def incremental_index(self) -> dict:
-        """Re-parse only changed files instead of a full re-index."""
+    def incremental_index(self, candidate_files: list[str] | None = None) -> dict:
+        """Re-parse only changed files instead of a full re-index.
+
+        When `candidate_files` is provided (e.g. from a post-edit hook), only those files
+        and their 1-hop import neighbors are stat()'d on disk (`O(k)` instead of a full repo walk).
+        """
+        if candidate_files is None and getattr(self, "_is_partial_index", False):
+            self._reset_partial_index()
+            self.load()
         if not self._index:
             return self.index()
 
-        current_files: dict[str, tuple[str, float]] = {
-            rel: (abs_path, mtime)
-            for rel, abs_path, mtime in self._walk_entries()
-        }
+        if candidate_files is not None:
+            rels_to_stat: set[str] = set()
+            cand_rels: set[str] = set()
+            for raw_f in candidate_files:
+                r = self._normalize_rel(str(raw_f))
+                if r:
+                    cand_rels.add(r)
+                    rels_to_stat.add(r)
+                    for imp_r in self._imported_by.get(r, ()):
+                        if imp_r in self._index or not self._all_indexed_files or imp_r not in self._all_indexed_files:
+                            rels_to_stat.add(imp_r)
+                    for tgt_r in self._import_targets.get(r, ()):
+                        if tgt_r in self._index or not self._all_indexed_files or tgt_r not in self._all_indexed_files:
+                            rels_to_stat.add(tgt_r)
+            added: set[str] = set()
+            deleted: set[str] = set()
+            modified: set[str] = set()
+            current_files: dict[str, tuple[str, float]] = {}
+            for r in rels_to_stat:
+                p = self.root / r
+                try:
+                    st = p.stat()
+                    current_files[r] = (str(p), st.st_mtime)
+                    if (
+                        r not in self._index
+                        and r not in self._skipped
+                        and not (self._all_indexed_files and r in self._all_indexed_files)
+                    ):
+                        if p.suffix.lower() in PARSED_EXTS:
+                            added.add(r)
+                    elif r in self._index and st.st_mtime != (
+                        self._index.get_mtime(r) if isinstance(self._index, LazyFileIndex) else self._index[r].get("mtime")
+                    ):
+                        modified.add(r)
+                except OSError:
+                    if r in self._index or r in self._skipped:
+                        deleted.add(r)
+        else:
+            current_files = {
+                rel: (abs_path, mtime)
+                for rel, abs_path, mtime in self._walk_entries()
+            }
 
-        old_keys = set(self._index.keys()) | set(self._skipped.keys())
-        new_keys = set(current_files.keys())
+            old_keys = set(self._index.keys()) | set(self._skipped.keys())
+            new_keys = set(current_files.keys())
 
-        added = new_keys - old_keys
-        deleted = old_keys - new_keys
-        potentially_modified = set(self._index.keys()) & new_keys
+            added = new_keys - old_keys
+            deleted = old_keys - new_keys
+            potentially_modified = set(self._index.keys()) & new_keys
 
-        modified: set[str] = {
-            rel for rel in potentially_modified
-            if current_files[rel][1] != self._index[rel].get("mtime")
-        }
+            is_lazy_inc = isinstance(self._index, LazyFileIndex)
+            modified = {
+                rel for rel in potentially_modified
+                if current_files[rel][1] != (self._index.get_mtime(rel) if is_lazy_inc else self._index[rel].get("mtime"))
+            }
 
         if not added and not deleted and not modified:
             return {
@@ -1539,8 +1988,15 @@ class ProjectBrain:
                 self._pre_edit_index[rel] = dict(old_info)
             old_iface_hash = compute_file_interface_hash(old_info) if old_info else None
 
+            pending = self._pending_parsed_files.pop(rel, None)
             try:
-                source = path.read_text(encoding="utf-8", errors="ignore")
+                st = path.stat()
+                if pending is not None and pending[3] == st.st_mtime and pending[4] == st.st_size:
+                    info_raw, ts_tree, source, _, _ = pending
+                else:
+                    source = path.read_text(encoding="utf-8", errors="ignore")
+                    info_raw = None
+                    ts_tree = None
             except OSError as e:
                 self._skipped[rel] = f"read_error:{e.__class__.__name__}"
                 skipped_changed = True
@@ -1550,8 +2006,8 @@ class ProjectBrain:
                 all_interfaces_unchanged = False
                 continue
 
-            if _is_minified(source):
-                self._skipped[rel] = "minified_or_generated"
+            if _is_minified(source) or _is_unexpanded_symlink(path, source):
+                self._skipped[rel] = "minified_or_generated" if _is_minified(source) else "symlink_stub"
                 skipped_changed = True
                 if was_in_index:
                     self._index.pop(rel, None)
@@ -1562,8 +2018,12 @@ class ProjectBrain:
             if rel in self._skipped:
                 self._skipped.pop(rel, None)
                 skipped_changed = True
-            st = path.stat()
-            info, ts_tree = parse_with_tree(source, ext)
+            self._source_cache[rel] = source
+            if info_raw is not None:
+                info = dict(info_raw)
+                info["routes"] = list(info.get("routes") or [])
+            else:
+                info, ts_tree = parse_with_tree(source, ext)
             info.setdefault("routes", []).extend(frameworks.infer_file_based_routes(rel, info))
             info["cells_4d"] = extract_4d_coordinate_matrix(source.splitlines(), ext=ext, tree=ts_tree)
             info["mtime"] = st.st_mtime
@@ -1593,6 +2053,13 @@ class ProjectBrain:
             }
 
         changed_indexed = {r for r in (added | modified) if r in self._index}
+        self._cached_stats_summary = None
+        inc_meta = {
+            "schema_version": SCHEMA_VERSION,
+            "parser_version": PARSER_VERSION,
+            "graph_version": GRAPH_VERSION,
+            "root": str(self.root),
+        }
         if self._graph is not None and len(changed_indexed | deleted_indexed) <= 30:
             self._update_blobs_incremental(
                 changed_indexed,
@@ -1608,14 +2075,12 @@ class ProjectBrain:
                 imported_by=self._imported_by,
                 interfaces_unchanged=all_interfaces_unchanged,
             )
-            self._sync_interprocedural_effects(target_rels=set(graph_delta["affected_rels"]))
+            if self._blobs_ready:
+                self._sync_interprocedural_effects(target_rels=set(graph_delta["affected_rels"]))
+            if not getattr(self, "_is_partial_index", False):
+                inc_meta["symbol_imports_b85"] = pack_symbol_imports(self._symbol_imports)
             self._db_store.apply_incremental(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "parser_version": PARSER_VERSION,
-                    "graph_version": GRAPH_VERSION,
-                    "root": str(self.root),
-                },
+                inc_meta,
                 {r: self._index[r] for r in changed_indexed},
                 self._sizes,
                 deleted_indexed,
@@ -1625,6 +2090,10 @@ class ProjectBrain:
                 skipped_changed=skipped_changed,
             )
         else:
+            if getattr(self, "_is_partial_index", False):
+                self._reset_partial_index()
+                self.load()
+                return self.incremental_index(candidate_files=candidate_files)
             self._build_blobs()
             self._graph = CodeGraph.build(
                 self._index,
@@ -1632,13 +2101,11 @@ class ProjectBrain:
                 symbol_imports=self._symbol_imports,
             )
             self._sync_interprocedural_effects()
+            self._cached_stats_summary = compute_stats_summary(self._index)
+            inc_meta["stats_summary"] = self._cached_stats_summary
+            inc_meta["symbol_imports_b85"] = pack_symbol_imports(self._symbol_imports)
             self._db_store.apply_incremental(
-                {
-                    "schema_version": SCHEMA_VERSION,
-                    "parser_version": PARSER_VERSION,
-                    "graph_version": GRAPH_VERSION,
-                    "root": str(self.root),
-                },
+                inc_meta,
                 {r: self._index[r] for r in changed_indexed},
                 self._sizes,
                 deleted_indexed,
@@ -1660,6 +2127,7 @@ class ProjectBrain:
         }
 
     def _ensure_fresh(self) -> None:
+        self._reset_partial_index()
         if not self._index:
             self.load()
         if not self._index:
@@ -1682,6 +2150,7 @@ class ProjectBrain:
     def query(self, prompt: str, top_n: int = 10, min_score_ratio: float | None = None) -> list[dict]:
         """Return the top_n most relevant files for a natural language prompt."""
         self._ensure_fresh()
+        self._ensure_blobs()
 
         base_keywords = _extract_keywords(prompt)
         keywords = self._expand_keywords_with_aliases(base_keywords)
@@ -1720,6 +2189,7 @@ class ProjectBrain:
             z_reads = getattr(self, "_z_read_sets", {}).get(rel_path, set())
             tokens = self._token_sets.get(rel_path, set())
             imp_tokens = imp_token_map.get(rel_path, set())
+            trans_effects = getattr(self, "_trans_effect_sets", {}).get(rel_path, set())
             body_tokens = self._body_token_sets.get(rel_path, set())
             score = 0.0
             c_hits = 0
@@ -1731,6 +2201,7 @@ class ProjectBrain:
                 hit_own = False
                 for kw in members:
                     matched_token = kw in tokens
+                    matched_trans = kw in trans_effects
                     matched_imp = kw in imp_tokens
                     matched_body = kw in body_tokens
                     matched_sub = len(kw) >= 4 and kw in blob
@@ -1740,7 +2211,7 @@ class ProjectBrain:
                     in_dir = (not is_test_f or query_wants_tests) and (
                         kw in dir_segs or kw.rstrip("s") in dir_segs or kw in dir_lower
                     )
-                    if not (matched_token or matched_imp or matched_body or matched_sub or in_stem or in_dir):
+                    if not (matched_token or matched_trans or matched_imp or matched_body or matched_sub or in_stem or in_dir):
                         continue
                     idf_weight = (0.7 + 0.3 * self._idf.get(kw, 1.0)) if multi_kw else 1.0
                     if kw in defns:
@@ -1751,6 +2222,9 @@ class ProjectBrain:
                         hit_own = True
                     elif matched_token:
                         base_hit = 1.0
+                        hit_own = True
+                    elif matched_trans:
+                        base_hit = 0.55
                         hit_own = True
                     elif matched_body:
                         base_hit = 0.35
@@ -2056,8 +2530,8 @@ class ProjectBrain:
     def verify_plan(self, task: str, files_to_edit: list[str], files_to_create: list[str] | None = None) -> dict:
         return _verify_plan_fn(self, task, files_to_edit, files_to_create=files_to_create)
 
-    def impact(self, files_changed: list[str] | str) -> dict:
-        return _verify_impact_fn(self, files_changed)
+    def impact(self, files_changed: list[str] | str, *, _already_fresh: bool = False) -> dict:
+        return _verify_impact_fn(self, files_changed, _already_fresh=_already_fresh)
 
     def _connections(self, rel_path: str) -> list[dict]:
         connections = [
@@ -2110,24 +2584,28 @@ class ProjectBrain:
         """Summary counts for the current index plus cumulative ROI savings telemetry."""
         if reset:
             return self._ledger.reset()
+        self._reset_partial_index()
         if not self._index and self._db_store.db_path.exists():
             self.load()
+        cached_s = getattr(self, "_cached_stats_summary", None) or compute_stats_summary(self._index)
+        self._cached_stats_summary = cached_s
         result = {
             "files": len(self._index),
-            "functions": sum(len(v.get("functions", [])) for v in self._index.values()),
-            "classes": sum(len(v.get("classes", [])) for v in self._index.values()),
-            "routes": sum(len(v.get("routes", [])) for v in self._index.values()),
-            "cells_6d": sum(len(v.get("cells_4d", [])) for v in self._index.values()),
-            "cells_4d": sum(len(v.get("cells_4d", [])) for v in self._index.values()),
+            "functions": cached_s["functions"],
+            "classes": cached_s["classes"],
+            "routes": cached_s["routes"],
+            "cells_6d": cached_s["cells_4d"],
+            "cells_4d": cached_s["cells_4d"],
             "memories": len(self._memory._notes),
+            "boundary_rules": len(self._memory._boundary_rules),
             "storage_backend": "sqlite" if self._db_store.db_path.exists() else "json",
             "schema_version": SCHEMA_VERSION,
             "parser_version": PARSER_VERSION,
             "graph_version": GRAPH_VERSION,
             "root": str(self.root),
+            "parse_status": dict(cached_s["parse_status"]),
+            "skipped": len(self._skipped),
         }
-        result["parse_status"] = self._parse_status_counts()
-        result["skipped"] = len(self._skipped)
         if self._graph:
             result["graph_nodes"] = len(self._graph.nodes)
             result["graph_edges"] = len(self._graph.edges)
@@ -2175,84 +2653,17 @@ class ProjectBrain:
         return _runner_run_command_compressed(self, command, timeout=timeout, max_lines=max_lines)
 
     def _load_gitignore_rules(self, gitignore_file: Path, base_rel: str) -> list[tuple[bool, bool, str, re.Pattern]]:
-        """Parse and cache `.gitignore` rules as `(is_negated, dir_only, base_rel, compiled_regex)`."""
+        from .runner import load_gitignore_rules
         cache = getattr(self, "_gitignore_cache", None)
         if cache is None:
             cache = {}
             self._gitignore_cache = cache
-        try:
-            st = gitignore_file.stat()
-        except OSError:
-            return []
-        key = (str(gitignore_file), st.st_mtime)
-        if key in cache:
-            return cache[key]
-        rules: list[tuple[bool, bool, str, re.Pattern]] = []
-        try:
-            raw_lines = gitignore_file.read_text(encoding="utf-8", errors="ignore").splitlines()
-        except OSError:
-            return []
-        for raw in raw_lines:
-            line = raw.strip()
-            if not line or line.startswith("#"):
-                continue
-            is_neg = line.startswith("!")
-            if is_neg:
-                line = line[1:].strip()
-            if not line:
-                continue
-            dir_only = line.endswith("/")
-            if dir_only:
-                line = line.rstrip("/")
-            if not line:
-                continue
-            anchored = "/" in line
-            if line.startswith("/"):
-                line = line.lstrip("/")
-            # Convert gitignore glob to regex
-            i, n = 0, len(line)
-            rx = ["^" if anchored else "(?:^|/)"]
-            while i < n:
-                ch = line[i]
-                if ch == "*":
-                    if i + 1 < n and line[i + 1] == "*":
-                        if i + 2 < n and line[i + 2] == "/":
-                            rx.append("(?:.*/)?")
-                            i += 3
-                            continue
-                        rx.append(".*")
-                        i += 2
-                        continue
-                    rx.append("[^/]*")
-                elif ch == "?":
-                    rx.append("[^/]")
-                elif ch in ".+^$(){}[]|\\-":
-                    rx.append("\\" + ch)
-                else:
-                    rx.append(ch)
-                i += 1
-            rx.append("(?:$|/)")
-            try:
-                rules.append((is_neg, dir_only, base_rel, re.compile("".join(rx))))
-            except re.error:
-                continue
-        cache[key] = rules
-        return rules
+        return load_gitignore_rules(cache, gitignore_file, base_rel)
 
     @staticmethod
     def _matches_gitignore(rel_posix: str, is_dir: bool, rules: list[tuple[bool, bool, str, re.Pattern]]) -> bool:
-        for is_neg, dir_only, base_rel, rx in reversed(rules):
-            if dir_only and not is_dir:
-                continue
-            if base_rel:
-                if not rel_posix.startswith(base_rel + "/"):
-                    continue
-                target = rel_posix[len(base_rel) + 1:]
-            else:
-                target = rel_posix
-            if rx.search(target):
-                return not is_neg
-        return False
+        from .runner import matches_gitignore
+        return matches_gitignore(rel_posix, is_dir, rules)
 
     def _walk_entries(self) -> list[tuple[str, str, float]]:
         """Fast os.scandir traversal returning (rel_posix, abs_path_str, mtime)."""
@@ -2362,7 +2773,7 @@ class ProjectBrain:
             kept_dirs: list[tuple[str, str]] = []
             for d_entry in dir_entries:
                 d = d_entry.name
-                if d in SKIP_DIRS or d.startswith((".pytest", ".mypy", ".ruff", ".tox", ".nox")) or d == "target":
+                if d in SKIP_DIRS or d.startswith((".pytest", "pytest-of-", ".mypy", ".ruff", ".tox", ".nox")) or d == "target":
                     continue
                 if d == "projectbrain" and os.path.exists(
                     os.path.join(d_entry.path, "src", "projectbrain", "brain.py")
@@ -2421,20 +2832,7 @@ class ProjectBrain:
 
 
 def _is_minified(source: str) -> bool:
-    lines = source.splitlines()
-    if not lines:
-        return False
-    non_empty = [len(line) for line in lines if line.strip()]
-    if not non_empty:
-        return False
-    max_len = max(non_empty)
-    if max_len <= MINIFIED_LINE_THRESHOLD:
-        return False
-    if max_len > 5000 or len(non_empty) <= 5:
-        return True
-    long_count = sum(1 for ln in non_empty if ln > MINIFIED_LINE_THRESHOLD)
-    avg_len = sum(non_empty) / len(non_empty)
-    return (long_count / len(non_empty)) > 0.25 or avg_len > 250
+    return _is_minified_src(source, MINIFIED_LINE_THRESHOLD)
 
 
 _TEST_QUERY_TERMS = {
@@ -2447,7 +2845,7 @@ _TEST_QUERY_TERMS = {
 def _is_test_file(rel_path: str) -> bool:
     p = Path(rel_path)
     parts_low = {seg.lower() for seg in p.parts[:-1]}
-    if parts_low & {"tests", "test", "testing", "__tests__", "spec", "specs", "e2e", "benchmarks", "benchmark"}:
+    if parts_low & {"tests", "test", "testing", "__tests__", "spec", "specs", "e2e", "benchmarks", "benchmark", "eval", "evals"}:
         return True
     name_low = p.name.lower()
     stem_low = p.stem.lower()

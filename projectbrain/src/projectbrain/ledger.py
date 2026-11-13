@@ -90,6 +90,15 @@ class SavingsLedger:
                 "files_patched": 0,
                 "syntax_verified_patches": 0,
             },
+            "interceptions": {
+                "audits_run": 0,
+                "clean_edits_audited": 0,
+                "syntax_errors_caught": 0,
+                "contract_violations_caught": 0,
+                "boundary_violations_caught": 0,
+                "signature_blast_alerts": 0,
+                "stale_invariants_flagged": 0,
+            },
             "session_seen": {},
             "recent_events": [],
         }
@@ -273,10 +282,66 @@ class SavingsLedger:
         self._save(data)
         return event
 
+    def record_guardrail_audit(
+        self,
+        source: str,
+        files_audited: int = 1,
+        syntax_errors: int = 0,
+        contract_violations: int = 0,
+        boundary_violations: int = 0,
+        signature_blast_alerts: int = 0,
+        stale_invariants: int = 0,
+    ) -> dict:
+        """Record a post-edit hook, pre-commit, or CI guardrail audit outcome."""
+        data = self._load()
+        data["total_ops"] = data.get("total_ops", 0) + 1
+        ops_map = data.setdefault("ops_by_type", {})
+        ops_map["guardrail"] = ops_map.get("guardrail", 0) + 1
+
+        ic = data.setdefault("interceptions", {})
+        ic["audits_run"] = ic.get("audits_run", 0) + 1
+        total_hits = (
+            int(syntax_errors)
+            + int(contract_violations)
+            + int(boundary_violations)
+            + int(signature_blast_alerts)
+            + int(stale_invariants)
+        )
+        if total_hits == 0:
+            ic["clean_edits_audited"] = ic.get("clean_edits_audited", 0) + 1
+        else:
+            ic["syntax_errors_caught"] = ic.get("syntax_errors_caught", 0) + int(syntax_errors)
+            ic["contract_violations_caught"] = ic.get("contract_violations_caught", 0) + int(contract_violations)
+            ic["boundary_violations_caught"] = ic.get("boundary_violations_caught", 0) + int(boundary_violations)
+            ic["signature_blast_alerts"] = ic.get("signature_blast_alerts", 0) + int(signature_blast_alerts)
+            ic["stale_invariants_flagged"] = ic.get("stale_invariants_flagged", 0) + int(stale_invariants)
+
+        event = {
+            "ts": time.strftime("%H:%M:%S", time.gmtime()),
+            "op": f"guardrail:{source}",
+            "files_audited": int(files_audited),
+            "interceptions": total_hits,
+        }
+        recent = data.setdefault("recent_events", [])
+        recent.append(event)
+        if len(recent) > 25:
+            data["recent_events"] = recent[-25:]
+
+        self._save(data)
+        return event
+
     def get_stats(self) -> dict:
-        """Return formatted resolution and structural coverage statistics."""
+        """Return formatted resolution, guardrail interception, and structural coverage statistics."""
         data = self._load()
         res = data.get("resolution", {})
+        ic = data.get("interceptions", {})
+        total_interceptions = (
+            ic.get("syntax_errors_caught", 0)
+            + ic.get("contract_violations_caught", 0)
+            + ic.get("boundary_violations_caught", 0)
+            + ic.get("signature_blast_alerts", 0)
+            + ic.get("stale_invariants_flagged", 0)
+        )
         return {
             "ledger_path": str(self.path),
             "started_at": data.get("started_at"),
@@ -291,6 +356,16 @@ class SavingsLedger:
                 "files_patched": res.get("files_patched", 0),
                 "syntax_verified_patches": res.get("syntax_verified_patches", 0),
                 "files_in_working_memory": len(self._session_seen),
+            },
+            "interceptions": {
+                "total_interceptions": total_interceptions,
+                "audits_run": ic.get("audits_run", 0),
+                "clean_edits_audited": ic.get("clean_edits_audited", 0),
+                "syntax_errors_caught": ic.get("syntax_errors_caught", 0),
+                "contract_violations_caught": ic.get("contract_violations_caught", 0),
+                "boundary_violations_caught": ic.get("boundary_violations_caught", 0),
+                "signature_blast_alerts": ic.get("signature_blast_alerts", 0),
+                "stale_invariants_flagged": ic.get("stale_invariants_flagged", 0),
             },
             "recent_events": data.get("recent_events", [])[-10:],
         }

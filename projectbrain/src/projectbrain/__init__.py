@@ -1,4 +1,9 @@
-from .brain import ProjectBrain
-
-__version__ = "0.9.1"
+__version__ = "1.0.0"
 __all__ = ["ProjectBrain", "__version__"]
+
+
+def __getattr__(name: str):
+    if name == "ProjectBrain":
+        from .brain import ProjectBrain
+        return ProjectBrain
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

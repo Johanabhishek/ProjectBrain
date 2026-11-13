@@ -1,25 +1,30 @@
-"""ProjectBrain MCP Server (v2: High-Leverage Context Compiler & Slicer).
+"""ProjectBrain MCP Server (v1.0: Zero-LSP Code Graph & Blast-Radius Guardrail).
 
-Exposes 5 primary power tools designed to stop LLM coding agents from wasting
-tokens on full-file reads and multi-turn grep loops:
-  1. `brain_context`  — One-call Context Compiler: returns surgical AST code slices
-                        for target functions/classes + signature-only skeletons for
-                        1-hop neighbors + AST-anchored memories (auto-deduplicated!).
-  2. `brain_slice`    — Surgical Symbol/Range Reader: reads exact function/class code
-                        or file signature skeletons without opening full files.
-  3. `brain_explore`  — Unified Graph Navigator: finds neighborhood callers/callees,
-                        shortest path between two symbols, or frontend->backend flow.
-  4. `brain_check`    — Pre-Flight Verifier & Blast Radius: fact-checks structural claims,
-                        validates edit plans, and reports downstream callers/tests.
-  5. `brain_remember` — Persistent Repo Memory: pins discovered architectural rules or
-                        gotchas to AST nodes in `.projectbrain_memory.json`.
+Exposes 5 primary non-overlapping power tools by default (`--lean`):
+  1. `brain_dossier`  — One-call Architecture & Context Compiler: returns PDG/AST code
+                        slices, 1-2 hop caller/callee skeletons, route/state flows,
+                        covering tests, and pinned AST invariants.
+  2. `brain_slice`    — `<20ms` Surgical Symbol, File Skeleton & Intra-Function PDG
+                        Reader (`focus` variable slicing without full-file reads).
+  3. `brain_explore`  — Unified Code Graph Navigator: traces callers/callees, shortest
+                        path `A -> B`, `/api/...` frontend-to-DB flows, and git co-changes.
+  4. `brain_check`    — Pre-Flight Verifier, Cross-File Contract Gate & Blast Radius:
+                        validates edit plans, 3-valued claims (`SUPPORTED`/`REFUTED`/`UNKNOWN`),
+                        boundary rules, caller impact, and stale invariants.
+  5. `brain_remember` — Git-Tracked AST Invariants & Architectural Boundary Rules
+                        (`.projectbrain_memory.json`) with automatic staleness detection.
 
-Legacy tools (`projectbrain_query`, `projectbrain_get_context`, etc.) are also kept
-for backward compatibility.
+Pass `--full` (or `PROJECTBRAIN_FULL_TOOLS=1`) to also expose auxiliary tools
+(`brain_context`, `brain_stats`, `brain_run`, `brain_patch`).
 """
+from __future__ import annotations
+
+import argparse
 import os
 import sys
 import threading
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 try:
     from mcp.server.fastmcp import FastMCP
@@ -29,146 +34,115 @@ except ImportError:
     except ImportError:
         from mcp.server import FastMCP  # type: ignore[attr-defined,no-redef]
 
-from .brain import ProjectBrain
+if TYPE_CHECKING:
+    from .brain import ProjectBrain
 
 
-def _resolve_root() -> str:
-    if len(sys.argv) > 1:
-        return sys.argv[1]
-    return os.environ.get("PROJECTBRAIN_ROOT", os.getcwd())
+def parse_server_args(argv: list[str] | None = None) -> argparse.Namespace:
+    """Parse CLI arguments for `projectbrain-mcp` without mistaking flags for paths."""
+    parser = argparse.ArgumentParser(prog="projectbrain-mcp", add_help=True)
+    parser.add_argument("repo_path", nargs="?", default=None, help="Repository root path")
+    parser.add_argument("--path", dest="flag_path", default=None, help="Explicit repository root path")
+    parser.add_argument("--lean", action="store_true", help="Expose the 5 core MCP tools (default)")
+    parser.add_argument("--full", "--all-tools", dest="full", action="store_true", help="Expose all MCP tools")
+    parser.add_argument("--allow-exec", action="store_true", help="Allow direct shell execution in brain_run")
+    args, _ = parser.parse_known_args(argv)
+    return args
+
+
+def _resolve_root(argv: list[str] | None = None) -> str:
+    args = parse_server_args(argv if argv is not None else sys.argv[1:])
+    chosen = args.flag_path or args.repo_path or os.environ.get("PROJECTBRAIN_ROOT") or os.getcwd()
+    return str(Path(chosen).resolve())
+
+
+def _is_unsafe_unindexed_root(target: Path) -> bool:
+    """Prevent accidental multi-minute scans of `/` or `$HOME` when no repo_path was configured."""
+    resolved = target.resolve()
+    if (resolved / ".projectbrain.db").exists() or (resolved / ".git").exists() or (resolved / "pyproject.toml").exists() or (resolved / "package.json").exists():
+        return False
+    if resolved == resolved.anchor or str(resolved) == resolved.drive + "\\":
+        return True
+    try:
+        if resolved == Path.home().resolve():
+            return True
+    except Exception:
+        pass
+    return False
 
 
 mcp = FastMCP("projectbrain")
-_default_root = _resolve_root()
-_brain = ProjectBrain(_default_root)
-_brains_by_root: dict[str, ProjectBrain] = {os.path.abspath(_default_root): _brain}
+_brains_by_root: dict[str, "ProjectBrain"] = {}
 _brains_lock = threading.RLock()
 
 
-def _get_brain(repo_path: str | None = None) -> ProjectBrain:
-    if not repo_path:
-        return _brain
-    key = os.path.abspath(repo_path)
+def _get_brain(repo_path: str | None = None) -> "ProjectBrain":
+    from .brain import ProjectBrain
+
+    raw_target = repo_path or _resolve_root()
+    resolved = Path(raw_target).resolve()
+    if _is_unsafe_unindexed_root(resolved):
+        raise ValueError(
+            f"Refusing to scan unindexed system/home directory '{resolved}'. "
+            "Pass `repo_path='/path/to/your/repo'` or configure `projectbrain-mcp /path/to/your/repo`."
+        )
+    key = str(resolved)
     with _brains_lock:
         if key not in _brains_by_root:
             _brains_by_root[key] = ProjectBrain(key)
         return _brains_by_root[key]
 
 
-# ── v2 Power Tools (Primary Agent Interface) ─────────────────────────────────
-
-@mcp.tool()
-def brain_context(
-    task: str,
-    budget_tokens: int = 3000,
-    top_n: int = 4,
-    repo_path: str | None = None,
-) -> dict:
-    """Compile surgical code slices and neighbor signature skeletons for a task in ONE call.
-
-    ALWAYS CALL THIS FIRST before grepping or calling view_file on unfamiliar files.
-    Unlike file search tools that only return file paths (forcing you to read 1,000-line
-    files afterward), `brain_context` directly returns:
-      - `target_slices`: The EXACT source code (with line numbers) of the top matching
-        functions, methods, or classes you need to inspect or edit.
-      - `neighbor_skeletons`: Compact AST signature skeletons (parameters, return types,
-        class fields, docstrings — implementation bodies stripped!) for connected files
-        so you know how to call dependencies without reading their full source.
-      - `memories`: Persistent architectural notes anchored to these symbols, automatically
-        checked for staleness against current AST hashes.
-      - `related_tests`: Exact test files that cover the matched code.
-      - Automatic session deduplication: symbols already served to you in this session
-        are omitted automatically so you never waste tokens re-reading the same code.
-
-    Parameters:
-      task          — Natural-language description of what you are trying to fix, build,
-                      or understand (e.g. "add discount code to checkout", "fix 404 on /users").
-      budget_tokens — Approximate token budget for the compiled packet (default: 3000).
-      top_n         — Number of top files to compile from (default: 4).
-      repo_path     — Optional path to repository root (defaults to active workspace).
-    """
-    return _get_brain(repo_path).compile_context(task, budget_tokens=budget_tokens, top_n=top_n)
-
+# ── Core 5 Power Tools (Default Lean Agent Surface) ──────────────────────────
 
 @mcp.tool()
 def brain_dossier(
-    tasks: list[str],
+    tasks: list[str] | str,
     impact_files: list[str] | None = None,
     zoom: bool = False,
     include_markdown: bool = True,
     repo_path: str | None = None,
 ) -> dict:
-    """Compile a self-contained <800-line Engineering Dossier (.projectbrain_dossier.md) in ONE call.
+    """Compile a self-contained <800-line Engineering Dossier in ONE call.
 
-    Combines 4D AST Coordinate Matrix slices, module globals/constants, 1-3 hop bidirectional
-    call chains, and Closed-World Exhaustive Repo Scan. Pass zoom=True for pure 4D Surgical Zoom.
-    When zoom=True or include_markdown=True (default), returns the compiled markdown directly in
-    the response so no second read_file call is needed.
+    Use when investigating an unfamiliar multi-file flow, cross-layer bug, or architecture
+    question (prefer native `rg` / `read_file` when you already know the exact file or string).
+    Combines PDG/AST function slices, module globals, 1-3 hop bidirectional call chains,
+    route/state-flow maps, covering tests, and pinned AST invariants without writing files to disk.
     """
-    res = _get_brain(repo_path).compile_dossier(tasks, impact_files=impact_files, zoom=zoom)
+    task_list = [tasks] if isinstance(tasks, str) else list(tasks)
+    res = _get_brain(repo_path).compile_dossier(
+        task_list,
+        impact_files=impact_files,
+        zoom=zoom,
+        write_file=False,
+    )
     if include_markdown or zoom:
         return res
     return {k: v for k, v in res.items() if k != "markdown"}
 
 
 @mcp.tool()
-def brain_patch(
-    spec: str,
-    apply: bool = False,
-    repo_path: str | None = None,
-) -> dict:
-    """Apply or dry-run an AST-verified Surgical Anchor Patch spec.
-
-    Use this instead of repeating verbatim Target + Replacement blocks in `edit_file` or
-    writing verbose before/after code blocks.
-    Syntax:
-      @file <rel_path>
-      @sub L<line> `<old_expr>` -> `<new_expr>` (or `@sub ALL` / `@sub <symbol>`)
-      @replace L<start>-L<end>
-      <new lines only>
-      @end
-      @replace_body <symbol>
-      <new body lines>
-      @end
-      @add_method <ClassName>
-      <new method lines>
-      @end
-      @insert_after L<line>
-      <new lines>
-      @end
-      @delete L<start>-L<end>
-    """
-    return _get_brain(repo_path).patch(spec, apply=apply)
-
-
-@mcp.tool()
-def brain_stats(
-    repo_path: str | None = None,
-    reset: bool = False,
-) -> dict:
-    """Return index topology and structural/epistemic resolution telemetry from `.projectbrain_ledger.json`."""
-    return _get_brain(repo_path).stats(reset=reset)
-
-
-@mcp.tool()
 def brain_slice(
-    targets: list[str],
-    max_lines_per_symbol: int = 100,
+    targets: list[str] | str,
+    focus: list[str] | str | None = None,
+    max_lines_per_symbol: int = 120,
     repo_path: str | None = None,
 ) -> dict:
-    """Surgically read specific functions, classes, line ranges, or file skeletons.
+    """Surgically read functions, classes, file skeletons, or intra-function PDG slices in <20ms.
 
-    Use this instead of `view_file` when you only need a specific function/class body
-    or when you want to see a file's signature skeleton without reading 1,000+ lines.
-
-    Each item in `targets` can be:
-      - A symbol name: `"verify_claim"` or `"ProjectBrain.verify_plan"`
-      - A file:symbol pair: `"brain.py:verify_claim"`
-      - A graph node ID: `"fn:src/projectbrain/brain.py:ProjectBrain.query"`
-      - A line range: `"src/projectbrain/brain.py:100-160"`
-      - A file path (returns its signature-only skeleton): `"src/projectbrain/brain.py"`
+    Use instead of full-file reads when inspecting specific symbols or file outlines:
+      - Symbol name or qualified method: `"OrderService.validate"` or `"orders.py:validate"`
+      - File signature skeleton (bodies stripped): `"src/services/orders.py"`
+      - Line range: `"src/services/orders.py:100-160"`
+      - Intra-function PDG slice: pass `focus="discount_code"` to trace backward definitions,
+        forward uses, and enclosing control guards around a target variable or call.
     """
-    return _get_brain(repo_path).slice_symbols(targets, max_lines_per_symbol=max_lines_per_symbol)
+    return _get_brain(repo_path).slice_symbols(
+        targets,
+        max_lines_per_symbol=max_lines_per_symbol,
+        focus=focus,
+    )
 
 
 @mcp.tool()
@@ -180,17 +154,14 @@ def brain_explore(
     include_co_changes: bool = False,
     repo_path: str | None = None,
 ) -> dict:
-    """Navigate the symbol graph: find callers/callees, trace shortest paths, or trace URL flows.
+    """Navigate the code graph: trace callers/callees, shortest paths, or full-stack HTTP routes.
 
     Modes:
-      1. Path between two symbols (`target` + `target_b` both provided):
-         Finds the shortest typed path connecting `target` and `target_b` across imports,
-         calls, routes, and inheritance (e.g. `target="checkout"`, `target_b="Coupon"`).
-      2. End-to-end URL route trace (`target` starts with `/`, e.g. `"/api/checkout"`):
-         Traces UI fetch callers -> backend route handler -> service/database callees.
-      3. Symbol/file neighborhood (`target` only):
-         Traverses `depth` hops outward from `target`, returning connected callers, callees,
-         and imports (plus git `co_changes` if `include_co_changes=True`).
+      1. Path between two symbols (`target` + `target_b`): shortest typed call/import/route chain.
+      2. Full-stack route trace (`target` starts with `/`, e.g. `"/api/orders"`):
+         traces UI fetch callers -> backend route handler -> service/database callees.
+      3. Symbol/file neighborhood (`target` only): `depth`-hop callers, callees, imports,
+         and optional git `co_changes` (`include_co_changes=True`).
     """
     return _get_brain(repo_path).explore(
         target,
@@ -209,16 +180,15 @@ def brain_check(
     task: str = "",
     repo_path: str | None = None,
 ) -> dict:
-    """Pre-flight verification gate: check structural claims, validate plans, or assess edit impact.
+    """Verification & blast-radius gate: check claims, edit plans, contracts, and invariants.
 
-    Call this:
-      - BEFORE editing (`plan_files=["..."]`, `task="..."`): Checks if your edit plan
-         misses any connected importers, models, or test files (`COMPLETE` / `INCOMPLETE`).
-      - AFTER editing (`files_modified=["..."]`): Computes blast radius — all direct
-         consumers, callers of functions in those files (with their signatures), and test files.
-      - BEFORE asserting architectural facts (`claims=[["checkout", "reaches", "Coupon"]]`):
-         Fact-checks claims against the closed-world symbol graph (`SUPPORTED` / `REFUTED` / `UNKNOWN`).
-      - With no arguments: Returns index health and parse coverage.
+    Modes:
+      - Pre-edit plan gate (`plan_files=[...]`, `task="..."`): flags missing connected importers/tests.
+      - Post-edit impact & contract gate (`files_modified=[...]` or git diff): checks syntax,
+        4-pillar cross-file arity/import/key/SQL contracts, architectural boundary rules,
+        downstream callers, and stale AST invariants.
+      - Fact-check claims (`claims=[["Router", "calls", "dispatch"]]`): returns `SUPPORTED`,
+        `REFUTED`, or `UNKNOWN` (never guesses on dynamic dispatch or partial ASTs).
     """
     return _get_brain(repo_path).check(
         files_modified=files_modified,
@@ -230,19 +200,60 @@ def brain_check(
 
 @mcp.tool()
 def brain_remember(
-    target: str,
-    note: str,
+    target: str = "",
+    note: str = "",
+    forbid: str | None = None,
+    action: str = "save",
     tags: list[str] | None = None,
     repo_path: str | None = None,
 ) -> dict:
-    """Save an architectural rule, invariant, or bug root-cause to `.projectbrain_memory.json`.
+    """Pin AST-anchored invariants or enforceable architectural boundary rules in `.projectbrain_memory.json`.
 
-    The note is anchored to `target` (a function name, class name, file path, or node ID)
-    along with its current AST hash. Future `brain_context` calls touching this subgraph
-    will automatically surface this note — and flag it as stale if the underlying code
-    is later modified.
+    Usage:
+      - Pin invariant: `brain_remember(target="AuthService.verify", note="Must strip Bearer prefix before HMAC")`
+      - Enforce layer rule: `brain_remember(forbid="routes/* -> db/*", note="Routes must call services, not DB")`
+      - Audit invariants: `brain_remember(action="list")` or `brain_remember(action="stale")`
+      - Remove/refresh: `brain_remember(target="mem_1", action="forget")` or `action="refresh"`
     """
-    return _get_brain(repo_path).remember(target, note, tags=tags)
+    return _get_brain(repo_path).remember(
+        target=target,
+        note=note,
+        tags=tags,
+        forbid=forbid,
+        action=action,
+    )
+
+
+# ── Auxiliary / Legacy Tools (`--full` Mode) ─────────────────────────────────
+
+@mcp.tool()
+def brain_context(
+    task: str,
+    budget_tokens: int = 3000,
+    top_n: int = 4,
+    repo_path: str | None = None,
+) -> dict:
+    """Compile token-budgeted target slices and 1-hop neighbor signature skeletons."""
+    return _get_brain(repo_path).compile_context(task, budget_tokens=budget_tokens, top_n=top_n)
+
+
+@mcp.tool()
+def brain_stats(
+    repo_path: str | None = None,
+    reset: bool = False,
+) -> dict:
+    """Return index topology, guardrail interception scorecard, and resolution telemetry."""
+    return _get_brain(repo_path).stats(reset=reset)
+
+
+@mcp.tool()
+def brain_patch(
+    spec: str,
+    apply: bool = False,
+    repo_path: str | None = None,
+) -> dict:
+    """Legacy AST symbol/anchor patch tool (only exposed in `--full` mode)."""
+    return _get_brain(repo_path).patch(spec, apply=apply)
 
 
 @mcp.tool()
@@ -253,17 +264,11 @@ def brain_run(
     timeout: int = 120,
     repo_path: str | None = None,
 ) -> dict:
-    """Compress raw terminal/test output (`raw_output`) with Code Graph traceback resolution.
-
-    Strips passing test noise (pytest, jest/vitest, go test, cargo test), folds repetitive log/JSON/CSV
-    lines, and cross-references any stack-trace `file:line` frames against the Code Graph to return
-    the exact failing symbols, signatures, roles, and 1-hop callers.
-    Note: Direct shell command execution over MCP is disabled by default for security unless
-    `PROJECTBRAIN_ALLOW_EXEC=1` (or `--allow-exec`) is explicitly configured by the user.
-    """
+    """Compress raw terminal/test output with Code Graph stack-trace frame resolution."""
     b = _get_brain(repo_path)
     if command.strip():
-        allow_exec = ("--allow-exec" in sys.argv) or (os.environ.get("PROJECTBRAIN_ALLOW_EXEC") == "1")
+        parsed = parse_server_args(sys.argv[1:])
+        allow_exec = parsed.allow_exec or (os.environ.get("PROJECTBRAIN_ALLOW_EXEC") == "1")
         if not allow_exec:
             return {
                 "error": "Direct command execution over MCP is disabled by default for security. Pass `raw_output` to compress terminal/test logs, or set `PROJECTBRAIN_ALLOW_EXEC=1`.",
@@ -275,27 +280,30 @@ def brain_run(
 
 LEAN_CORE_TOOLS = {
     "brain_dossier",
-    "brain_context",
     "brain_slice",
-    "brain_patch",
+    "brain_explore",
     "brain_check",
     "brain_remember",
 }
 
 
-def main() -> None:
-    full_mode = (
-        "--full" in sys.argv
-        or "--all-tools" in sys.argv
-        or os.environ.get("PROJECTBRAIN_FULL_TOOLS") == "1"
-    )
-    if not full_mode:
-        tm = getattr(mcp, "_tool_manager", None)
-        tools_dict = getattr(tm, "_tools", None)
-        if isinstance(tools_dict, dict):
+def configure_mcp_tools(full_mode: bool = False) -> set[str]:
+    """Filter registered FastMCP tools according to `--lean` (default) vs `--full`."""
+    tm = getattr(mcp, "_tool_manager", None)
+    tools_dict = getattr(tm, "_tools", None)
+    if isinstance(tools_dict, dict):
+        if not full_mode:
             for t_name in list(tools_dict.keys()):
                 if t_name not in LEAN_CORE_TOOLS:
                     tools_dict.pop(t_name, None)
+        return set(tools_dict.keys())
+    return set(LEAN_CORE_TOOLS)
+
+
+def main(argv: list[str] | None = None) -> None:
+    parsed = parse_server_args(argv if argv is not None else sys.argv[1:])
+    full_mode = parsed.full or (os.environ.get("PROJECTBRAIN_FULL_TOOLS") == "1")
+    configure_mcp_tools(full_mode=full_mode)
     mcp.run(transport="stdio")
 
 

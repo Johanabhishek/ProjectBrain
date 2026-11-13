@@ -7,59 +7,91 @@ imports, import_bindings, exports, and routes.
 """
 from __future__ import annotations
 
+import bisect
 import hashlib
 import re
 import threading
 from tree_sitter import Language, Parser, Query, QueryCursor
 
-import tree_sitter_python as _tspy
-import tree_sitter_javascript as _tsjs
-import tree_sitter_typescript as _tsts
+_PY: Language | None = None
+_JS: Language | None = None
+_TS: Language | None = None
+_TSX: Language | None = None
+_GO: Language | None = None
+_RS: Language | None = None
+_JAVA: Language | None = None
 
-_PY  = Language(_tspy.language())
-_JS  = Language(_tsjs.language())
-_TS  = Language(_tsts.language_typescript())
-_TSX = Language(_tsts.language_tsx())
-
-_LANG_MAP: dict[str, Language] = {
-    ".py":  _PY,
-    ".js":  _JS,
-    ".jsx": _JS,
-    ".mjs": _JS,
-    ".cjs": _JS,
-    ".ts":  _TS,
-    ".tsx": _TSX,
-}
-
-try:
-    import tree_sitter_go as _tsgo
-    _GO = Language(_tsgo.language())
-    _LANG_MAP[".go"] = _GO
-except ImportError:
-    _GO = None
-
-try:
-    import tree_sitter_rust as _tsrs
-    _RS = Language(_tsrs.language())
-    _LANG_MAP[".rs"] = _RS
-except ImportError:
-    _RS = None
-
-try:
-    import tree_sitter_java as _tsjava
-    _JAVA = Language(_tsjava.language())
-    _LANG_MAP[".java"] = _JAVA
-except ImportError:
-    _JAVA = None
-
-_PARSERS: dict[str, Parser] = {ext: Parser(lang) for ext, lang in _LANG_MAP.items()}
+_LANG_MAP: dict[str, Language] = {}
+_UNAVAILABLE_EXTS: set[str] = set()
+_LANG_LOCK = threading.RLock()
 _THREAD_LOCAL = threading.local()
+
+
+def get_language(ext: str) -> Language | None:
+    """Lazily load and cache the Tree-sitter Language for `ext` on first use."""
+    global _PY, _JS, _TS, _TSX, _GO, _RS, _JAVA
+    ext_l = ext.lower()
+    if ext_l in _LANG_MAP:
+        return _LANG_MAP[ext_l]
+    if ext_l in _UNAVAILABLE_EXTS:
+        return None
+    with _LANG_LOCK:
+        if ext_l in _LANG_MAP:
+            return _LANG_MAP[ext_l]
+        if ext_l in _UNAVAILABLE_EXTS:
+            return None
+        try:
+            if ext_l == ".py":
+                import tree_sitter_python as _tspy
+                _PY = Language(_tspy.language())
+                _LANG_MAP[".py"] = _PY
+            elif ext_l in (".js", ".mjs", ".cjs"):
+                import tree_sitter_javascript as _tsjs
+                _JS = Language(_tsjs.language())
+                for k in (".js", ".mjs", ".cjs"):
+                    _LANG_MAP[k] = _JS
+            elif ext_l in (".ts", ".tsx", ".jsx"):
+                try:
+                    import tree_sitter_typescript as _tsts
+                    _TS = Language(_tsts.language_typescript())
+                    _TSX = Language(_tsts.language_tsx())
+                    _LANG_MAP[".ts"] = _TS
+                    _LANG_MAP[".tsx"] = _TSX
+                    # Official JSX spec (`JSXAttributeName := JSXIdentifier`) permits JS reserved words
+                    # like `class` and `for` as attribute names; `language_tsx` parses JSX spec-compliantly.
+                    _LANG_MAP[".jsx"] = _TSX
+                except ImportError:
+                    if ext_l == ".jsx":
+                        import tree_sitter_javascript as _tsjs
+                        _JS = Language(_tsjs.language())
+                        _LANG_MAP[".jsx"] = _JS
+                    else:
+                        raise
+            elif ext_l == ".go":
+                import tree_sitter_go as _tsgo
+                _GO = Language(_tsgo.language())
+                _LANG_MAP[".go"] = _GO
+            elif ext_l == ".rs":
+                import tree_sitter_rust as _tsrs
+                _RS = Language(_tsrs.language())
+                _LANG_MAP[".rs"] = _RS
+            elif ext_l == ".java":
+                import tree_sitter_java as _tsjava
+                _JAVA = Language(_tsjava.language())
+                _LANG_MAP[".java"] = _JAVA
+            else:
+                _UNAVAILABLE_EXTS.add(ext_l)
+                return None
+        except ImportError:
+            _UNAVAILABLE_EXTS.add(ext_l)
+            return None
+        return _LANG_MAP.get(ext_l)
 
 
 def get_parser(ext: str) -> Parser | None:
     """Return a thread-local Tree-sitter Parser for `ext` (or None if unsupported)."""
     ext_l = ext.lower()
-    lang = _LANG_MAP.get(ext_l)
+    lang = get_language(ext_l)
     if lang is None:
         return None
     parsers_map: dict[str, Parser] | None = getattr(_THREAD_LOCAL, "parsers", None)
@@ -312,22 +344,25 @@ _PRIMITIVE_TYPE_NAMES = {
 }
 
 
+_PARAM_TYPE_RE = re.compile(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\??\s*:\s*([A-Za-z_][A-Za-z0-9_.]*)")
+_LOCAL_CTOR_RE = re.compile(
+    r"\b((?:self\.|this\.)?[a-z_][A-Za-z0-9_]*)\s*(?::\s*[A-Za-z0-9_.\[\]| ]+\s*)?=\s*(?:new\s+)?([A-Z][A-Za-z0-9_]*)\s*\("
+)
+
+
 def _extract_param_and_local_types(params_str: str | None, body_text: str) -> dict[str, str]:
     """Extract static receiver type bindings (`var -> ClassName`) from parameter annotations and constructor assignments."""
     types_map: dict[str, str] = {}
-    if params_str:
+    if params_str and ":" in params_str:
         inner = params_str.strip()
         if inner.startswith("(") and inner.endswith(")"):
             inner = inner[1:-1]
-        for m_p in re.finditer(r"\b([A-Za-z_][A-Za-z0-9_]*)\s*\??\s*:\s*([A-Za-z_][A-Za-z0-9_.]*)", inner):
+        for m_p in _PARAM_TYPE_RE.finditer(inner):
             p_nm, t_raw = m_p.group(1), m_p.group(2).split(".")[-1]
             if p_nm not in ("self", "cls", "this") and t_raw.lower() not in _PRIMITIVE_TYPE_NAMES:
                 types_map[p_nm] = t_raw
-    if body_text and len(body_text) <= 16000:
-        for m_c in re.finditer(
-            r"\b((?:self\.|this\.)?[a-z_][A-Za-z0-9_]*)\s*(?::\s*[A-Za-z0-9_.\[\]| ]+\s*)?=\s*(?:new\s+)?([A-Z][A-Za-z0-9_]*)\s*\(",
-            body_text,
-        ):
+    if body_text and "=" in body_text and "(" in body_text and len(body_text) <= 16000:
+        for m_c in _LOCAL_CTOR_RE.finditer(body_text):
             v_nm, cls_nm = m_c.group(1), m_c.group(2)
             if cls_nm.lower() not in _PRIMITIVE_TYPE_NAMES:
                 types_map.setdefault(v_nm, cls_nm)
@@ -636,50 +671,157 @@ _BODY_NOISE = {
 }
 
 
-def _extract_body_tokens(func_node, const_map: dict[str, str] | None = None) -> list[str]:
+_BT_IDENT_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]*\b")
+_BT_STR_KEY_RE = re.compile(r"['\"]([A-Za-z_][A-Za-z0-9_.\-]{2,40})['\"]")
+_BT_CODE_ID_RE = re.compile(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b")
+_BT_WORD_RE = re.compile(r"[a-zA-Z]{3,}")
+_BT_CAMEL_RE = re.compile(r"([a-z])([A-Z])")
+
+
+def _collect_call_events(
+    lang: Language,
+    call_query: str,
+    root,
+    jsx_query: str | None = None,
+) -> tuple[list[int], list[tuple[int, str, int, str | None]]]:
+    """Run call query once at file `root` and return sorted `(starts, events)` for O(log M + k) per-function slicing."""
+    events: list[tuple[int, str, int, str | None]] = []
+    for _, mc in _matches(lang, call_query, root):
+        callee_nodes = mc.get("callee")
+        if not callee_nodes:
+            continue
+        c_nd = callee_nodes[0]
+        r_nodes = mc.get("receiver")
+        r_txt = _text(r_nodes[0]) if r_nodes else None
+        events.append((c_nd.start_byte, _text(c_nd), _line(c_nd), r_txt))
+    if jsx_query is not None:
+        for _, mc_j in _matches(lang, jsx_query, root):
+            callee_nodes = mc_j.get("callee")
+            if callee_nodes:
+                c_nd = callee_nodes[0]
+                c_txt = _text(c_nd)
+                if c_txt[:1].isupper():
+                    events.append((c_nd.start_byte, c_txt, _line(c_nd), None))
+    events.sort(key=lambda x: x[0])
+    return [ev[0] for ev in events], events
+
+
+def _slice_call_events(
+    starts: list[int],
+    events: list[tuple[int, str, int, str | None]],
+    fn_node,
+) -> tuple[list[str], dict[str, int], dict[str, list[int]], dict[str, int]]:
+    lo = bisect.bisect_left(starts, fn_node.start_byte)
+    hi = bisect.bisect_right(starts, fn_node.end_byte)
+    calls: list[str] = []
+    call_sites: dict[str, int] = {}
+    call_sites_all: dict[str, list[int]] = {}
+    qualified_calls: dict[str, int] = {}
+    for idx in range(lo, hi):
+        _, callee_text, line, receiver_text = events[idx]
+        if callee_text not in call_sites:
+            calls.append(callee_text)
+            call_sites[callee_text] = line
+        elif line < call_sites[callee_text]:
+            call_sites[callee_text] = line
+        s_list = call_sites_all.setdefault(callee_text, [])
+        if line not in s_list and len(s_list) < 8:
+            s_list.append(line)
+            s_list.sort()
+        if receiver_text is not None:
+            qual = f"{receiver_text}.{callee_text}"
+            if qual not in qualified_calls or line < qualified_calls[qual]:
+                qualified_calls[qual] = line
+    return calls, call_sites, call_sites_all, qualified_calls
+
+
+_IDENT_TOKS_CACHE: dict[str, tuple[tuple[str, ...], tuple[str, ...]]] = {}
+
+
+def _split_ident_cached(ident: str) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    hit = _IDENT_TOKS_CACHE.get(ident)
+    if hit is not None:
+        return hit
+    if len(_IDENT_TOKS_CACHE) > 65536:
+        _IDENT_TOKS_CACHE.clear()
+    is_flat = ident.islower() or ident.isupper()
+    if "_" not in ident and is_flat:
+        w_low = ident.lower()
+        w_tup = (w_low,) if (len(w_low) >= 3 and w_low not in _BODY_NOISE) else ()
+        res = ((), w_tup)
+        _IDENT_TOKS_CACHE[ident] = res
+        return res
+    raw_low = ident.lower().strip("_")
+    clean_id = ident.replace("_", "").lower()
+    split_id = ident if is_flat else _BT_CAMEL_RE.sub(r"\1 \2", ident)
+    s_list: list[str] = []
+    for p in (raw_low, clean_id, *(x.lower() for x in split_id.replace("_", " ").split())):
+        if len(p) >= 3 and p not in _BODY_NOISE and p not in s_list:
+            s_list.append(p)
+    res = (tuple(s_list), tuple(s_list))
+    _IDENT_TOKS_CACHE[ident] = res
+    return res
+
+
+def _extract_body_tokens(
+    func_node,
+    const_map: dict[str, str] | None = None,
+    raw_full_text: str | None = None,
+) -> list[str]:
     """Extract distinct domain words from a function's body/comments plus any
     same-file module-level constants it references (e.g. BLOCKED_PATTERNS)."""
-    raw_text = _text(func_node)[:6000]
-    extra_texts = [raw_text]
+    raw_text = (raw_full_text if raw_full_text is not None else _text(func_node))[:6000]
+    all_idents = _BT_IDENT_RE.findall(raw_text)
+    uniq_idents = list(dict.fromkeys(all_idents))
+    extra_words: list[str] = []
     if const_map:
-        referenced = set(re.findall(r"\b[A-Za-z_][A-Za-z0-9_]*\b", raw_text))
-        for ref in referenced:
+        for ref in uniq_idents:
             if ref in const_map:
-                extra_texts.append(const_map[ref])
-    combined = " ".join(extra_texts)
+                extra_words.extend(_BT_WORD_RE.findall(const_map[ref]))
     out: list[str] = []
     seen: set[str] = set()
     # Pass 1: prioritize PascalCase / camelCase / snake_case code identifiers and string config keys
-    for s_key in re.findall(r"['\"]([A-Za-z_][A-Za-z0-9_.\-]{2,40})['\"]", raw_text):
-        if "_" in s_key or s_key.isupper() or any(c.isupper() for c in s_key[1:]):
-            sk_low = s_key.lower()
-            sk_parts = [sk_low, sk_low.replace("_", "")] + [
-                p.lower()
-                for p in re.sub(r"([a-z])([A-Z])", r"\1 \2", s_key).replace("_", " ").replace("-", " ").replace(".", " ").split()
-            ]
-            for p in sk_parts:
-                if len(p) >= 3 and p not in _BODY_NOISE and p not in seen:
-                    seen.add(p)
-                    out.append(p)
-    for ident in re.findall(r"\b[A-Za-z_][A-Za-z0-9_]{3,}\b", raw_text):
-        if "_" in ident or any(c.isupper() for c in ident[1:]) or (ident[0].isupper() and any(c.islower() for c in ident[1:])):
-            raw_low = ident.lower().strip("_")
-            clean_id = ident.replace("_", "").lower()
-            parts = [raw_low, clean_id] + [p.lower() for p in re.sub(r"([a-z])([A-Z])", r"\1 \2", ident).replace("_", " ").split()]
-            for p in parts:
-                if len(p) >= 3 and p not in _BODY_NOISE and p not in seen:
+    if "'" in raw_text or '"' in raw_text:
+        for s_key in _BT_STR_KEY_RE.findall(raw_text):
+            if "_" in s_key or not s_key.islower():
+                sk_low = s_key.lower()
+                split_src = s_key if (s_key.islower() or s_key.isupper()) else _BT_CAMEL_RE.sub(r"\1 \2", s_key)
+                for p in (
+                    sk_low,
+                    sk_low.replace("_", ""),
+                    *(x.lower() for x in split_src.replace("_", " ").replace("-", " ").replace(".", " ").split()),
+                ):
+                    if len(p) >= 3 and p not in _BODY_NOISE and p not in seen:
+                        seen.add(p)
+                        out.append(p)
+    for ident in uniq_idents:
+        if len(ident) < 3:
+            continue
+        s_parts, _ = _split_ident_cached(ident)
+        if s_parts:
+            for p in s_parts:
+                if p not in seen:
                     seen.add(p)
                     out.append(p)
                     if len(out) >= 100:
                         break
-        if len(out) >= 100:
-            break
+            if len(out) >= 100:
+                break
     # Pass 2: general lexical words up to 140 total tokens
-    words = re.findall(r"[a-zA-Z]{3,}", combined)
-    for w in words:
-        parts = [w.lower()] + [p.lower() for p in re.sub(r"([a-z])([A-Z])", r"\1 \2", w).split()]
-        for p in parts:
-            if len(p) >= 3 and p not in _BODY_NOISE and p not in seen:
+    for w in uniq_idents:
+        if len(w) < 3:
+            continue
+        _, w_parts = _split_ident_cached(w)
+        for p in w_parts:
+            if p not in seen:
+                seen.add(p)
+                out.append(p)
+                if len(out) >= 140:
+                    return out
+    for w in extra_words:
+        _, w_parts = _split_ident_cached(w)
+        for p in w_parts:
+            if p not in seen:
                 seen.add(p)
                 out.append(p)
                 if len(out) >= 140:
@@ -825,6 +967,8 @@ def _parse_python(root) -> dict:
         if not is_ovl:
             non_overload_keys.add((p_cls, _text(nm_n)))
 
+    py_call_starts, py_call_events = _collect_call_events(_PY, _PY_CALLS, root) if raw_py_funcs else ([], [])
+
     for func_node in raw_py_funcs:
         name_node = func_node.child_by_field_name("name")
         if not name_node:
@@ -845,36 +989,18 @@ def _parse_python(root) -> dict:
                 is_nested_fn = True
                 break
             anc = anc.parent
-        callee_matches = _matches(_PY, _PY_CALLS, func_node)
-        calls = []
-        call_sites = {}
-        call_sites_all: dict[str, list[int]] = {}
-        qualified_calls = {}
-        for _, mc in callee_matches:
-            callee_nodes = mc.get("callee", [])
-            receiver_nodes = mc.get("receiver", [])
-            if callee_nodes:
-                callee_node = callee_nodes[0]
-                callee_text = _text(callee_node)
-                line = _line(callee_node)
-                if callee_text not in calls:
-                    calls.append(callee_text)
-                if callee_text not in call_sites or line < call_sites[callee_text]:
-                    call_sites[callee_text] = line
-                s_list = call_sites_all.setdefault(callee_text, [])
-                if line not in s_list and len(s_list) < 8:
-                    s_list.append(line)
-                    s_list.sort()
-                if receiver_nodes:
-                    receiver_text = _text(receiver_nodes[0])
-                    qual = f"{receiver_text}.{callee_text}"
-                    if qual not in qualified_calls or line < qualified_calls[qual]:
-                        qualified_calls[qual] = line
+        calls, call_sites, call_sites_all, qualified_calls = _slice_call_events(
+            py_call_starts, py_call_events, func_node,
+        )
         sig, params, ret_type = _py_func_signature(func_node)
         is_meth = parent_cls is not None
         fn_body_raw = _text(func_node)
-        param_types = _extract_param_and_local_types(params, fn_body_raw)
-        ret_keys = _extract_closed_return_keys(func_node, is_python=True)
+        param_types = _extract_param_and_local_types(params, fn_body_raw) if qualified_calls else {}
+        ret_keys = (
+            _extract_closed_return_keys(func_node, is_python=True)
+            if ("{" in fn_body_raw and "return" in fn_body_raw)
+            else None
+        )
         iface_str = f"{sig}|ret:{','.join(ret_keys)}" if ret_keys else sig
         entry = {
             "name": fn_nm_str,
@@ -886,7 +1012,7 @@ def _parse_python(root) -> dict:
             "arity_spec": extract_arity_spec(params, is_method=is_meth, is_python=True),
             "param_types": param_types,
             "docstring": _py_docstring(func_node),
-            "body_tokens": _extract_body_tokens(func_node, py_consts),
+            "body_tokens": _extract_body_tokens(func_node, py_consts, raw_full_text=fn_body_raw),
             "calls": calls,
             "call_sites": call_sites,
             "call_sites_all": call_sites_all,
@@ -1320,48 +1446,167 @@ def _parse_js_lhs_target(lhs_text: str, rhs_node) -> tuple[str | None, str | Non
     return None, None, False
 
 
+def _walk_js_ast(
+    root,
+    is_jsx: bool,
+) -> tuple[
+    list,
+    list,
+    set[str],
+    set[str],
+    list[tuple],
+    list[int],
+    list[tuple[int, str, int, str | None]],
+]:
+    """Single-pass AST walk for JS/TS/TSX avoiding 6 cold `tree_sitter.Query` compilations."""
+    cls_nodes: list = []
+    func_nodes: list = []
+    import_mods: set[str] = set()
+    export_names: set[str] = set()
+    route_matches: list[tuple] = []
+    call_events: list[tuple[int, str, int, str | None]] = []
+
+    stack = [root]
+    while stack:
+        nd = stack.pop()
+        nt = nd.type
+        if nt == "class_declaration":
+            if nd.child_by_field_name("name") is not None:
+                cls_nodes.append(nd)
+        elif nt == "function_declaration":
+            nm = nd.child_by_field_name("name")
+            if nm is not None and nm.type == "identifier":
+                func_nodes.append(nd)
+        elif nt == "method_definition":
+            nm = nd.child_by_field_name("name")
+            if nm is not None and nm.type == "property_identifier":
+                func_nodes.append(nd)
+        elif nt == "variable_declarator":
+            nm = nd.child_by_field_name("name")
+            val = nd.child_by_field_name("value")
+            if nm is not None and nm.type == "identifier" and val is not None:
+                vt = val.type
+                if vt in ("arrow_function", "function_expression"):
+                    func_nodes.append(nd)
+                elif vt == "call_expression":
+                    fn_c = val.child_by_field_name("function")
+                    args_c = val.child_by_field_name("arguments")
+                    if (
+                        fn_c is not None
+                        and fn_c.type in ("identifier", "member_expression")
+                        and args_c is not None
+                    ):
+                        nc = args_c.named_children
+                        if nc and nc[0].type in ("arrow_function", "function_expression"):
+                            func_nodes.append(nd)
+        elif nt == "import_statement":
+            src_n = nd.child_by_field_name("source")
+            if src_n is not None and src_n.type == "string":
+                for sc in src_n.children:
+                    if sc.type == "string_fragment":
+                        import_mods.add(_text(sc))
+        elif nt == "export_statement":
+            src_n = nd.child_by_field_name("source")
+            if src_n is not None and src_n.type == "string":
+                for sc in src_n.children:
+                    if sc.type == "string_fragment":
+                        import_mods.add(_text(sc))
+            decl = nd.child_by_field_name("declaration")
+            if decl is not None:
+                dt = decl.type
+                if dt == "function_declaration":
+                    nm = decl.child_by_field_name("name")
+                    if nm is not None and nm.type == "identifier":
+                        export_names.add(_text(nm))
+                elif dt == "class_declaration":
+                    nm = decl.child_by_field_name("name")
+                    if nm is not None:
+                        export_names.add(_text(nm))
+                elif dt == "lexical_declaration":
+                    for vd in decl.children:
+                        if vd.type == "variable_declarator":
+                            nm = vd.child_by_field_name("name")
+                            if nm is not None and nm.type == "identifier":
+                                export_names.add(_text(nm))
+        elif nt == "call_expression":
+            fn_c = nd.child_by_field_name("function")
+            args_c = nd.child_by_field_name("arguments")
+            if fn_c is not None:
+                ft = fn_c.type
+                if ft == "identifier":
+                    call_events.append((fn_c.start_byte, _text(fn_c), _line(fn_c), None))
+                    if args_c is not None:
+                        for ac in args_c.children:
+                            if ac.type == "string":
+                                for sf in ac.children:
+                                    if sf.type == "string_fragment":
+                                        import_mods.add(_text(sf))
+                elif ft == "import":
+                    if args_c is not None:
+                        for ac in args_c.children:
+                            if ac.type == "string":
+                                for sf in ac.children:
+                                    if sf.type == "string_fragment":
+                                        import_mods.add(_text(sf))
+                elif ft == "member_expression":
+                    obj_n = fn_c.child_by_field_name("object")
+                    prop_n = fn_c.child_by_field_name("property")
+                    if prop_n is not None and prop_n.type == "property_identifier":
+                        p_txt = _text(prop_n)
+                        o_txt = _text(obj_n) if obj_n is not None else None
+                        call_events.append((prop_n.start_byte, p_txt, _line(prop_n), o_txt))
+                        if p_txt in _HTTP and args_c is not None and obj_n is not None:
+                            for ac in args_c.children:
+                                if ac.type == "string":
+                                    for sf in ac.children:
+                                        if sf.type == "string_fragment":
+                                            route_matches.append((prop_n, sf, obj_n, args_c, nd))
+                                            break
+                                    break
+        elif is_jsx and nt in ("jsx_self_closing_element", "jsx_opening_element"):
+            nm = nd.child_by_field_name("name")
+            if nm is not None and nm.type == "identifier":
+                c_txt = _text(nm)
+                if c_txt[:1].isupper():
+                    call_events.append((nm.start_byte, c_txt, _line(nm), None))
+
+        ch = nd.children
+        if ch:
+            stack.extend(reversed(ch))
+
+    call_events.sort(key=lambda x: x[0])
+    return (
+        cls_nodes,
+        func_nodes,
+        import_mods,
+        export_names,
+        route_matches,
+        [ev[0] for ev in call_events],
+        call_events,
+    )
+
+
 def _parse_js(root, lang: Language) -> dict:
     functions, classes, imports, exports, routes = [], [], [], [], []
     method_to_class: dict[tuple, str] = {}
     js_consts, leading_docs = _js_const_map_and_leading_docs(root)
     root_span = max(1, _end_line(root) - _line(root))
 
+    (
+        cls_nodes,
+        func_nodes,
+        import_mods,
+        export_names,
+        route_matches,
+        js_call_starts,
+        js_call_events,
+    ) = _walk_js_ast(root, is_jsx=(lang in (_TSX, _JS)))
+
     def _extract_js_callees(fn_node) -> tuple[list[str], dict[str, int], dict[str, list[int]], dict[str, int]]:
-        callee_matches = list(_matches(lang, _JS_CALLS, fn_node))
-        if lang in (_TSX, _JS):
-            for m_jsx in _matches(lang, _JSX_CALLS, fn_node):
-                c_nodes = m_jsx[1].get("callee", [])
-                if c_nodes and _text(c_nodes[0])[:1].isupper():
-                    callee_matches.append(m_jsx)
-        calls: list[str] = []
-        call_sites: dict[str, int] = {}
-        call_sites_all: dict[str, list[int]] = {}
-        qualified_calls: dict[str, int] = {}
-        for _, mc in callee_matches:
-            callee_nodes = mc.get("callee", [])
-            receiver_nodes = mc.get("receiver", [])
-            if callee_nodes:
-                callee_node = callee_nodes[0]
-                callee_text = _text(callee_node)
-                line = _line(callee_node)
-                if callee_text not in calls:
-                    calls.append(callee_text)
-                if callee_text not in call_sites or line < call_sites[callee_text]:
-                    call_sites[callee_text] = line
-                s_list = call_sites_all.setdefault(callee_text, [])
-                if line not in s_list and len(s_list) < 8:
-                    s_list.append(line)
-                    s_list.sort()
-                if receiver_nodes:
-                    receiver_text = _text(receiver_nodes[0])
-                    qual = f"{receiver_text}.{callee_text}"
-                    if qual not in qualified_calls or line < qualified_calls[qual]:
-                        qualified_calls[qual] = line
-        return calls, call_sites, call_sites_all, qualified_calls
+        return _slice_call_events(js_call_starts, js_call_events, fn_node)
 
     # Phase 1 — classes first
-    caps = _captures(lang, _JS_CLASS, root)
-    for cls_node in caps.get("class", []):
+    for cls_node in cls_nodes:
         name_node = cls_node.child_by_field_name("name")
         if not name_node:
             continue
@@ -1398,9 +1643,8 @@ def _parse_js(root, lang: Language) -> dict:
             classes.append(iface)
 
     # Phase 2 — standard declarations, arrow declarators, and class methods
-    caps = _captures(lang, _JS_FUNC, root)
     seen_fn_keys: set[tuple[str | None, str, int]] = set()
-    for func_node in caps.get("func", []):
+    for func_node in func_nodes:
         name_node = func_node.child_by_field_name("name")
         if not name_node:
             continue
@@ -1421,8 +1665,12 @@ def _parse_js(root, lang: Language) -> dict:
         is_meth = parent_cls is not None
         seen_fn_keys.add((parent_cls, fn_name, l_start))
         fn_body_raw = _text(func_node)
-        param_types = _extract_param_and_local_types(params, fn_body_raw)
-        ret_keys = _extract_closed_return_keys(func_node, is_python=False)
+        param_types = _extract_param_and_local_types(params, fn_body_raw) if qualified_calls else {}
+        ret_keys = (
+            _extract_closed_return_keys(func_node, is_python=False)
+            if ("{" in fn_body_raw and ("return" in fn_body_raw or "=>" in fn_body_raw))
+            else None
+        )
         iface_str = f"{sig}|ret:{','.join(ret_keys)}" if ret_keys else sig
         entry = {
             "name": fn_name,
@@ -1434,7 +1682,7 @@ def _parse_js(root, lang: Language) -> dict:
             "arity_spec": extract_arity_spec(params, is_method=is_meth, is_python=False),
             "param_types": param_types,
             "docstring": doc,
-            "body_tokens": _extract_body_tokens(func_node, js_consts),
+            "body_tokens": _extract_body_tokens(func_node, js_consts, raw_full_text=fn_body_raw),
             "calls": calls,
             "call_sites": call_sites,
             "call_sites_all": call_sites_all,
@@ -1583,35 +1831,25 @@ def _parse_js(root, lang: Language) -> dict:
             if em not in cls_obj["methods"]:
                 cls_obj["methods"].append(em)
 
-    caps = _captures(lang, _JS_IMPORT, root)
-    imports = list({_text(n) for n in caps.get("mod", [])})
+    imports = list(import_mods)
     import_bindings = _js_import_bindings(root)
 
-    caps = _captures(lang, _JS_EXPORT, root)
-    exports = list({_text(n) for n in caps.get("name", [])})
+    exports = list(export_names)
     exports.extend(_js_named_exports(root, lang))
     exports.extend(assigned_exports)
     exports = list(set(exports))
 
-    for _, mc in _matches(lang, _JS_ROUTE, root):
-        m_nodes = mc.get("method", [])
-        p_nodes = mc.get("path", [])
-        o_nodes = mc.get("obj", [])
-        a_nodes = mc.get("args", [])
-        rc_nodes = mc.get("route_call", [])
-        if not (m_nodes and p_nodes):
-            continue
-        method = _text(m_nodes[0])
+    for m_node, p_node, o_node, args_node, rc_node in route_matches:
+        method = _text(m_node)
         if method not in _HTTP:
             continue
-        path = _text(p_nodes[0])
-        receiver = _text(o_nodes[0]) if o_nodes else ""
+        path = _text(p_node)
+        receiver = _text(o_node) if o_node else ""
         if not _is_express_route(receiver, path):
             continue
 
         handler_name = None
-        if a_nodes:
-            args_node = a_nodes[0]
+        if args_node is not None:
             arg_children = [
                 c for c in args_node.children
                 if c.type not in ("(", ")", ",", "string")
@@ -1621,31 +1859,11 @@ def _parse_js(root, lang: Language) -> dict:
                 if last_arg.type == "identifier":
                     handler_name = _text(last_arg)
                 elif last_arg.type in ("arrow_function", "function_expression"):
-                    callee_matches = _matches(lang, _JS_CALLS, last_arg)
-                    r_calls = []
-                    r_sites = {}
-                    r_qual = {}
-                    for _, rmc in callee_matches:
-                        c_nodes = rmc.get("callee", [])
-                        rec_nodes = rmc.get("receiver", [])
-                        if c_nodes:
-                            cn = c_nodes[0]
-                            ct = _text(cn)
-                            cl = _line(cn)
-                            if ct not in r_calls:
-                                r_calls.append(ct)
-                            if ct not in r_sites or cl < r_sites[ct]:
-                                r_sites[ct] = cl
-                            if rec_nodes:
-                                rt = _text(rec_nodes[0])
-                                q = f"{rt}.{ct}"
-                                if q not in r_qual or cl < r_qual[q]:
-                                    r_qual[q] = cl
+                    r_calls, r_sites, _, r_qual = _extract_js_callees(last_arg)
                     if r_calls:
                         clean_p = re.sub(r"[^a-zA-Z0-9]+", "_", path).strip("_") or "root"
                         syn_name = f"route_{method.upper()}_{clean_p}"
                         handler_name = syn_name
-                        rc_node = rc_nodes[0] if rc_nodes else last_arg
                         syn_sig = f"{receiver}.{method}('{path}', (req, res) => ...)"
                         functions.append({
                             "name": syn_name,
@@ -1667,7 +1885,7 @@ def _parse_js(root, lang: Language) -> dict:
         route_dict = {
             "method": method.upper(),
             "path": path,
-            "line": _line(m_nodes[0]),
+            "line": _line(m_node),
             "framework": "express",
         }
         if handler_name:
@@ -2460,34 +2678,41 @@ _STRUCTURAL_POLYGLOT_EXTS = {
 }
 
 
+_SFC_HTML_COMMENT_RE = re.compile(r"<!--.*?-->", re.DOTALL)
+_SFC_SCRIPT_OPEN_RE = re.compile(r'<script\b((?:[^>"\']|"[^"]*"|\'[^\']*\')*)>', re.IGNORECASE | re.DOTALL)
+_SFC_SCRIPT_CLOSE_RE = re.compile(r"</script\s*>", re.IGNORECASE)
+
+
 def _extract_sfc_script_preserving_lines(source: str) -> tuple[str, str]:
     """Extract `<script>` block(s) from `.vue` / `.svelte` files while preserving 1-based line numbers."""
-    lines = source.splitlines()
-    out_lines = [""] * len(lines)
-    in_script = False
-    is_ts = False
-    for idx, line in enumerate(lines):
-        if not in_script:
-            m_open = re.search(r"<script\b([^>]*)>", line, re.IGNORECASE)
-            if m_open:
-                attrs = m_open.group(1) or ""
-                if re.search(r'\blang\s*=\s*["\']?(?:ts|typescript)\b', attrs, re.IGNORECASE):
-                    is_ts = True
-                after = line[m_open.end():]
-                m_close_same = re.search(r"</script\s*>", after, re.IGNORECASE)
-                if m_close_same:
-                    out_lines[idx] = after[:m_close_same.start()]
-                else:
-                    in_script = True
-                    out_lines[idx] = after
-        else:
-            m_close = re.search(r"</script\s*>", line, re.IGNORECASE)
-            if m_close:
-                out_lines[idx] = line[:m_close.start()]
-                in_script = False
-            else:
-                out_lines[idx] = line
-    return "\n".join(out_lines), (".ts" if is_ts else ".js")
+    masked = _SFC_HTML_COMMENT_RE.sub(lambda m: "\n" * m.group(0).count("\n"), source)
+    chunks: list[str] = []
+    pos = 0
+    script_ext = ".js"
+    while pos < len(masked):
+        m_open = _SFC_SCRIPT_OPEN_RE.search(masked, pos)
+        if not m_open:
+            chunks.append("\n" * masked[pos:].count("\n"))
+            break
+        chunks.append("\n" * masked[pos:m_open.end()].count("\n"))
+        attrs = m_open.group(1) or ""
+        m_lang = re.search(r'\blang\s*=\s*["\']?(tsx|jsx|ts|typescript)\b', attrs, re.IGNORECASE)
+        if m_lang:
+            lv = m_lang.group(1).lower()
+            if lv == "tsx":
+                script_ext = ".tsx"
+            elif lv == "jsx" and script_ext != ".tsx":
+                script_ext = ".jsx"
+            elif script_ext not in (".tsx",):
+                script_ext = ".ts"
+        m_close = _SFC_SCRIPT_CLOSE_RE.search(masked, m_open.end())
+        if not m_close:
+            chunks.append(masked[m_open.end():])
+            break
+        chunks.append(masked[m_open.end():m_close.start()])
+        chunks.append("\n" * m_close.group(0).count("\n"))
+        pos = m_close.end()
+    return "".join(chunks), script_ext
 
 
 def _find_matching_brace_end(lines: list[str], start_idx: int, max_scan: int = 400) -> int:
@@ -2664,6 +2889,27 @@ def _parse_polyglot_structural(source: str, ext: str) -> dict:
     return res
 
 
+def _has_structural_error(node, ext_l: str) -> bool:
+    """Return True if the CST contains a real syntax error (ignoring benign unescaped `& ` in JSX text)."""
+    if not node.has_error:
+        return False
+    if ext_l not in (".tsx", ".jsx"):
+        return True
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if not cur.has_error:
+            continue
+        if cur.type == "ERROR" or cur.is_missing:
+            parent_t = cur.parent.type if cur.parent else ""
+            txt = (cur.text or b"").decode("utf-8", errors="ignore")
+            if parent_t in ("jsx_element", "jsx_fragment") and "&" in txt and "<" not in txt and "{" not in txt:
+                continue
+            return True
+        stack.extend(cur.children)
+    return False
+
+
 def parse_with_tree(source: str, ext: str) -> tuple[dict, object | None]:
     """Parse source by file extension and return `(result_dict, tree_sitter_tree)` for single-pass reuse."""
     ext_l = ext.lower()
@@ -2672,10 +2918,10 @@ def parse_with_tree(source: str, ext: str) -> tuple[dict, object | None]:
     if ext_l in (".vue", ".svelte"):
         script_src, script_ext = _extract_sfc_script_preserving_lines(source)
         return parse_with_tree(script_src, script_ext)
-    if ext_l in _STRUCTURAL_POLYGLOT_EXTS and ext_l not in _LANG_MAP:
+    if ext_l in _STRUCTURAL_POLYGLOT_EXTS and get_language(ext_l) is None:
         return _parse_polyglot_structural(source, ext_l), None
     parser = get_parser(ext_l)
-    lang = _LANG_MAP.get(ext_l)
+    lang = get_language(ext_l)
     if parser is None or lang is None:
         return {
             "functions": [], "classes": [], "imports": [], "routes": [],
@@ -2709,7 +2955,7 @@ def parse_with_tree(source: str, ext: str) -> tuple[dict, object | None]:
                 for sc_k, sc_obj in (result.get("sql_schemas") or {}).items():
                     if sc_k.lower() == tbl_k.lower():
                         apply_sql_alters_to_schema(sc_obj, ops)
-    result["parse_status"] = "partial" if root.has_error else "ok"
+    result["parse_status"] = "partial" if _has_structural_error(root, ext_l) else "ok"
     result["interface_hash"] = compute_file_interface_hash(result)
     return result, tree
 
@@ -2718,4 +2964,134 @@ def parse(source: str, ext: str) -> dict:
     """Parse source by file extension. Returns functions/classes/imports/routes/exports."""
     res, _ = parse_with_tree(source, ext)
     return res
+
+
+def _is_unexpanded_symlink_src(path, source: str) -> bool:
+    if not source or len(source) > 255 or "\n" in source or "\r" in source:
+        return False
+    target = source.strip()
+    if not target.startswith(("./", "../")):
+        return False
+    try:
+        return (path.parent / target).exists()
+    except OSError:
+        return False
+
+
+def _is_minified_src(source: str, min_line_threshold: int = 500) -> bool:
+    lines = source.splitlines()
+    if not lines:
+        return False
+    non_empty = [len(line) for line in lines if line.strip()]
+    if not non_empty:
+        return False
+    max_len = max(non_empty)
+    if max_len <= min_line_threshold:
+        return False
+    if max_len > 5000 or len(non_empty) <= 5:
+        return True
+    long_count = sum(1 for ln in non_empty if ln > min_line_threshold)
+    avg_len = sum(non_empty) / len(non_empty)
+    return (long_count / len(non_empty)) > 0.25 or avg_len > 250
+
+
+def _parse_worker_batch(
+    batch: list[tuple[str, str, str, float, int]],
+) -> list[tuple[str, dict, int]]:
+    """Process-pool worker: parse a batch of `(rel, ext, source, mtime, size)` items."""
+    from . import frameworks as _fw
+    from .contracts import extract_4d_coordinate_matrix as _extract_4d
+
+    out: list[tuple[str, dict, int]] = []
+    for rel, ext, source, mtime, size in batch:
+        info, ts_tree = parse_with_tree(source, ext)
+        info.setdefault("routes", []).extend(_fw.infer_file_based_routes(rel, info))
+        info["cells_4d"] = _extract_4d(source.splitlines(), ext=ext, tree=ts_tree)
+        info["mtime"] = mtime
+        out.append((rel, info, size))
+    return out
+
+
+def parse_files_parallel(
+    dirty_items: list[tuple[str, object, str, float, int]],
+    min_line_threshold: int = 500,
+) -> tuple[dict[str, dict], dict[str, int], dict[str, str]]:
+    """Read and parse `(rel, path, ext, mtime, size)` concurrently while preserving walk order.
+
+    Uses a 16-thread I/O reader pool (overlapping cold OS disk reads) followed by a
+    multi-core `ProcessPoolExecutor` for >=48 files (falling back gracefully in-process).
+    """
+    import os
+    from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor
+
+    if not dirty_items:
+        return {}, {}, {}
+
+    def _read_one(item: tuple[str, object, str, float, int]):
+        rel, path, ext, mtime, size = item
+        try:
+            source = path.read_text(encoding="utf-8", errors="ignore")  # type: ignore[attr-defined]
+        except OSError as e:
+            return (rel, None, f"read_error:{e.__class__.__name__}", ext, mtime, size)
+        if _is_minified_src(source, min_line_threshold):
+            return (rel, None, "minified_or_generated", ext, mtime, size)
+        if _is_unexpanded_symlink_src(path, source):
+            return (rel, None, "symlink_stub", ext, mtime, size)
+        return (rel, source, None, ext, mtime, size)
+
+    if len(dirty_items) >= 16:
+        with ThreadPoolExecutor(max_workers=16) as io_pool:
+            read_results = list(io_pool.map(_read_one, dirty_items))
+    else:
+        read_results = [_read_one(it) for it in dirty_items]
+
+    skipped_map: dict[str, str] = {}
+    to_parse: list[tuple[str, str, str, float, int]] = []
+    for rel, source, skip_reason, ext, mtime, size in read_results:
+        if skip_reason is not None or source is None:
+            skipped_map[rel] = skip_reason or "read_error"
+        else:
+            to_parse.append((rel, ext, source, mtime, size))
+
+    parsed_by_rel: dict[str, tuple[dict, int]] = {}
+    cpu_cnt = min(os.cpu_count() or 4, 8)
+    use_multiproc = (
+        len(to_parse) >= 48
+        and cpu_cnt >= 2
+        and os.environ.get("PROJECTBRAIN_PARALLEL_INDEX", "1") != "0"
+    )
+    if use_multiproc:
+        # Sort descending by source length and deal round-robin across chunks so no worker straggles
+        sorted_items = sorted(to_parse, key=lambda x: len(x[2]), reverse=True)
+        num_batches = cpu_cnt * 2
+        batches: list[list[tuple[str, str, str, float, int]]] = [[] for _ in range(num_batches)]
+        for idx, it in enumerate(sorted_items):
+            batches[idx % num_batches].append(it)
+        batches = [b for b in batches if b]
+        try:
+            with ProcessPoolExecutor(max_workers=cpu_cnt) as cpu_pool:
+                for batch_res in cpu_pool.map(_parse_worker_batch, batches):
+                    for rel, info, size in batch_res:
+                        parsed_by_rel[rel] = (info, size)
+        except Exception:
+            for batch in batches:
+                for rel, info, size in _parse_worker_batch(batch):
+                    parsed_by_rel[rel] = (info, size)
+    elif to_parse:
+        for rel, info, size in _parse_worker_batch(to_parse):
+            parsed_by_rel[rel] = (info, size)
+
+    # Reconstruct maps in deterministic original walk order
+    parsed_index: dict[str, dict] = {}
+    parsed_sizes: dict[str, int] = {}
+    parsed_skipped: dict[str, str] = {}
+    for rel, _, _, _, _ in dirty_items:
+        if rel in skipped_map:
+            parsed_skipped[rel] = skipped_map[rel]
+        elif rel in parsed_by_rel:
+            info, sz = parsed_by_rel[rel]
+            parsed_index[rel] = info
+            parsed_sizes[rel] = sz
+    return parsed_index, parsed_sizes, parsed_skipped
+
 

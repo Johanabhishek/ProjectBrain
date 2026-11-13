@@ -33,6 +33,12 @@ from .slicer import (
 if TYPE_CHECKING:
     from .brain import ProjectBrain
 
+_PURE_WORD_RE = re.compile(r"^\w+$")
+_WORD_EXTRACT_RE = re.compile(r"\w+")
+_DOTTED_CHAIN_RE = re.compile(r"\w+(?:\.\w+)+")
+_TASK_PATH_RE = re.compile(r"\b([a-zA-Z0-9_.\-]+(?:/[a-zA-Z0-9_.\-]+)+\.[a-zA-Z0-9]+)\b")
+_DATA_KEY_RE = re.compile(r"\b([A-Z][A-Z0-9]+_[A-Z0-9_]+|[a-z][a-z0-9]*_[a-z0-9_]+)\b|`([A-Za-z_][A-Za-z0-9_]{3,})`")
+
 
 def score_symbol_for_query(
     brain: "ProjectBrain",
@@ -80,13 +86,15 @@ def score_symbol_for_query(
             kw_root = kw_stem
         if kw in ("handled", "handling", "work", "works", "working", "across"):
             idf *= 0.22
-        name_weight = 0.8 if kw in ("file", "files", "path", "paths", "data", "item", "items", "node", "nodes") else 2.6
+        is_generic_kw = kw in ("file", "files", "path", "paths", "data", "item", "items", "node", "nodes")
+        name_weight = 0.8 if is_generic_kw else 2.6
         sig_tokens = set(re.findall(r"[a-z0-9]+", (fn.get("signature") or "").lower()))
         hit = False
         if kw == name_lower or kw_stem == name_lower or (kw_e and kw_e == name_lower):
             score += 4.2 * idf
             hit = True
-            id_or_call_hits += 1
+            if not is_generic_kw:
+                id_or_call_hits += 1
         elif (
             kw in name_tokens
             or kw in name_lower
@@ -97,7 +105,8 @@ def score_symbol_for_query(
         ):
             score += name_weight * idf
             hit = True
-            id_or_call_hits += 1
+            if not is_generic_kw:
+                id_or_call_hits += 1
             if kw in doc_lower or (len(kw_stem) >= 4 and kw_stem in doc_lower):
                 score += 0.75 * idf
         elif (
@@ -112,11 +121,13 @@ def score_symbol_for_query(
         ):
             score += (2.4 if is_lifecycle_method else 1.35) * idf
             hit = True
-            id_or_call_hits += 1
+            if not is_generic_kw:
+                id_or_call_hits += 1
         elif kw in sig_tokens or (len(kw_stem) >= 3 and kw_stem in sig_tokens) or (kw_e and kw_e in sig_tokens):
-            score += 2.0 * idf
+            score += (0.6 if is_generic_kw else 2.0) * idf
             hit = True
-            id_or_call_hits += 1
+            if not is_generic_kw:
+                id_or_call_hits += 1
         elif any(
             kw in c
             or (len(kw_stem) >= 4 and kw_stem in c)
@@ -124,9 +135,10 @@ def score_symbol_for_query(
             or (len(kw_root) >= 4 and kw_root in c)
             for c in calls_lower
         ):
-            score += 1.45 * idf
+            score += (0.45 if is_generic_kw else 1.45) * idf
             hit = True
-            id_or_call_hits += 1
+            if not is_generic_kw:
+                id_or_call_hits += 1
         elif kw in doc_lower or (len(kw_stem) >= 4 and kw_stem in doc_lower) or (kw_e and kw_e in doc_lower):
             score += 1.15 * idf
             hit = True
@@ -235,6 +247,7 @@ def compile_evidence_packet(
     from .brain import _extract_keywords, _tokenize_symbol
 
     brain._ensure_fresh()
+    brain._ensure_blobs()
     intent = classify_intent(task)
     if intent.get("intent") == ADD_FEATURE or re.search(
         r"\b(add|create|implement|scaffold)\s+(?:a\s+)?(?:new\s+)?(route|endpoint|handler|controller|tool|service|model)\b",
@@ -671,6 +684,7 @@ def compile_engineering_dossier(
     impact_files: list[str] | None = None,
     out_path: str | None = None,
     zoom: bool = False,
+    write_file: bool = True,
 ) -> dict:
     """Compile a self-contained, zero-follow-up Engineering Dossier across one or more tasks."""
     from .brain import (
@@ -683,6 +697,7 @@ def compile_engineering_dossier(
     )
 
     brain._ensure_fresh()
+    brain._ensure_blobs()
     if isinstance(tasks, str):
         tasks = [tasks]
     impact_list = list(impact_files or [])
@@ -833,7 +848,7 @@ def compile_engineering_dossier(
         matrix_header = ""
         cell_slices: list[str] = []
         cell_focus_terms: list[str] = []
-        if (slice_e - slice_s) >= 10 and not is_caller_slice:
+        if (slice_e - slice_s) >= 10 and (not is_caller_slice or node_anns):
             pre_cells = brain._index[rel].get("cells_4d")
             if pre_cells:
                 cells = [c for c in pre_cells if c["line_start"] >= slice_s and c["line_end"] <= slice_e]
@@ -957,7 +972,7 @@ def compile_engineering_dossier(
 
         explicit_nodes: list[str] = []
         explicit_task_files: list[str] = []
-        for m_path in re.findall(r"\b([a-zA-Z0-9_.\-]+(?:/[a-zA-Z0-9_.\-]+)+\.[a-zA-Z0-9]+)\b", clean_task_for_search):
+        for m_path in _TASK_PATH_RE.findall(clean_task_for_search):
             mp_low = m_path.lower().strip("/")
             cands_mp = [
                 rel_k for rel_k in brain._index if rel_k.lower() == mp_low or rel_k.lower().endswith("/" + mp_low)
@@ -968,6 +983,15 @@ def compile_engineering_dossier(
                     explicit_task_files.append(best_mp)
         has_explicit_route = False
         if brain._graph:
+            brain._graph._ensure_registries()
+            # Pre-tokenize task text once in O(|task|) to replace O(|V|) dynamic regex compilations
+            task_word_tokens_exact = set(_WORD_EXTRACT_RE.findall(clean_task_for_search))
+            task_dotted_pairs_low: set[str] = set()
+            for d_chain in _DOTTED_CHAIN_RE.findall(t_low):
+                d_parts = d_chain.split(".")
+                for d_i in range(len(d_parts) - 1):
+                    task_dotted_pairs_low.add(f"{d_parts[d_i]}.{d_parts[d_i + 1]}")
+
             for nid, nd in brain._graph.nodes.items():
                 ntype = nd.get("type")
                 if ntype == "route":
@@ -980,23 +1004,34 @@ def compile_engineering_dossier(
                 elif ntype in ("fn", "cls"):
                     raw_nm = nd.get("name") or ""
                     p_cls = nd.get("parent_class") or ""
-                    q_nm = f"{p_cls}.{raw_nm}" if p_cls else ""
-                    if q_nm and re.search(r"\b" + re.escape(q_nm) + r"\b", clean_task_for_search, re.IGNORECASE):
-                        explicit_nodes.append(nid)
-                    elif len(raw_nm) >= 5 and (
-                        any(c.isupper() for c in raw_nm[1:])
-                        or "_" in raw_nm
-                        or f"`{raw_nm}`" in task
-                        or f"({raw_nm})" in task
-                    ):
-                        if re.search(r"\b" + re.escape(raw_nm) + r"\b", clean_task_for_search):
+                    if p_cls and raw_nm:
+                        q_nm = f"{p_cls}.{raw_nm}"
+                        q_nm_low = q_nm.lower()
+                        if _PURE_WORD_RE.match(p_cls) and _PURE_WORD_RE.match(raw_nm):
+                            q_matched = q_nm_low in task_dotted_pairs_low
+                        else:
+                            q_matched = q_nm_low in t_low and bool(
+                                re.search(r"\b" + re.escape(q_nm) + r"\b", clean_task_for_search, re.IGNORECASE)
+                            )
+                        if q_matched:
                             explicit_nodes.append(nid)
+                            continue
+                    if len(raw_nm) >= 5 and (
+                        raw_nm in task_word_tokens_exact or (not _PURE_WORD_RE.match(raw_nm) and raw_nm in clean_task_for_search)
+                    ):
+                        if (
+                            any(c.isupper() for c in raw_nm[1:])
+                            or "_" in raw_nm
+                            or f"`{raw_nm}`" in task
+                            or f"({raw_nm})" in task
+                        ):
+                            if _PURE_WORD_RE.match(raw_nm) or re.search(
+                                r"\b" + re.escape(raw_nm) + r"\b", clean_task_for_search
+                            ):
+                                explicit_nodes.append(nid)
 
         explicit_data_keys: list[str] = []
-        for m_dk_tok in re.findall(
-            r"\b([A-Z][A-Z0-9]+_[A-Z0-9_]+|[a-z][a-z0-9]*_[a-z0-9_]+)\b|`([A-Za-z_][A-Za-z0-9_]{3,})`",
-            clean_task_for_search,
-        ):
+        for m_dk_tok in _DATA_KEY_RE.findall(clean_task_for_search):
             dk_cand = (m_dk_tok[0] or m_dk_tok[1]).strip()
             if len(dk_cand) >= 5 and dk_cand.lower() not in STOPWORDS:
                 if not any(
@@ -1012,6 +1047,10 @@ def compile_engineering_dossier(
             dk_state_slices: list[tuple[float, str, int, int, str]] = []
             for dk in explicit_data_keys[:2]:
                 dk_low = dk.lower()
+                dk_word_re = re.compile(rf"\b{re.escape(dk_low)}\b")
+                dk_attr_re = re.compile(rf"(?:self|app|config|settings|cls)\.{re.escape(dk_low)}\b")
+                dk_assign_re = re.compile(rf"\b{re.escape(dk_low)}\b\s*(?::\s*[^=]+)?=")
+                dk_dict_re = re.compile(rf"^['\"]{re.escape(dk)}['\"]\s*:")
                 for rp_dk, info_dk in brain._index.items():
                     if not q_wants_tests_dk and (
                         _is_test_file(rp_dk)
@@ -1035,15 +1074,16 @@ def compile_engineering_dossier(
                     for fn_dk in info_dk.get("functions", []):
                         ls_d, le_d = fn_dk.get("line_start", 1), fn_dk.get("line_end", 1)
                         fn_txt_d = "\n".join(flines_dk[max(0, ls_d - 1) : min(len(flines_dk), le_d)])
-                        if dk in fn_txt_d or re.search(rf"\b{re.escape(dk_low)}\b", fn_txt_d.lower()):
+                        fn_txt_d_low = fn_txt_d.lower()
+                        if dk in fn_txt_d or (dk_low in fn_txt_d_low and dk_word_re.search(fn_txt_d_low)):
                             for cln in range(ls_d, le_d + 1):
                                 covered_dk_lines.add(cln)
                             sc_d = brain._score_symbol_for_query(fn_dk, t_kw + [dk_low], beh_dk, rts_dk, c4d_dk)
                             is_code_access = bool(
-                                f".{dk_low}" in fn_txt_d.lower()
+                                f".{dk_low}" in fn_txt_d_low
                                 or f'"{dk}"' in fn_txt_d
                                 or f"'{dk}'" in fn_txt_d
-                                or re.search(rf"(?:self|app|config|settings|cls)\.{re.escape(dk_low)}\b", fn_txt_d.lower())
+                                or dk_attr_re.search(fn_txt_d_low)
                             )
                             if is_code_access:
                                 sc_d += 10.0
@@ -1052,11 +1092,12 @@ def compile_engineering_dossier(
                     for ln_i, ln_str in enumerate(flines_dk, start=1):
                         if ln_i in covered_dk_lines:
                             continue
-                        if dk in ln_str or re.search(rf"\b{re.escape(dk_low)}\b\s*(?::\s*[^=]+)?=", ln_str.lower()):
+                        ln_low = ln_str.lower()
+                        if dk in ln_str or (dk_low in ln_low and dk_assign_re.search(ln_low)):
                             st_ln = ln_str.strip()
                             if st_ln.startswith(("#", "//", "*", '"""', "'''")):
                                 continue
-                            is_dict_kv = bool(re.match(rf"^['\"]{re.escape(dk)}['\"]\s*:", st_ln))
+                            is_dict_kv = bool(dk_dict_re.match(st_ln))
                             if st_ln.startswith(('"', "'")) and not is_dict_kv:
                                 continue
                             is_decl = ("=" in ln_str) or is_dict_kv
@@ -1424,6 +1465,23 @@ def compile_engineering_dossier(
                                         break
 
         if brain._graph and explicit_nodes:
+            brain._graph._ensure_registries()
+
+            def _is_reliable_call_edge(e_obj: dict) -> bool:
+                conf = e_obj.get("confidence")
+                if conf in ("exact", "import_resolved", "qualified"):
+                    return True
+                if conf == "candidate" and e_obj.get("type") == "calls" and brain._graph:
+                    dst_nm = brain._graph.nodes.get(e_obj.get("dst", ""), {}).get("name") or ""
+                    # Closed-world CHA: compound domain selector (>=2 subtokens) with unique definition (|defs(m)| == 1)
+                    if (
+                        len(dst_nm) >= 6
+                        and len(_tokenize_symbol(dst_nm)) >= 2
+                        and len(brain._graph._registry.get(dst_nm, ())) == 1
+                    ):
+                        return True
+                return False
+
             chain_lines: list[str] = []
             expanded_nodes: list[tuple[str, str, list[str], int, int]] = []
             for seed_id in explicit_nodes[:6]:
@@ -1452,9 +1510,10 @@ def compile_engineering_dossier(
                                 (dst1, f"reads state from {seed_id.split(':')[-1]}", t_kw + [dst1_name], 26, 0)
                             )
                         continue
-                    if e1["type"] not in ("calls", "handles") or e1.get("confidence") not in (
-                        "exact",
-                        "import_resolved",
+                    if e1["type"] not in ("calls", "handles") or not (
+                        _is_reliable_call_edge(e1)
+                        if e1["type"] == "calls"
+                        else e1.get("confidence") in ("exact", "import_resolved")
                     ):
                         continue
                     dst1 = e1["dst"]
@@ -1558,7 +1617,7 @@ def compile_engineering_dossier(
                 raw_callers: list[tuple[int, int, str, dict]] = []
                 for ei in brain._graph._radj.get(seed_id, []):
                     e_in = brain._graph.edges[ei]
-                    if e_in["type"] != "calls" or e_in.get("confidence") not in ("exact", "import_resolved"):
+                    if e_in["type"] != "calls" or not _is_reliable_call_edge(e_in):
                         continue
                     cid = e_in["src"]
                     cnd = brain._graph.nodes.get(cid, {})
@@ -1646,7 +1705,10 @@ def compile_engineering_dossier(
                     for imp_rel in brain._imported_by.get(seed_rel, []):
                         if not q_wants_tests_bwd and _is_test_file(imp_rel):
                             continue
-                        if seed_sym in brain._blobs.get(imp_rel, ""):
+                        if (
+                            seed_sym in brain._blobs.get(imp_rel, "")
+                            or seed_sym in brain._body_token_sets.get(imp_rel, set())
+                        ):
                             imp_info = brain._index.get(imp_rel, {})
                             for ifn in imp_info.get("functions", []):
                                 if seed_sym in [c.lower() for c in ifn.get("calls", [])]:
@@ -1853,7 +1915,12 @@ def compile_engineering_dossier(
                 enm = (end_node.get("name") or "").lower()
                 enm_tokens = set(_tokenize_symbol(enm))
                 erel = end_node.get("rel_path", "")
-                is_monolith_call = bool(m_cl) and full_node_span > 120 and erel in primary_files and monolith_call_wins < 2
+                is_monolith_call = (
+                    bool(m_cl)
+                    and full_node_span > 120
+                    and (erel in primary_files or erel in top3_query_files)
+                    and monolith_call_wins < 2
+                )
                 espan = 12 if is_monolith_call else full_node_span
                 sec_lines_now = sum(len(x.splitlines()) for x in sec)
                 is_chop = "Causal Symptom Chop" in ereason
@@ -2086,12 +2153,14 @@ def compile_engineering_dossier(
         current_lines_after = len("\n".join(md_sections).splitlines())
         if current_lines_after < 775:
             md_sections.append(
-                "\n> **Tools:** `projectbrain slice --summary <file>:<symbol>` | `projectbrain patch` (`@file <rel_path>`, `@replace_body <Symbol> ... @end`, `@sub <Symbol> \\`<old>\\` -> \\`<new>\\``)"
+                "\n> **Tools:** `brain_slice` (`<file>:<symbol>`, `focus=\"<var>\"`) | `brain_explore` (`<symbol_or_route>`) | `brain_check` (`files_modified=[...]`) | `brain_remember` (`<target>`, `<note>`)"
             )
 
     full_md = "\n".join(md_sections)
-    target_file = Path(out_path) if out_path else (brain.root / ".projectbrain_dossier.md")
-    target_file.write_text(full_md, encoding="utf-8")
+    target_file: Path | None = None
+    if out_path or write_file:
+        target_file = Path(out_path) if out_path else (brain.root / ".projectbrain_dossier.md")
+        target_file.write_text(full_md, encoding="utf-8")
     total_lines = len(full_md.splitlines())
     for f_rel, ivs in emitted_by_file.items():
         brain._ledger.commit_slice_intervals(f_rel, ivs)
@@ -2108,7 +2177,7 @@ def compile_engineering_dossier(
         closed_world_verified=closed_world_verified,
     )
     return {
-        "dossier_path": str(target_file),
+        "dossier_path": str(target_file) if target_file else None,
         "total_lines": total_lines,
         "total_chars": len(full_md),
         "slices_included": len(seen_slices),

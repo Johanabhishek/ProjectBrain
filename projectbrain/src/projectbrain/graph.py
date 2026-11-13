@@ -5,6 +5,7 @@ Edges: defines, imports, calls, inherits, handles, has_method, exports
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 from collections import deque
@@ -107,7 +108,8 @@ class CodeGraph:
         for fn in info.get("functions", []):
             parent = fn.get("parent_class")
             nid = fn_id(rel_path, fn["name"], parent)
-            calls_sig = ",".join(fn.get("calls", [])) + "|" + ",".join(sorted((fn.get("qualified_calls") or {}).keys()))
+            raw_cs = ",".join(fn.get("calls", ())) + "|" + ",".join(sorted((fn.get("qualified_calls") or {}).keys()))
+            calls_sig = hashlib.blake2b(raw_cs.encode("utf-8"), digest_size=6).hexdigest()
             self.nodes[nid] = {
                 "type": "fn",
                 "rel_path": rel_path,
@@ -118,7 +120,6 @@ class CodeGraph:
                 "is_method": fn.get("is_method", False),
                 "parent_class": parent,
                 "interface_hash": fn.get("interface_hash", ""),
-                "arity_spec": fn.get("arity_spec"),
                 "ast_hash": fn.get("ast_hash", ""),
                 "calls_sig": calls_sig,
             }
@@ -494,12 +495,12 @@ class CodeGraph:
 
         dirty_rels = set(changed_rels) | set(deleted_rels)
         old_nodes_snapshot: dict[str, dict] = {}
-        removed_node_ids: set[str] = set()
+        all_old_node_ids: set[str] = set()
         for rel in dirty_rels:
             old_nids = self._nodes_by_file.pop(rel, [])
             for nid in old_nids:
                 nd = self.nodes.pop(nid, None)
-                removed_node_ids.add(nid)
+                all_old_node_ids.add(nid)
                 if nd:
                     old_nodes_snapshot[nid] = nd
                     nm = nd.get("name", "")
@@ -521,10 +522,13 @@ class CodeGraph:
         # Fast Salsa cutoff path: if interfaces are unchanged, no nodes were added/removed,
         # and every function's outgoing call signature is unchanged, skip 200k-edge rebuild
         new_node_ids = {nid for r in changed_rels for nid in self._nodes_by_file.get(r, ())}
+        truly_removed_node_ids = all_old_node_ids - new_node_ids
+        added_node_ids = new_node_ids - all_old_node_ids
         if (
             interfaces_unchanged
             and not deleted_rels
-            and new_node_ids == removed_node_ids
+            and not truly_removed_node_ids
+            and not added_node_ids
             and all(
                 (
                     self.nodes[nid].get("calls_sig") == old_nodes_snapshot[nid].get("calls_sig")
@@ -554,22 +558,29 @@ class CodeGraph:
                 "new_edges": [],
             }
 
-        # Determine files whose outgoing edges must be recomputed
+        # Determine files whose outgoing edges must be recomputed.
+        # Importers' outgoing edges only depend on symbol node existence and class inheritance bases,
+        # never on callee parameter signatures — so surviving symbol IDs keep all incoming edges intact.
+        cls_bases_changed = any(
+            self.nodes[nid].get("bases") != old_nodes_snapshot[nid].get("bases")
+            for nid in (new_node_ids & all_old_node_ids)
+            if self.nodes[nid].get("type") == "cls"
+        )
         edge_rebuild_rels = {r for r in changed_rels if r in index}
-        if not interfaces_unchanged:
+        if truly_removed_node_ids or added_node_ids or cls_bases_changed:
             for r in dirty_rels:
                 for imp_rel in imported_by.get(r, ())[:25]:
                     if imp_rel in index:
                         edge_rebuild_rels.add(imp_rel)
 
-        rebuild_src_ids: set[str] = set(removed_node_ids)
+        rebuild_src_ids: set[str] = set(all_old_node_ids)
         for rel in edge_rebuild_rels:
             rebuild_src_ids.update(self._nodes_by_file.get(rel, ()))
 
         # Filter existing edges in-place and append rebuilt edges for edge_rebuild_rels
         self.edges = [
             e for e in self.edges
-            if e["src"] not in rebuild_src_ids and e["dst"] not in removed_node_ids and e["dst"] in self.nodes
+            if e["src"] not in rebuild_src_ids and e["dst"] not in truly_removed_node_ids and e["dst"] in self.nodes
         ]
         prev_edge_len = len(self.edges)
         for rel in edge_rebuild_rels:
@@ -584,11 +595,15 @@ class CodeGraph:
             for nid in self._nodes_by_file.get(rel, ()):
                 if nid in self.nodes:
                     upserted_nodes[nid] = self.nodes[nid]
+            for imp in index.get(rel, {}).get("imports", []):
+                mnid = mod_id(imp)
+                if mnid in self.nodes:
+                    upserted_nodes[mnid] = self.nodes[mnid]
 
         return {
             "affected_rels": list(edge_rebuild_rels),
             "removed_rels": list(dirty_rels),
-            "removed_node_ids": list(removed_node_ids),
+            "removed_node_ids": list(truly_removed_node_ids),
             "rebuild_src_ids": list(rebuild_src_ids),
             "upserted_nodes": upserted_nodes,
             "new_edges": new_edges,
@@ -858,21 +873,39 @@ class CodeGraph:
         total_s = sum(valid_seeds.values())
         v0 = {k: v / total_s for k, v in valid_seeds.items()}
 
+        self._ensure_registries()
         _FWD_W = {"http_flow": 1.45, "state_flow": 1.25, "handles": 1.15, "calls": 1.00, "defines_nested": 0.95}
         _BWD_W = {"http_flow": 0.85, "state_flow": 0.80, "handles": 0.70, "calls": 0.65}
         _CONF_W = {"exact": 1.0, "qualified": 0.9, "import_resolved": 0.85}
 
-        # Precompute incoming call degree for Ochiai hub damping
+        def _edge_conf_weight(e_obj: dict) -> float:
+            conf = e_obj.get("confidence", "")
+            w0 = _CONF_W.get(conf)
+            if w0 is not None:
+                return w0
+            if conf == "candidate" and e_obj.get("type") == "calls":
+                dst_nm = self.nodes.get(e_obj.get("dst", ""), {}).get("name") or ""
+                # Closed-world CHA: compound selector (>=2 subtokens, avoiding 1-word stdlib protocols like .execute/.write)
+                # with a globally unique definition across the repository.
+                if (
+                    len(dst_nm) >= 6
+                    and ("_" in dst_nm.strip("_") or (any(c.isupper() for c in dst_nm[1:]) and any(c.islower() for c in dst_nm)))
+                    and len(self._registry.get(dst_nm, ())) == 1
+                ):
+                    return 0.72
+            return 0.0
+
+        # Lazily compute incoming call degree on touched nodes only (preserving sublinear ACL runtime)
         call_in_deg: dict[str, int] = {}
-        for nid in self.nodes:
-            in_edges = self._radj.get(nid, [])
-            call_in_deg[nid] = sum(
-                1 for ei in in_edges
-                if self.edges[ei]["type"] == "calls" and self.edges[ei].get("confidence") in _CONF_W
-            )
 
         def _hub_damp(target_nid: str) -> float:
-            deg = call_in_deg.get(target_nid, 0)
+            deg = call_in_deg.get(target_nid)
+            if deg is None:
+                deg = sum(
+                    1 for ei in self._radj.get(target_nid, ())
+                    if self.edges[ei]["type"] == "calls" and _edge_conf_weight(self.edges[ei]) > 0.0
+                )
+                call_in_deg[target_nid] = deg
             return 1.0 / ((1.0 + deg) ** 0.6)
 
         # State is (node_id, phase) where phase=0 is UP/ENTRY and phase=1 is DOWN (inside callee)
@@ -909,28 +942,30 @@ class CodeGraph:
             for ei in self._adj.get(u, []):
                 e = self.edges[ei]
                 et = e["type"]
-                conf = e.get("confidence", "")
-                if et in _FWD_W and conf in _CONF_W:
-                    dst = e["dst"]
-                    w = _FWD_W[et] * _CONF_W[conf] * _hub_damp(dst)
-                    # Stepping down a `calls` edge enters DOWN phase (1); cross-stack bridges reset to ENTRY (0)
-                    nxt_phase = 1 if et in ("calls", "defines_nested") else 0
-                    rsn = e.get("reason") or f"{et} from {u_nm}"
-                    transitions.append((dst, nxt_phase, w, f"PPR [{et}] via {u_nm}: {rsn}"))
+                if et in _FWD_W:
+                    cw = _edge_conf_weight(e)
+                    if cw > 0.0:
+                        dst = e["dst"]
+                        w = _FWD_W[et] * cw * _hub_damp(dst)
+                        # Stepping down a `calls` edge enters DOWN phase (1); cross-stack bridges reset to ENTRY (0)
+                        nxt_phase = 1 if et in ("calls", "defines_nested") else 0
+                        rsn = e.get("reason") or f"{et} from {u_nm}"
+                        transitions.append((dst, nxt_phase, w, f"PPR [{et}] via {u_nm}: {rsn}"))
 
             # Backward edges (subject to Dyck two-phase realizability)
             for ei in self._radj.get(u, []):
                 e = self.edges[ei]
                 et = e["type"]
-                conf = e.get("confidence", "")
-                if et in _BWD_W and conf in _CONF_W:
-                    # HRB / Dyck law: if we arrived at `u` by stepping DOWN into a callee (phase == 1),
-                    # never step UP via `inverse_calls` into other callers of `u`!
-                    if phase == 1 and et == "calls":
-                        continue
-                    src = e["src"]
-                    w = _BWD_W[et] * _CONF_W[conf] * _hub_damp(src)
-                    transitions.append((src, 0, w, f"PPR [inverse_{et}] -> {u_nm}"))
+                if et in _BWD_W:
+                    cw = _edge_conf_weight(e)
+                    if cw > 0.0:
+                        # HRB / Dyck law: if we arrived at `u` by stepping DOWN into a callee (phase == 1),
+                        # never step UP via `inverse_calls` into other callers of `u`!
+                        if phase == 1 and et == "calls":
+                            continue
+                        src = e["src"]
+                        w = _BWD_W[et] * cw * _hub_damp(src)
+                        transitions.append((src, 0, w, f"PPR [inverse_{et}] -> {u_nm}"))
 
             if not transitions:
                 for k, val in v0.items():

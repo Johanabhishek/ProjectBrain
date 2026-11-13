@@ -3,6 +3,6 @@
 # Bump GRAPH_VERSION when graph.py changes node/edge shape or semantics.
 # Any bump invalidates existing caches, forcing a full reindex on next load().
 
-SCHEMA_VERSION = 6
-PARSER_VERSION = "2026-11-09.2"
-GRAPH_VERSION = "2026-11-09.2"
+SCHEMA_VERSION = 8
+PARSER_VERSION = "2026-11-10.1"
+GRAPH_VERSION = "2026-11-12.1"

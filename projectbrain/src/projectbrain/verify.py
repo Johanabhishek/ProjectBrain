@@ -547,14 +547,15 @@ def verify_plan(
     return result
 
 
-def impact(brain: "ProjectBrain", files_changed: list[str] | str) -> dict:
+def impact(brain: "ProjectBrain", files_changed: list[str] | str, *, _already_fresh: bool = False) -> dict:
     from .contracts import verify_cross_file_contracts
 
     if isinstance(files_changed, (str, Path)):
         files_changed = [str(files_changed)]
-    if hasattr(brain, "_capture_pre_edit_snapshots"):
-        brain._capture_pre_edit_snapshots(files_changed)
-    brain._ensure_fresh()
+    if not _already_fresh:
+        if hasattr(brain, "_capture_pre_edit_snapshots"):
+            brain._capture_pre_edit_snapshots(files_changed)
+        brain._ensure_fresh()
 
     results = []
     all_impacted: set[str] = set()
@@ -589,8 +590,9 @@ def impact(brain: "ProjectBrain", files_changed: list[str] | str) -> dict:
                 fn_name = fn["name"]
                 fn_node_id = fn_id(rel_path, fn_name, fn.get("parent_class"))
                 if fn_node_id in brain._graph.nodes:
-                    for edge in brain._graph.edges:
-                        if edge["dst"] == fn_node_id and edge["type"] == "calls":
+                    for ei in brain._graph._radj.get(fn_node_id, ()):
+                        edge = brain._graph.edges[ei]
+                        if edge["type"] == "calls":
                             src_node = brain._graph.nodes.get(edge["src"], {})
                             callers.append({
                                 "function": fn_name,
@@ -691,6 +693,8 @@ def url_matches(pattern: str, url: str) -> bool:
 
 
 def find_url_callers(brain: "ProjectBrain", url_path: str, method: str) -> list[dict]:
+    if hasattr(brain, "_ensure_blobs"):
+        brain._ensure_blobs()
     callers = []
     url_lower = url_path.lower()
 
@@ -901,3 +905,247 @@ def co_change_analysis(brain: "ProjectBrain", file_path: str, days: int = 90) ->
             "co_changes": [],
             "message": "Git not available or timed out.",
         }
+
+
+def load_neighborhood_for_check(brain: "ProjectBrain", candidate_files: list[str]) -> bool:
+    """Hydrate only the connected 1-2 hop neighborhood from SQLite for O(k) `check(files_modified=...)`."""
+    from . import resolve
+    from .brain import PARSED_EXTS
+    from .graph import CodeGraph, cls_id, fn_id
+    from .parsers import parse_with_tree
+
+    if (
+        brain._index
+        or not candidate_files
+        or len(candidate_files) > 20
+        or not brain._db_store.db_path.exists()
+        or brain._cache_path.exists()
+    ):
+        return False
+
+    focus_rels = {
+        r
+        for raw_f in candidate_files
+        for r in (brain._normalize_rel(str(raw_f)),)
+        if r
+    }
+    if not focus_rels:
+        return False
+
+    extra_called_names: set[str] = set()
+    need_sql_schemas = False
+    symbols_changed = False
+    has_static_unedited_focus = False
+    mutated_set: set[str] = set()
+
+    for r in focus_rels:
+        pre_inf = brain._pre_edit_index.get(r)
+        pre_mtime: float | None = None
+        if pre_inf is None:
+            pre_hit = brain._db_store.get_file_fast(r)
+            pre_inf = (pre_hit or {}).get("info") or {}
+            pre_mtime = (pre_hit or {}).get("mtime")
+        p = brain.root / r
+        if not p.exists():
+            if pre_inf:
+                symbols_changed = True
+            continue
+        if p.suffix.lower() not in PARSED_EXTS:
+            continue
+
+        pending = brain._pending_parsed_files.get(r)
+        if pending is not None:
+            inf, _, src, _, _ = pending
+            was_edited = True
+        else:
+            try:
+                st = p.stat()
+                if pre_inf and pre_mtime is not None and st.st_mtime == pre_mtime:
+                    # Unmodified file on disk -> static clean-HEAD contract audit
+                    inf = pre_inf
+                    src = ""
+                    was_edited = False
+                else:
+                    src = p.read_text(encoding="utf-8", errors="ignore")
+                    inf, ts_tree = parse_with_tree(src, p.suffix.lower())
+                    if pre_inf:
+                        brain._pre_edit_index.setdefault(r, dict(pre_inf))
+                    brain._source_cache[r] = src
+                    brain._pending_parsed_files[r] = (inf, ts_tree, src, st.st_mtime, st.st_size)
+                    was_edited = bool(
+                        not pre_inf
+                        or inf.get("interface_hash") != pre_inf.get("interface_hash")
+                        or [x.get("ast_hash") for x in inf.get("functions", [])]
+                        != [x.get("ast_hash") for x in pre_inf.get("functions", [])]
+                        or [x.get("ast_hash") for x in inf.get("classes", [])]
+                        != [x.get("ast_hash") for x in pre_inf.get("classes", [])]
+                    )
+            except OSError:
+                continue
+
+        if not was_edited:
+            has_static_unedited_focus = True
+        if src:
+            src_up = src.upper()
+            if "INSERT " in src_up or "SELECT " in src_up or "sqlite3" in src:
+                need_sql_schemas = True
+        elif pre_inf.get("sql_schemas") or "sqlite3" in (pre_inf.get("imports") or ()):
+            need_sql_schemas = True
+
+        if not pre_inf:
+            symbols_changed = True
+            continue
+
+        pre_calls = {c for fn in pre_inf.get("functions", []) for c in (fn.get("calls") or ())}
+        post_calls = {c for fn in inf.get("functions", []) for c in (fn.get("calls") or ())}
+        pre_bases = {
+            b_raw.split(".")[-1].split("[")[0].strip()
+            for cls in pre_inf.get("classes", [])
+            for b_raw in (cls.get("bases") or ())
+            if b_raw.split(".")[-1].split("[")[0].strip()
+        }
+        post_bases = {
+            b_raw.split(".")[-1].split("[")[0].strip()
+            for cls in inf.get("classes", [])
+            for b_raw in (cls.get("bases") or ())
+            if b_raw.split(".")[-1].split("[")[0].strip()
+        }
+        extra_called_names.update((post_calls - pre_calls) | (post_bases - pre_bases))
+
+        pre_fn_hashes = {
+            (fn.get("parent_class"), fn["name"]): (fn.get("interface_hash"), fn.get("ast_hash"))
+            for fn in pre_inf.get("functions", [])
+        }
+        post_fn_hashes = {
+            (fn.get("parent_class"), fn["name"]): (fn.get("interface_hash"), fn.get("ast_hash"))
+            for fn in inf.get("functions", [])
+        }
+        pre_cls_hashes = {
+            c["name"]: (c.get("interface_hash"), c.get("ast_hash"))
+            for c in pre_inf.get("classes", [])
+        }
+        post_cls_hashes = {
+            c["name"]: (c.get("interface_hash"), c.get("ast_hash"))
+            for c in inf.get("classes", [])
+        }
+        if (
+            pre_fn_hashes.keys() != post_fn_hashes.keys()
+            or pre_cls_hashes.keys() != post_cls_hashes.keys()
+            or pre_bases != post_bases
+            or set(pre_inf.get("exports") or ()) != set(inf.get("exports") or ())
+            or set((pre_inf.get("import_bindings") or {}).keys()) != set((inf.get("import_bindings") or {}).keys())
+        ):
+            symbols_changed = True
+        else:
+            for (p_cls, fn_nm), h_pair in post_fn_hashes.items():
+                if pre_fn_hashes.get((p_cls, fn_nm)) != h_pair:
+                    mutated_set.add(fn_id(r, fn_nm, p_cls))
+            for cls_nm, h_pair in post_cls_hashes.items():
+                if pre_cls_hashes.get(cls_nm) != h_pair:
+                    mutated_set.add(cls_id(r, cls_nm))
+
+    boundary_src_globs = []
+    if brain._memory._boundary_rules:
+        from .memory import _compile_path_glob
+        for rule in brain._memory._boundary_rules:
+            if rule.get("src_glob") and rule.get("dst_glob"):
+                dst_rx = _compile_path_glob(rule["dst_glob"])
+                if any(dst_rx.match(f) for f in focus_rels):
+                    boundary_src_globs.append(_compile_path_glob(rule["src_glob"]))
+
+    mutated_arg = None if (symbols_changed or has_static_unedited_focus) else mutated_set
+    data = brain._db_store.load_check_neighborhood(
+        focus_rels,
+        extra_called_names=extra_called_names,
+        boundary_src_globs=boundary_src_globs,
+        need_sql_schemas=need_sql_schemas,
+        symbols_changed=symbols_changed,
+        mutated_node_ids=mutated_arg,
+    )
+    if data is None or not brain._is_compatible_cache(data):
+        return False
+
+    brain._is_partial_index = True
+    brain._blobs_ready = False
+    brain._all_indexed_files = set(data["all_indexed_files"])
+    brain._index = {
+        rel: {**entry.get("info", {}), "mtime": entry.get("mtime")}
+        for rel, entry in data.get("files", {}).items()
+    }
+    brain._sizes = {
+        rel: entry.get("size") for rel, entry in data.get("files", {}).items()
+    }
+    brain._skipped = data.get("skipped", {})
+
+    brain._doc_freq = {}
+    brain._blobs = {}
+    brain._token_sets = {}
+    brain._import_token_sets = {}
+    brain._body_token_sets = {}
+    brain._defn_sets = {}
+    brain._ast_hashes = {}
+    brain._z_write_sets = {}
+    brain._z_read_sets = {}
+    brain._trans_effect_sets = {}
+    brain._cell_4d_tokens = {}
+    brain._const_aliases = {}
+    brain._idf = {}
+    brain._behaviors = {}
+    brain._import_targets = {}
+    brain._symbol_imports = {}
+    brain._imported_by = {}
+    brain._python_module_index = resolve.build_python_module_index(brain._all_indexed_files)
+
+    from .store import unpack_symbol_imports
+
+    fimp_sub: dict[str, list[str]] | None = data.get("file_imports_subset")
+    sym_imps_all = unpack_symbol_imports(data["symbol_imports_b85"]) if "symbol_imports_b85" in data else None
+
+    for rel_path, info in brain._index.items():
+        for f in info.get("functions", []):
+            nid = fn_id(rel_path, f["name"], f.get("parent_class"))
+            if f.get("ast_hash"):
+                brain._ast_hashes[nid] = f["ast_hash"]
+        for c in info.get("classes", []):
+            nid = cls_id(rel_path, c["name"])
+            if c.get("ast_hash"):
+                brain._ast_hashes[nid] = c["ast_hash"]
+        if rel_path in focus_rels:
+            for tok in brain._compute_file_blob(rel_path, info):
+                brain._doc_freq[tok] = brain._doc_freq.get(tok, 0) + 1
+        targets = info.get("_resolved_targets")
+        sym_map = info.get("_resolved_sym_map")
+        if (targets is None or sym_map is None) and rel_path not in focus_rels and fimp_sub is not None and sym_imps_all is not None:
+            targets = list(fimp_sub.get(rel_path, ()))
+            sym_map = dict(sym_imps_all.get(rel_path, {}))
+            info["_resolved_targets"] = targets
+            info["_resolved_sym_map"] = sym_map
+        elif targets is None or sym_map is None:
+            targets, sym_map = resolve.resolve_file_imports_and_symbols(
+                rel_path, info, brain._all_indexed_files, brain._python_module_index, index=brain._index,
+            )
+            info["_resolved_targets"] = targets
+            info["_resolved_sym_map"] = sym_map
+        brain._import_targets[rel_path] = targets
+        brain._symbol_imports[rel_path] = sym_map
+        for target in targets:
+            brain._imported_by.setdefault(target, []).append(rel_path)
+
+    # Merge full direct-importer lists from `file_imports` so `impact()` consumer counts stay 100% exact
+    # even when non-calling hub importers were skipped during symbol-targeted hydration.
+    for fr, full_imps in (data.get("direct_importers_by_focus") or {}).items():
+        cur_imps = brain._imported_by.setdefault(fr, [])
+        seen_imps = set(cur_imps)
+        for imp_r in full_imps:
+            if imp_r not in seen_imps:
+                seen_imps.add(imp_r)
+                cur_imps.append(imp_r)
+
+    brain._importer_counts = {
+        rel_path: len(brain._imported_by.get(rel_path, []))
+        for rel_path in brain._index
+    }
+    brain._graph = CodeGraph.from_json(data["graph_json"])
+    return True
+
+

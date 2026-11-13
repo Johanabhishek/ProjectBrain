@@ -156,7 +156,86 @@ def test_modular_decomposition_and_lean_mcp_surface():
     assert callable(verify.verify_claim)
     assert callable(verify.impact)
     assert callable(runner.compress_command_output)
-    assert 6 <= len(server.LEAN_CORE_TOOLS) <= 10
+    assert 5 <= len(server.LEAN_CORE_TOOLS) <= 8
     assert "brain_dossier" in server.LEAN_CORE_TOOLS
     assert "brain_slice" in server.LEAN_CORE_TOOLS
+    assert "brain_explore" in server.LEAN_CORE_TOOLS
+    assert "brain_check" in server.LEAN_CORE_TOOLS
+    assert "brain_remember" in server.LEAN_CORE_TOOLS
+    assert "brain_patch" not in server.LEAN_CORE_TOOLS
+
+
+def test_cold_sqlite_fast_paths_do_not_hydrate_full_graph(tmp_path: Path, capsys):
+    """Verify cold slice (incl. missing targets), explore (neighbors + path), and memories stay zero-hydration."""
+    from projectbrain import cli
+
+    (tmp_path / "ledger.py").write_text(
+        "class BillingLedger:\n"
+        "    def reconcile_invoice_balance(self, account_id: str) -> int:\n"
+        "        return len(account_id)\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "dispatcher.py").write_text(
+        "from ledger import BillingLedger\n\n"
+        "def run_settlement_cycle(ledger_instance) -> int:\n"
+        "    return ledger_instance.reconcile_invoice_balance('acc_1')\n",
+        encoding="utf-8",
+    )
+    b_init = ProjectBrain(str(tmp_path))
+    b_init.index()
+    b_init.remember("reconcile_invoice_balance", "Must remain idempotent on retries.")
+
+    # 1. Cold slice with one valid range + one misspelled symbol must NOT hydrate _index
+    b_cold_slice = ProjectBrain(str(tmp_path))
+    res_s = b_cold_slice.slice_symbols(["ledger.py:1-3", "ledger.py:BillingLedger.reconcile_invoic_balanc"])
+    assert b_cold_slice._index == {}
+    assert len(res_s["slices"]) == 2
+    assert "reconcile_invoice_balance" in res_s["slices"][0]["code"]
+    assert "error" in res_s["slices"][1]
+    assert any("reconcile_invoice_balance" in s for s in res_s["slices"][1]["did_you_mean"])
+
+    # 2. Cold explore (neighbors AND bidirectional shortest path) must NOT hydrate _index
+    b_cold_exp = ProjectBrain(str(tmp_path))
+    res_nb = b_cold_exp.explore("reconcile_invoice_balance", depth=2)
+    assert b_cold_exp._index == {}
+    assert res_nb["center"]["name"] == "reconcile_invoice_balance"
+    res_path = b_cold_exp.explore("run_settlement_cycle", target_b="reconcile_invoice_balance")
+    assert b_cold_exp._index == {}
+    assert len(res_path["path"]) >= 1
+
+    # 3. Cold list_memories must NOT hydrate _index
+    b_cold_mem = ProjectBrain(str(tmp_path))
+    res_mem = b_cold_mem.list_memories()
+    assert b_cold_mem._index == {}
+    assert res_mem["count"] == 1
+    assert res_mem["stale_count"] == 0
+
+    # 4. CHA monomorphic receiver call expansion surfaces untyped OOP caller in compile_dossier
+    dossier_res = b_init.compile_dossier("Bug inside reconcile_invoice_balance settlement")
+    assert "run_settlement_cycle" in dossier_res["markdown"]
+
+    # 5. CLI batched slice preview reports actual line count (never EndLine < StartLine)
+    big_lines = "\n".join(f"def generated_helper_{i}(x):\n    return x + {i}\n" for i in range(260))
+    (tmp_path / "large_mod.py").write_text(big_lines + "\n", encoding="utf-8")
+    b_init.index()
+    capsys.readouterr()
+    rc = cli.main(["--path", str(tmp_path), "slice", "large_mod.py:1-380", "--max-lines", "380"])
+    assert rc == 0
+    cli_out = capsys.readouterr().out
+    if "StartLine=" in cli_out:
+        import re as _re
+        m = _re.search(r"StartLine=(\d+),\s*EndLine=(\d+)", cli_out)
+        assert m is not None
+        assert int(m.group(2)) >= int(m.group(1))
+
+    # 6. CLI check on file with callers formats text & markdown reports cleanly without KeyError
+    rc_chk = cli.main(["--path", str(tmp_path), "check", "ledger.py"])
+    assert rc_chk == 0
+    chk_out = capsys.readouterr().out
+    assert "dispatcher.py" in chk_out
+    rc_chk_md = cli.main(["--path", str(tmp_path), "check", "ledger.py", "--format", "markdown"])
+    assert rc_chk_md == 0
+    assert "dispatcher.py" in capsys.readouterr().out
+
+
 

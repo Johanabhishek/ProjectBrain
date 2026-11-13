@@ -11,6 +11,7 @@ import os
 import re
 import shlex
 import subprocess
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 from .graph import fn_id
@@ -292,3 +293,83 @@ def run_command_compressed(
     res["command"] = command if isinstance(command, str) else " ".join(command)
     res["exit_code"] = exit_code
     return res
+
+
+def load_gitignore_rules(
+    cache: dict,
+    gitignore_file: Path,
+    base_rel: str,
+) -> list[tuple[bool, bool, str, re.Pattern]]:
+    """Parse and cache `.gitignore` rules as `(is_negated, dir_only, base_rel, compiled_regex)`."""
+    try:
+        st = gitignore_file.stat()
+    except OSError:
+        return []
+    key = (str(gitignore_file), st.st_mtime)
+    if key in cache:
+        return cache[key]
+    rules: list[tuple[bool, bool, str, re.Pattern]] = []
+    try:
+        raw_lines = gitignore_file.read_text(encoding="utf-8", errors="ignore").splitlines()
+    except OSError:
+        return []
+    for raw in raw_lines:
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        is_neg = line.startswith("!")
+        if is_neg:
+            line = line[1:].strip()
+        if not line:
+            continue
+        dir_only = line.endswith("/")
+        if dir_only:
+            line = line.rstrip("/")
+        if not line:
+            continue
+        anchored = "/" in line
+        if line.startswith("/"):
+            line = line.lstrip("/")
+        i, n = 0, len(line)
+        rx = ["^" if anchored else "(?:^|/)"]
+        while i < n:
+            ch = line[i]
+            if ch == "*":
+                if i + 1 < n and line[i + 1] == "*":
+                    if i + 2 < n and line[i + 2] == "/":
+                        rx.append("(?:.*/)?")
+                        i += 3
+                        continue
+                    rx.append(".*")
+                    i += 2
+                    continue
+                rx.append("[^/]*")
+            elif ch == "?":
+                rx.append("[^/]")
+            elif ch in ".+^$(){}[]|\\-":
+                rx.append("\\" + ch)
+            else:
+                rx.append(ch)
+            i += 1
+        rx.append("(?:$|/)")
+        try:
+            rules.append((is_neg, dir_only, base_rel, re.compile("".join(rx))))
+        except re.error:
+            continue
+    cache[key] = rules
+    return rules
+
+
+def matches_gitignore(rel_posix: str, is_dir: bool, rules: list[tuple[bool, bool, str, re.Pattern]]) -> bool:
+    for is_neg, dir_only, base_rel, rx in reversed(rules):
+        if dir_only and not is_dir:
+            continue
+        if base_rel:
+            if not rel_posix.startswith(base_rel + "/"):
+                continue
+            target = rel_posix[len(base_rel) + 1 :]
+        else:
+            target = rel_posix
+        if rx.search(target):
+            return not is_neg
+    return False

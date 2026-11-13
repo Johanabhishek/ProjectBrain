@@ -15,7 +15,7 @@ from __future__ import annotations
 import ast
 import re
 from pathlib import Path
-from .parsers import _PARSERS, get_parser
+from .parsers import get_parser
 
 _IMPORTANT_CODE_PAT = re.compile(
     r"\b(setInterval|setTimeout|clearTimeout|clearInterval|addEventListener|removeEventListener|fetch|axios|Promise\.race|AbortController|AbortSignal|"
