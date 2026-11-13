@@ -39,8 +39,10 @@ def _load_brain_cls():
     return ProjectBrain
 
 
-def _resolve_mcp_server_command(resolved_root: str) -> tuple[str, list[str]]:
-    """Resolve `projectbrain-mcp` to an absolute path (or `sys.executable -m`) to prevent GUI IDE ENOENT."""
+def _resolve_mcp_server_command(resolved_root: str, *, portable: bool = False) -> tuple[str, list[str]]:
+    """Resolve `projectbrain-mcp` to an absolute path (or OS-portable command when `portable=True`)."""
+    if portable:
+        return "projectbrain-mcp", ["--lean", "."]
     import shutil
     which_mcp = shutil.which("projectbrain-mcp")
     if which_mcp:
@@ -132,7 +134,10 @@ def _print_stats_summary(st: dict) -> None:
     print("===============================================================")
     print(f"  Repository                  : {st.get('repo', st.get('root'))}")
     print(f"  Indexed Topology            : {st.get('files', 0)} files | {st.get('functions', 0)} functions | {st.get('classes', 0)} classes")
-    print(f"  Pinned Repo Governance      : {st.get('memories', 0)} AST invariants | {st.get('boundary_rules', 0)} boundary rules")
+    print(
+        f"  Pinned Repo Governance      : {st.get('memories', 0)} AST invariants | "
+        f"{st.get('boundary_rules', 0)} boundary rules | {st.get('co_change_rules', 0)} co-change rules"
+    )
     print("---------------------------------------------------------------")
     print(f"  Guardrail Audits Run        : {ic.get('audits_run', 0)} ({ic.get('clean_edits_audited', 0)} clean silent edits)")
     print(f"  Total Regressions Caught    : {ic.get('total_interceptions', 0)}")
@@ -148,131 +153,10 @@ def _print_stats_summary(st: dict) -> None:
 
 
 def format_check_report(res: dict, fmt: str = "text") -> str:
-    """Format `brain.check()` output as `text` (Ruff-style), `markdown` (PR comment), or `github` (CI annotations)."""
-    if fmt == "json":
-        return json.dumps(res, indent=2)
+    """Format `brain.check()` output as `text`, `json`, `markdown`, `pr-comment`, `github`, or `sarif`."""
+    from .reporters import format_check_report as _fmt_check_report
 
-    verdict = res.get("verdict", "SAFE_TO_PROCEED")
-    all_valid = res.get("all_contracts_valid", True)
-    diags: list[str] = res.get("contract_diagnostics", [])
-    b_violations: list[dict] = res.get("boundary_violations", [])
-    imp: dict = res.get("impact_analysis", {})
-    details: list[dict] = imp.get("details", [])
-    memories: list[dict] = res.get("memories", [])
-    stale_memories: list[dict] = res.get("stale_memories", [])
-    health: dict = res.get("health", {})
-
-    if fmt == "github":
-        import re
-        lines: list[str] = []
-        for bv in b_violations:
-            sf = bv.get("src_file", "")
-            ln = bv.get("line", 1)
-            lines.append(f"::error file={sf},line={ln},title=ProjectBrain Boundary Violation::{bv.get('message')}")
-        b_msgs = {bv.get("message") for bv in b_violations}
-        for d in diags:
-            if d in b_msgs:
-                continue
-            m_loc = re.search(r"([A-Za-z0-9_./\-]+\.[A-Za-z0-9]+):L?(\d+)", d)
-            if m_loc:
-                lines.append(f"::error file={m_loc.group(1)},line={m_loc.group(2)},title=ProjectBrain Contract Violation::{d}")
-            else:
-                lines.append(f"::error title=ProjectBrain Contract Violation::{d}")
-        for sm in stale_memories:
-            rf = sm.get("rel_path") or ""
-            loc_part = f" file={rf}," if rf else ""
-            lines.append(
-                f"::warning{loc_part}title=Stale AST Invariant::({sm.get('target_id')}) {sm.get('note')}"
-            )
-        status_txt = "PASS" if all_valid else "FAILED"
-        lines.append(
-            f"ProjectBrain CI Gate: {status_txt} (verdict={verdict}, diagnostics={len(diags)}, stale_invariants={len(stale_memories)})"
-        )
-        return "\n".join(lines)
-
-    if fmt == "markdown":
-        badge = "PASS" if all_valid else "ACTION REQUIRED"
-        md: list[str] = [
-            f"## ProjectBrain Blast-Radius & Contract Report — `{badge}`",
-            "",
-            f"- **Verdict:** `{verdict}`",
-            f"- **Files Analyzed:** `{imp.get('files_analyzed', len(details))}` | **Impact Zone:** `{imp.get('total_impact_zone', 0)}` file(s)",
-        ]
-        if diags:
-            md.append("\n### Contract, Syntax & Boundary Violations")
-            for d in diags:
-                md.append(f"- ❌ {d}")
-        if details:
-            high_callers = [d for d in details if d.get("called_by") or d.get("direct_consumers")]
-            if high_callers:
-                md.append("\n### Downstream Blast Radius")
-                for d in high_callers:
-                    callers_str = ", ".join(
-                        f"`{c.get('caller_file') or c.get('in_file') or '?'}:L{c.get('line') or '?'}` (`{c.get('caller') or c.get('called_by') or '?'}`)"
-                        for c in d.get("called_by", [])[:6]
-                    ) or ", ".join(f"`{c}`" for c in d.get("direct_consumers", [])[:6])
-                    md.append(f"- **`{d['rel_path']}`** (`{d.get('risk', 'low')}` risk) → {callers_str}")
-        if memories or stale_memories:
-            md.append("\n### Architectural Invariants")
-            seen_m: set[str] = set()
-            for m in [*stale_memories, *memories]:
-                mid = m.get("id", m.get("target_id", ""))
-                if mid in seen_m:
-                    continue
-                seen_m.add(mid)
-                icon = "⚠️ **[STALE — RE-VERIFY]**" if m.get("stale") else "📌 **[PINNED]**"
-                md.append(f"- {icon} `{m.get('target_id')}`: {m.get('note')}")
-        tests = sorted({t for d in details for t in d.get("test_consumers", [])})
-        if tests:
-            md.append(f"\n### Affected Tests\n```bash\npytest {' '.join(tests[:10])}\n```")
-        return "\n".join(md)
-
-    # Default `text` (Ruff-style scannable terminal output)
-    out: list[str] = []
-    status_lbl = "PASS" if all_valid else "VIOLATION"
-    if details or diags:
-        out.append(f"ProjectBrain Check [{status_lbl}] — Verdict: {verdict}")
-    elif health:
-        out.append(
-            f"ProjectBrain Check [{status_lbl}] — {health.get('files_indexed', 0)} files indexed "
-            f"({health.get('graph_nodes', 0)} nodes, {health.get('graph_edges', 0)} edges, "
-            f"{health.get('memories_count', 0)} invariants)"
-        )
-    else:
-        out.append(f"ProjectBrain Check [{status_lbl}]")
-
-    for d in diags:
-        out.append(f"  error: {d}")
-
-    for d in details:
-        callers = d.get("called_by", [])
-        consumers = d.get("direct_consumers", [])
-        if callers:
-            c_fmt = ", ".join(
-                f"{c.get('caller_file') or c.get('in_file') or '?'}:L{c.get('line') or '?'}"
-                for c in callers[:5]
-            )
-            out.append(f"  impact: {d['rel_path']} [{d.get('risk', 'low')}] -> called by {c_fmt}")
-        elif consumers:
-            out.append(f"  impact: {d['rel_path']} [{d.get('risk', 'low')}] -> imported by {', '.join(consumers[:5])}")
-
-    seen_ids: set[str] = set()
-    for m in [*stale_memories, *memories]:
-        mid = m.get("id", m.get("target_id", ""))
-        if mid in seen_ids:
-            continue
-        seen_ids.add(mid)
-        tag = "stale-invariant" if m.get("stale") else "invariant"
-        out.append(f"  {tag}: [{m.get('target_id')}] {m.get('note')}")
-
-    tests = sorted({t for d in details for t in d.get("test_consumers", [])})
-    if tests:
-        out.append(f"  tests: pytest {' '.join(tests[:8])}")
-
-    if health and health.get("partial_files"):
-        out.append(f"  partial-parse: {', '.join(health['partial_files'][:5])}")
-
-    return "\n".join(out)
+    return _fmt_check_report(res, fmt=fmt)
 
 
 def _write_or_merge_json(file_path: Path, top_key: str, server_name: str, server_cfg: dict) -> None:
@@ -321,8 +205,13 @@ def _run_init(
     ide: str = "auto",
     write_hooks: bool = True,
     write_git_hook: bool = False,
+    *,
+    team: bool = False,
+    github_action: bool = False,
+    no_github_action: bool = False,
+    learn: bool = False,
 ) -> dict:
-    """One-command setup: index repo, update .gitignore, wire ENOENT-proof MCP config, rules, and active hooks."""
+    """One-command setup: index repo, update .gitignore, wire MCP config, rules, active hooks, CI workflow, and governance."""
     ProjectBrain = _load_brain_cls()
     brain = ProjectBrain(str(root_path))
     stats = brain.index()
@@ -365,9 +254,9 @@ def _run_init(
         )
         actions.append("created_.gitignore")
 
-    # 2. Write ENOENT-proof MCP configurations
+    # 2. Write MCP configurations (ENOENT-proof local paths by default; OS-portable when `team=True`)
     if write_mcp:
-        mcp_cmd, mcp_args = _resolve_mcp_server_command(resolved_root)
+        mcp_cmd, mcp_args = _resolve_mcp_server_command(resolved_root, portable=team)
         stdio_cfg = {
             "command": mcp_cmd,
             "args": mcp_args,
@@ -375,7 +264,7 @@ def _run_init(
         if ide in ("auto", "all", "claude", "antigravity"):
             _write_or_merge_json(root_path / ".mcp.json", "mcpServers", "projectbrain", stdio_cfg)
             actions.append("configured_.mcp.json")
-        if ide in ("all", "cursor") or (ide == "auto" and has_cursor):
+        if ide in ("all", "cursor") or (ide == "auto" and (has_cursor or team)):
             _write_or_merge_json(root_path / ".cursor" / "mcp.json", "mcpServers", "projectbrain", stdio_cfg)
             actions.append("configured_.cursor/mcp.json")
         if ide in ("all", "vscode") or (ide == "auto" and has_vscode):
@@ -397,11 +286,11 @@ def _run_init(
             _write_or_append_rule(rule_file, _AGENT_RULE_CONTENT)
             actions.append("wrote_.agents/rules/projectbrain.md")
 
-        if ide in ("all", "claude") or (ide == "auto" and has_claude):
+        if ide in ("all", "claude") or (ide == "auto" and (has_claude or team)):
             _write_or_append_rule(root_path / "CLAUDE.md", _AGENT_RULE_CONTENT)
             actions.append("wrote_CLAUDE.md")
 
-        if ide in ("all", "cursor") or (ide == "auto" and has_cursor):
+        if ide in ("all", "cursor") or (ide == "auto" and (has_cursor or team)):
             cursor_rule = root_path / ".cursor" / "rules" / "projectbrain.mdc"
             cursor_rule.parent.mkdir(parents=True, exist_ok=True)
             if cursor_rule.exists():
@@ -423,24 +312,57 @@ def _run_init(
     if write_hooks or write_git_hook:
         from .hooks import install_git_pre_commit_hook, merge_claude_hooks, merge_cursor_hooks
         if write_hooks:
-            if ide in ("auto", "all", "claude"):
-                merge_claude_hooks(root_path / ".claude" / "settings.local.json", resolved_root)
-                actions.append("wrote_.claude/settings.local.json_hooks")
-            if ide in ("all", "cursor") or (ide == "auto" and has_cursor):
-                merge_cursor_hooks(root_path / ".cursor" / "hooks.json", resolved_root)
-                actions.append("wrote_.cursor/hooks.json")
+            if team:
+                if ide in ("auto", "all", "claude"):
+                    merge_claude_hooks(
+                        root_path / ".claude" / "settings.json",
+                        resolved_root,
+                        portable=True,
+                    )
+                    actions.append("wrote_.claude/settings.json_hooks")
+                if ide in ("auto", "all", "cursor"):
+                    merge_cursor_hooks(
+                        root_path / ".cursor" / "hooks.json",
+                        resolved_root,
+                        portable=True,
+                    )
+                    actions.append("wrote_.cursor/hooks.json")
+            else:
+                if ide in ("auto", "all", "claude"):
+                    merge_claude_hooks(root_path / ".claude" / "settings.local.json", resolved_root)
+                    actions.append("wrote_.claude/settings.local.json_hooks")
+                if ide in ("all", "cursor") or (ide == "auto" and has_cursor):
+                    merge_cursor_hooks(root_path / ".cursor" / "hooks.json", resolved_root)
+                    actions.append("wrote_.cursor/hooks.json")
 
         if write_git_hook:
-            if install_git_pre_commit_hook(root_path, resolved_root):
+            if install_git_pre_commit_hook(root_path, resolved_root, portable=team):
                 actions.append("installed_.git/hooks/pre-commit")
 
-    return {
+    # 5. Optional GitHub Actions PR Guardrail Workflow (`--team` or `--github-action`)
+    if github_action or (team and not no_github_action):
+        from .hooks import write_github_action_workflow
+        write_github_action_workflow(root_path)
+        actions.append("wrote_.github/workflows/projectbrain.yml")
+
+    # 6. Optional Day-1 Governance Learning (`--learn`)
+    learned_gov: dict | None = None
+    if learn:
+        learned_gov = brain.learn(apply=True)
+        stats = brain.stats()
+        actions.append("learned_governance")
+
+    out = {
         "status": "initialized",
         "root": resolved_root,
         "ide": ide,
+        "team": bool(team),
         "actions": actions,
         "stats": stats,
     }
+    if learned_gov is not None:
+        out["learned_governance"] = learned_gov
+    return out
 
 
 def _strip_rule_block(file_path: Path) -> bool:
@@ -652,12 +574,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--path", default=".", help="Project root (default: current directory)")
     sub = parser.add_subparsers(dest="command", required=True)
 
-    init_parser = sub.add_parser("init", help="One-command setup: index, .gitignore, MCP configs, rules, and active post-edit guardrail hooks")
+    init_parser = sub.add_parser("init", help="One-command setup: index, .gitignore, MCP configs, rules, active hooks, CI workflow, and governance")
     init_parser.add_argument("--no-mcp", action="store_true", help="Skip writing MCP configs")
     init_parser.add_argument("--no-rules", action="store_true", help="Skip writing agent rule files")
     init_parser.add_argument("--hooks", action="store_true", default=True, help="Install active post-edit guardrail hooks (default: enabled)")
     init_parser.add_argument("--no-hooks", action="store_true", help="Skip installing post-edit guardrail hooks")
     init_parser.add_argument("--git-hook", action="store_true", help="Also install .git/hooks/pre-commit guardrail")
+    init_parser.add_argument("--team", action="store_true", help="Write OS-portable git-trackable team hooks (.claude/settings.json, .cursor/hooks.json) and GitHub Actions workflow")
+    init_parser.add_argument("--github-action", action="store_true", help="Write .github/workflows/projectbrain.yml PR guardrail workflow")
+    init_parser.add_argument("--no-github-action", action="store_true", help="Skip writing GitHub Actions workflow when using --team")
+    init_parser.add_argument("--learn", action="store_true", help="Auto-discover and apply zero-violation architectural boundary & co-change rules")
     init_parser.add_argument(
         "--ide",
         choices=["auto", "all", "antigravity", "claude", "cursor", "vscode"],
@@ -684,6 +610,7 @@ def main(argv: list[str] | None = None) -> int:
     hook_pre.add_argument("--strict", action="store_true", help="Also fail on stale AST invariants")
     hook_inst = hook_sub.add_parser("install", help="Install editor PostToolUse/afterFileEdit hooks and optional git pre-commit hook")
     hook_inst.add_argument("--git", action="store_true", help="Install .git/hooks/pre-commit")
+    hook_inst.add_argument("--team", action="store_true", help="Write OS-portable git-trackable hook configs without local user paths")
     hook_inst.add_argument("--ide", choices=["auto", "all", "claude", "cursor"], default="auto")
 
     sub.add_parser("index", help="Build and cache the SQLite code graph index")
@@ -746,28 +673,47 @@ def main(argv: list[str] | None = None) -> int:
 
     check_parser = sub.add_parser(
         "check",
-        help="Run blast-radius, cross-file contract, boundary rule, and invariant verification gate",
+        help="Run blast-radius, cross-file contract, boundary rule, governance tamper, and invariant verification gate",
     )
-    check_parser.add_argument("files", nargs="*", default=None, help="Modified file paths (default: auto-detect via git diff HEAD)")
+    check_parser.add_argument("files", nargs="*", default=None, help="Modified file paths (default: auto-detect via git merge-base / diff HEAD)")
+    check_parser.add_argument("--base", default=None, help="Git base branch/commit for PR merge-base diffing (e.g. main, origin/main); auto-detected in CI PRs")
+    check_parser.add_argument(
+        "--allow-governance-change",
+        action="store_true",
+        help="Allow intentional removal or modification of rules/invariants in .projectbrain_memory.json",
+    )
     check_parser.add_argument(
         "--format",
-        choices=["text", "json", "markdown", "github"],
+        choices=["text", "json", "markdown", "pr-comment", "github", "sarif"],
         default=None,
-        help="Output format: text (default), json, markdown (PR comment), or github (Actions annotations)",
+        help="Output format: text (default), json, markdown, pr-comment (sticky PR comment + Mermaid), github, or sarif (v2.1.0)",
     )
     check_parser.add_argument("--json", action="store_true", help="Alias for --format json")
     check_parser.add_argument("--ci", action="store_true", help="CI gate mode: emit GitHub annotations (in Actions) and exit 1 on violations")
     check_parser.add_argument(
         "--fail-on-violation",
         action="store_true",
-        help="Exit with non-zero code (1) if any syntax, contract, or boundary violation is detected",
+        help="Exit with non-zero code (1) if any syntax, contract, boundary, or governance violation is detected",
     )
 
-    remember_parser = sub.add_parser("remember", help="Pin an AST-anchored invariant or enforceable architectural boundary rule")
+    learn_parser = sub.add_parser(
+        "learn",
+        help="Auto-discover zero-violation architectural boundary rules, git co-change contracts, and hub symbols",
+    )
+    learn_parser.add_argument("--apply", action="store_true", help="Save discovered rules to .projectbrain_memory.json (default: dry-run preview)")
+    learn_parser.add_argument("--pin-hubs", action="store_true", help="Also pin AST invariants on top high-fan-in hub symbols when --apply is set")
+    learn_parser.add_argument("--max-rules", type=int, default=12, help="Maximum boundary rules to propose (default: 12)")
+    learn_parser.add_argument("--days", type=int, default=180, help="Git history window in days for co-change mining (default: 180)")
+    learn_parser.add_argument("--min-cochanges", type=int, default=3, help="Minimum co-change commits required (default: 3)")
+    learn_parser.add_argument("--min-confidence", type=float, default=0.70, help="Minimum co-change conditional probability (default: 0.70)")
+    learn_parser.add_argument("--json", action="store_true", help="Output raw JSON")
+
+    remember_parser = sub.add_parser("remember", help="Pin an AST-anchored invariant, boundary rule, or co-change contract")
     remember_parser.add_argument("target", nargs="?", default="", help="Symbol name, file path, or node ID")
-    remember_parser.add_argument("note", nargs="?", default="", help="Architectural invariant or boundary reason")
+    remember_parser.add_argument("note", nargs="?", default="", help="Architectural invariant or rule reason")
     remember_parser.add_argument("--forbid", default=None, help="Enforceable layer rule: '<src_glob> -> <dst_glob>' (e.g. 'routes/* -> db/*')")
-    remember_parser.add_argument("--reason", default="", help="Reason for --forbid rule")
+    remember_parser.add_argument("--co-change", default=None, help="Co-change contract: '<file_a> <-> <file_b>' or '<file_a> -> <file_b>'")
+    remember_parser.add_argument("--reason", default="", help="Reason for --forbid or --co-change rule")
 
     memories_parser = sub.add_parser("memories", help="List, audit stale, refresh, or forget repo invariants and boundary rules")
     memories_parser.add_argument("--stale", action="store_true", help="Show only stale AST invariants")
@@ -834,15 +780,24 @@ def main(argv: list[str] | None = None) -> int:
             resolved_root = str(root_p.resolve())
             installed: list[str] = []
             has_cursor = (root_p / ".cursor").exists()
-            if args.ide in ("auto", "all", "claude"):
-                merge_claude_hooks(root_p / ".claude" / "settings.local.json", resolved_root)
-                installed.append(".claude/settings.local.json")
-            if args.ide in ("all", "cursor") or (args.ide == "auto" and has_cursor):
-                merge_cursor_hooks(root_p / ".cursor" / "hooks.json", resolved_root)
-                installed.append(".cursor/hooks.json")
-            if args.git and install_git_pre_commit_hook(root_p, resolved_root):
+            portable_mode = bool(getattr(args, "team", False))
+            if portable_mode:
+                if args.ide in ("auto", "all", "claude"):
+                    merge_claude_hooks(root_p / ".claude" / "settings.json", resolved_root, portable=True)
+                    installed.append(".claude/settings.json")
+                if args.ide in ("auto", "all", "cursor"):
+                    merge_cursor_hooks(root_p / ".cursor" / "hooks.json", resolved_root, portable=True)
+                    installed.append(".cursor/hooks.json")
+            else:
+                if args.ide in ("auto", "all", "claude"):
+                    merge_claude_hooks(root_p / ".claude" / "settings.local.json", resolved_root)
+                    installed.append(".claude/settings.local.json")
+                if args.ide in ("all", "cursor") or (args.ide == "auto" and has_cursor):
+                    merge_cursor_hooks(root_p / ".cursor" / "hooks.json", resolved_root)
+                    installed.append(".cursor/hooks.json")
+            if args.git and install_git_pre_commit_hook(root_p, resolved_root, portable=portable_mode):
                 installed.append(".git/hooks/pre-commit")
-            print(json.dumps({"status": "hooks_installed", "root": resolved_root, "installed": installed}, indent=2))
+            print(json.dumps({"status": "hooks_installed", "root": resolved_root, "team": portable_mode, "installed": installed}, indent=2))
             return 0
 
     if args.command == "init":
@@ -854,6 +809,10 @@ def main(argv: list[str] | None = None) -> int:
             ide=args.ide,
             write_hooks=enable_hooks,
             write_git_hook=bool(getattr(args, "git_hook", False)),
+            team=bool(getattr(args, "team", False)),
+            github_action=bool(getattr(args, "github_action", False)),
+            no_github_action=bool(getattr(args, "no_github_action", False)),
+            learn=bool(getattr(args, "learn", False)),
         )
         print(json.dumps(res, indent=2))
         return 0
@@ -979,7 +938,11 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "check":
-        res = brain.check(files_modified=args.files or None)
+        res = brain.check(
+            files_modified=args.files or None,
+            base_ref=getattr(args, "base", None),
+            allow_governance_change=bool(getattr(args, "allow_governance_change", False)),
+        )
         chosen_fmt = args.format
         if args.json:
             chosen_fmt = "json"
@@ -994,10 +957,30 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
+    if args.command == "learn":
+        res = brain.learn(
+            apply=bool(args.apply),
+            pin_hubs=bool(args.pin_hubs),
+            max_rules=args.max_rules,
+            days=args.days,
+            min_cochanges=args.min_cochanges,
+            min_confidence=args.min_confidence,
+        )
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            from .learn import format_learn_report
+            print(format_learn_report(res))
+        return 0
+
     if args.command == "remember":
         if args.forbid:
             reason_txt = args.reason or args.note or args.target
             print(json.dumps(brain.remember(note=reason_txt, forbid=args.forbid), indent=2))
+            return 0
+        if args.co_change:
+            reason_txt = args.reason or args.note or args.target
+            print(json.dumps(brain.remember(note=reason_txt, co_change=args.co_change), indent=2))
             return 0
         print(json.dumps(brain.remember(args.target, args.note), indent=2))
         return 0
@@ -1019,10 +1002,17 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         notes = out_m.get("memories", [])
         rules = out_m.get("boundary_rules", [])
-        print(f"ProjectBrain Repo Governance: {len(notes)} invariant(s), {len(rules)} boundary rule(s)")
+        co_rules = out_m.get("co_change_rules", [])
+        print(
+            f"ProjectBrain Repo Governance: {len(notes)} invariant(s), "
+            f"{len(rules)} boundary rule(s), {len(co_rules)} co-change rule(s)"
+        )
         for r in rules:
             rsn = f" — {r['reason']}" if r.get("reason") else ""
             print(f"  [FORBID] ({r.get('id')}) {r.get('rule')}{rsn}")
+        for cr in co_rules:
+            rsn = f" — {cr['reason']}" if cr.get("reason") else ""
+            print(f"  [CO-CHANGE] ({cr.get('id')}) {cr.get('rule')}{rsn}")
         for m in notes:
             badge = "[STALE]" if m.get("stale") else "[OK]"
             print(f"  {badge} ({m.get('id')}) {m.get('target_id')}: {m.get('note')}")

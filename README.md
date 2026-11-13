@@ -1,28 +1,26 @@
-# ProjectBrain (`projectbrain-mcp` v1.0.0)
+# ProjectBrain (`projectbrain-mcp` v1.1.0)
 
 [![PyPI](https://img.shields.io/pypi/v/projectbrain-mcp.svg)](https://pypi.org/project/projectbrain-mcp/)
 [![License: MIT](https://img.shields.io/badge/License: MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-**Zero-LSP SQLite Code Graph, Real-Time Blast-Radius & Cross-File Contract Guardrail, and PDG Context Compiler for AI Coding Agents.**
+**Zero-LSP SQLite Code Graph, Real-Time Blast-Radius & PR Merge-Base Contract Guardrail, and PDG Context Compiler for AI Coding Agents.**
 
-ProjectBrain gives Claude Code, Cursor, Antigravity, Windsurf, and CI pipelines both **Offense** (1-turn architectural context + `<20ms` surgical PDG slicing) and **Defense** (active post-edit blast-radius, contract, and layer-boundary guardrails) backed by a local SQLite WAL + FTS5 graph (`.projectbrain.db`) and lazy-loaded `tree-sitter` / Python `ast`. No LSP servers, no Docker, no cloud embeddings, and no API keys.
+ProjectBrain gives Claude Code, Cursor, Antigravity, Windsurf, and CI pipelines both **Offense** (1-turn architectural context + `<20ms` surgical PDG slicing) and **Defense** (active post-edit hooks, PR merge-base contract & boundary verification, Governance Tamper Lock, SARIF v2.1.0, and Day-1 architecture learning) backed by a local SQLite WAL + FTS5 graph (`.projectbrain.db`) and lazy-loaded `tree-sitter` / Python `ast`. No LSP servers, no Docker, no cloud embeddings, and no API keys.
 
 ---
 
-## Why ProjectBrain v1.0? (Offense + Defense)
+## Why ProjectBrain v1.1? (Offense + Team/CI Defense)
 
-AI coding agents edit fast with native `Edit` / `edit_file` tools, but routinely **break uninspected callers across files**, **violate layer boundaries**, or **burn 50k+ tokens** grep-crawling monoliths. ProjectBrain solves both without forcing agents to learn a custom edit DSL:
+AI coding agents edit fast with native `Edit` / `edit_file` tools, but routinely **break uninspected callers across files**, **violate layer boundaries**, **silently delete governance rules in PRs**, or **burn 50k+ tokens** grep-crawling monoliths. ProjectBrain solves both without forcing agents to learn a custom edit DSL:
 
-### 1. Defense: Active Real-Time Post-Edit Guardrail Hooks (`hooks.py`)
-Installed automatically by `projectbrain init` into Claude Code (`.claude/settings.local.json` `PostToolUse`), Cursor (`.cursor/hooks.json` `afterFileEdit`), and optional Git `pre-commit`:
+### 1. Defense: Active Real-Time Hooks, PR Merge-Base CI Gate & Governance Tamper Lock
+Installed automatically by `projectbrain init` (or OS-portable `projectbrain init --team --learn` for git-shared team configs and `.github/workflows/projectbrain.yml`):
 - **Silent When Clean (`0` Token Tax):** Non-code edits (`.md`, `.json`, `.toml`) exit in `<30ms` on a pure-stdlib fast path without importing Tree-sitter. Clean body-only code edits verify incrementally via Salsa early-cutoff and emit **zero bytes** (`exit 0`).
-- **5-Layer Deterministic Rescue When Broken:** The instant a native edit introduces a regression, ProjectBrain injects a compact rescue report back into the agent's turn:
-  1. **Pinpoint Syntax Errors** (`file.py:L42`) via Python `ast` & Tree-sitter CST `ERROR` nodes.
-  2. **4-Pillar Cross-File Contracts** — caller argument arity mismatches, closed dict return-key removals, nominal parameter type mismatches, and SQL `NOT NULL` DDL schema violations.
-  3. **Enforceable Architectural Boundaries** — blocks forbidden cross-layer imports/calls pinned via `projectbrain remember --forbid "routes/* -> db/*"`.
-  4. **Public Signature Blast Radius** — diffs pre-edit vs. post-edit signatures across cold hook runs and lists downstream cross-file callers + covering `pytest`/`vitest` files when a signature changes or symbol is deleted.
-  5. **AST-Hash Invariant Alerts** — flags `[INVARIANT MUTATED — VERIFY STILL HOLDS]` when a function with a pinned architectural invariant in `.projectbrain_memory.json` changes its AST hash.
+- **True PR Merge-Base Diffing (`check --base main` / Automatic CI PR Detection):** Audits committed multi-commit PR branches against `git merge-base` (auto-detecting `GITHUB_BASE_REF`, `CI_MERGE_REQUEST_TARGET_BRANCH_NAME`, Bitbucket, and Azure PR envs) even when the CI working tree is 100% clean — catching cross-file arity/return-key breaks, signature blast radius, broken imports from deleted/renamed files, stale invariants, and git co-change drift.
+- **Governance Tamper Lock (`.projectbrain_memory.json`):** Compares `.projectbrain_memory.json` against the base branch and blocks `--ci` (`UNSAFE_GOVERNANCE_TAMPER`) if an agent deletes/weakens `--forbid` boundary rules, deletes/modifies AST invariants, wipes `ast_hash`, or removes `co_change_rules` without explicit human `--allow-governance-change`.
+- **Zero-Config Day-1 Onboarding (`projectbrain learn` / `init --learn`):** Automatically discovers **zero-violation** directional layer `--forbid` boundaries (`routes/* -> db/*`, `db/* -> services/*`), mines high-confidence git co-change contracts, and ranks high-fan-in hub symbols on Day 1.
+- **OASIS SARIF v2.1.0 & Zero-Noise Sticky PR Comments:** `--format sarif` emits Code Scanning SARIF (`PB001`–`PB010`); `--format pr-comment` emits sticky `<!-- projectbrain-pr-guardrail -->` Markdown (1-line green pass when clean; full Mermaid `graph LR` blast-radius diagram + covering test suite when impactful).
 
 ### 2. Offense: Lean 5-Tool Zero-LSP MCP & CLI Surface (`server.py`)
 By default (`projectbrain-mcp --lean`), ProjectBrain exposes **5 non-overlapping power tools** so it never bloats the agent's tool-schema budget:
@@ -32,10 +30,10 @@ By default (`projectbrain-mcp --lean`), ProjectBrain exposes **5 non-overlapping
 | **`brain_dossier`** (`projectbrain dossier`) | **1-Turn Architecture Compiler:** Ranks relevant files & symbols via sub-identifier BM25 + 1–2 hop call/import/state-flow edges, returning class-qualified code slices, neighbor skeletons, covering tests, and pinned invariants in `~0.2s`. |
 | **`brain_slice`** (`projectbrain slice`) | **`<20ms` Surgical Symbol & PDG Slicer:** Reads exact functions, methods (`Class.method`, `res.send`), file skeletons, or intra-function **Program Dependence Graph (`--focus var`)** slices (`backward defs` + `forward uses` + `enclosing guards`) directly from SQLite. |
 | **`brain_explore`** (`projectbrain explore`) | **Unified Code Graph Navigator:** Traces callers/callees, shortest call/import path between `target` and `target_b`, full-stack `/api/...` route flows, and git `co_changes`. |
-| **`brain_check`** (`projectbrain check`) | **Pre-Flight Verifier, 3-Valued Claim Gate & CI Reporter:** Fact-checks structural claims (`SUPPORTED` / `REFUTED` / `UNKNOWN` — never fabricates false refutations on syntax-broken files or dynamic receivers), validates multi-file edit plans, and outputs Ruff-style `text`, PR `markdown`, or GitHub Actions `--ci` annotations. |
-| **`brain_remember`** (`projectbrain remember` / `memories`) | **Git-Tracked Repo Governance (`.projectbrain_memory.json`):** Pins symbol invariants anchored to normalized AST hashes and enforceable `--forbid "<src_glob> -> <dst_glob>"` layer rules shared across teammates and CI. |
+| **`brain_check`** (`projectbrain check`) | **Pre-Flight Verifier, PR Merge-Base Gate & SARIF/PR Reporter:** Fact-checks 3-valued claims (`SUPPORTED` / `REFUTED` / `UNKNOWN`), audits working-tree or `--base <ref>` PR diffs, enforces Governance Tamper Lock, and outputs `text`, `json`, `markdown`, `pr-comment`, `github`, or `sarif`. |
+| **`brain_remember`** (`projectbrain remember` / `memories`) | **Git-Tracked Repo Governance (`.projectbrain_memory.json`):** Pins symbol invariants anchored to normalized AST hashes, `--forbid "<src_glob> -> <dst_glob>"` layer rules, and `--co-change "<file_a> <-> <file_b>"` coupling contracts. |
 
-*(Pass `--full` or `PROJECTBRAIN_FULL_TOOLS=1` to also expose auxiliary tools: `brain_context`, `brain_stats`, `brain_run`, `brain_patch`.)*
+*(Pass `--full` or `PROJECTBRAIN_FULL_TOOLS=1` to also expose auxiliary tools: `brain_learn`, `brain_context`, `brain_stats`, `brain_run`, `brain_patch`.)*
 
 ---
 
@@ -54,18 +52,21 @@ pipx install projectbrain-mcp
 pip install projectbrain-mcp
 ```
 
-### 2. Initialize Your Repository
+### 2. Initialize Your Repository (Local or OS-Portable Team + CI Mode)
 
 ```bash
+# Personal / local workstation setup (ENOENT-proof absolute IDE paths):
 projectbrain --path /path/to/your/repo init --git-hook
+
+# Team + CI setup (OS-portable .claude/settings.json, .cursor/hooks.json, GitHub Action, & Day-1 rule discovery):
+projectbrain --path /path/to/your/repo init --team --learn
 ```
 
 What `init` sets up non-destructively:
 1. Indexes your repository into `.projectbrain.db` (SQLite WAL + FTS5) honoring `.gitignore` and `.git/info/exclude`.
-2. Resolves absolute binary paths (`shutil.which` / `sys.executable -m`) so GUI IDEs (Cursor, Claude Desktop, VS Code) never hit `spawn ENOENT`.
-3. Writes `.mcp.json` and non-destructive `<!-- projectbrain:start -->` workflow rules in `AGENTS.md` (plus `.cursor/` / `.vscode/` / `CLAUDE.md` when detected or via `--ide all`).
-4. Installs active `PostToolUse` (`.claude/settings.local.json`), `afterFileEdit` (`.cursor/hooks.json`), and optional `.git/hooks/pre-commit` guardrails.
-5. Keeps `.projectbrain.db` git-ignored while leaving `.projectbrain_memory.json` git-trackable so architectural invariants and `--forbid` rules travel with PRs.
+2. Writes `.mcp.json` and non-destructive `<!-- projectbrain:start -->` workflow rules in `AGENTS.md` (with `--team`, emits zero local user/workspace paths so `.claude/settings.json`, `.cursor/hooks.json`, and `.github/workflows/projectbrain.yml` commit cleanly across macOS/Linux/Windows).
+3. Optionally runs `learn` (`--learn`) to auto-discover zero-violation `--forbid` layer boundaries and git co-change contracts into `.projectbrain_memory.json`.
+4. Keeps `.projectbrain.db` git-ignored while leaving `.projectbrain_memory.json` git-trackable and Tamper-Locked across PRs.
 
 ### 3. MCP Server Configuration (or Zero-Install via `uvx`)
 
@@ -83,21 +84,23 @@ What `init` sets up non-destructively:
 ### 4. Core CLI Workflow
 
 ```bash
-# 1. Compile a 1-turn architecture dossier directly to stdout
-projectbrain --path /path/to/repo dossier "how are exceptions routed to error handlers"
+# 1. Auto-discover zero-violation architectural boundaries, co-change rules & hub symbols (dry-run or --apply)
+projectbrain --path /path/to/repo learn
+projectbrain --path /path/to/repo learn --apply
 
-# 2. Slice exact symbols or intra-function PDG variable flows (<20ms cold SQLite lookup)
+# 2. Compile a 1-turn architecture dossier or <20ms PDG variable slice
+projectbrain --path /path/to/repo dossier "how are exceptions routed to error handlers"
 projectbrain --path /path/to/repo slice billing.py:compute_invoice --focus discount_total
 
-# 3. Pin an enforceable architectural boundary rule & symbol invariant (git-tracked)
+# 3. Pin an enforceable boundary rule, co-change contract, or AST symbol invariant (git-tracked)
 projectbrain --path /path/to/repo remember --forbid "routes/* -> db/*" --reason "Routes must go through services/*"
+projectbrain --path /path/to/repo remember --co-change "schema.sql <-> models/user.py" --reason "Keep ORM synced"
 projectbrain --path /path/to/repo remember settle_invoice "Must remain idempotent on duplicate invoice_id"
-projectbrain --path /path/to/repo memories
 
-# 4. Run blast-radius, contract, boundary & invariant check (Ruff-style text, PR markdown, or CI gate)
-projectbrain --path /path/to/repo check
-projectbrain --path /path/to/repo check --format markdown
-projectbrain --path /path/to/repo check --ci
+# 4. Run PR merge-base contract, boundary & governance tamper gate (text, pr-comment, sarif, or --ci)
+projectbrain --path /path/to/repo check --base main --ci
+projectbrain --path /path/to/repo check --base main --format pr-comment
+projectbrain --path /path/to/repo check --base main --format sarif > projectbrain.sarif
 
 # 5. View regression interception & code-graph scorecard
 projectbrain --path /path/to/repo stats --summary
@@ -176,7 +179,7 @@ python projectbrain/eval/bench_scale.py
 # 3. External repository benchmarks: pallets/flask, django/django, psf/requests, pallets/click, expressjs/express
 python projectbrain/eval/bench_external.py --suite all
 
-# 4. Full unit, guardrail, anti-leakage, security, and regression test suite (220 tests)
+# 4. Full unit, guardrail, anti-leakage, security, and regression test suite (256 tests)
 pytest projectbrain/tests -q
 ```
 

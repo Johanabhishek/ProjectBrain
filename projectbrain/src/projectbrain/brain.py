@@ -85,6 +85,7 @@ from .verify import (
     verify_plan as _verify_plan_fn,
     impact as _verify_impact_fn,
     load_neighborhood_for_check as _load_neighborhood_for_check_fn,
+    run_check as _verify_run_check,
     trace_flow as _verify_trace_flow,
     url_matches as _verify_url_matches,
     co_change_analysis as _verify_co_change_analysis,
@@ -898,119 +899,43 @@ class ProjectBrain:
         claims: list[list[str]] | list[tuple[str, str, str]] | None = None,
         plan_files: list[str] | None = None,
         task: str = "",
+        *,
+        base_ref: str | None = None,
+        allow_governance_change: bool = False,
     ) -> dict:
-        """Unified verification gate: checks claims, validates edit plans, and analyzes impact + 6D contracts."""
-        self._capture_pre_edit_snapshots(files_modified)
-        fast_check_scope = bool(files_modified and not claims and not plan_files)
-        if fast_check_scope:
-            if not self._index:
-                if not self._load_neighborhood_for_check(files_modified):
-                    self.load()
-            if not self._index:
-                self.index()
-            else:
-                self.incremental_index(candidate_files=files_modified)
-        else:
-            self._ensure_fresh()
-        out: dict = {}
+        """Unified verification gate: checks claims, validates plans, and audits working-tree or PR merge-base diffs."""
+        return _verify_run_check(
+            self,
+            files_modified=files_modified,
+            claims=claims,
+            plan_files=plan_files,
+            task=task,
+            base_ref=base_ref,
+            allow_governance_change=allow_governance_change,
+        )
 
-        if claims:
-            tuples = [(c[0], c[1], c[2]) for c in claims if len(c) >= 3]
-            out["claim_verification"] = self.verify_batch(tuples)
+    def learn(
+        self,
+        *,
+        apply: bool = False,
+        pin_hubs: bool = False,
+        max_rules: int = 12,
+        days: int = 180,
+        min_cochanges: int = 3,
+        min_confidence: float = 0.70,
+    ) -> dict:
+        """Discover zero-violation architectural boundary rules, co-change contracts, and hub symbols."""
+        from .learn import learn_repository_governance
 
-        if plan_files:
-            out["plan_validation"] = self.verify_plan(task or "planned edit", plan_files)
-
-        effective_modified = list(files_modified) if files_modified else []
-        if not effective_modified and not claims and not plan_files:
-            if self._pre_edit_index:
-                effective_modified = [r for r in self._pre_edit_index if r in self._index]
-            elif (self.root / ".git").exists():
-                try:
-                    proc = subprocess.run(
-                        ["git", "diff", "--name-only", "HEAD"],
-                        cwd=str(self.root),
-                        capture_output=True,
-                        text=True,
-                        encoding="utf-8",
-                        errors="replace",
-                        timeout=2,
-                    )
-                    if proc.returncode == 0 and proc.stdout:
-                        effective_modified = [
-                            ln.strip().replace("\\", "/")
-                            for ln in proc.stdout.splitlines()
-                            if ln.strip().replace("\\", "/") in self._index
-                        ]
-                except Exception:
-                    pass
-
-        if effective_modified:
-            norm_focus = {self._normalize_rel(str(f)) for f in effective_modified}
-            valid_focus = {r for r in norm_focus if r in self._index}
-            imp_res = self.impact(effective_modified, _already_fresh=fast_check_scope)
-            diags = list(imp_res.get("contract_diagnostics", []))
-
-            syntax_errs: list[str] = []
-            for r in sorted(valid_focus):
-                if self._index.get(r, {}).get("parse_status") == "partial":
-                    for msg in _file_diag_lines(self.root, r):
-                        syntax_errs.append(msg)
-                        if msg not in diags:
-                            diags.insert(0, msg)
-
-            b_violations = self._memory.check_boundary_violations(
-                self._index, self._import_targets, self._graph, focus_rels=valid_focus,
-            )
-            for bv in b_violations:
-                if bv["message"] not in diags:
-                    diags.append(bv["message"])
-
-            focus_node_ids: set[str] = set()
-            if self._graph:
-                self._graph._ensure_registries()
-                for r in valid_focus:
-                    focus_node_ids.update(self._graph._nodes_by_file.get(r, set()))
-            matched_memories = self._memory.get_notes_for(valid_focus, focus_node_ids, self._ast_hashes)
-            stale_memories = [m for m in matched_memories if m.get("stale")]
-
-            all_valid = len(diags) == 0
-            imp_res["contract_diagnostics"] = diags
-            imp_res["all_contracts_valid"] = all_valid
-            if not all_valid:
-                imp_res["verdict"] = "UNSAFE_CONTRACT_VIOLATION"
-
-            out["impact_analysis"] = imp_res
-            out["contract_diagnostics"] = diags
-            out["boundary_violations"] = b_violations
-            if syntax_errs:
-                out["syntax_errors"] = syntax_errs
-            if matched_memories:
-                out["memories"] = matched_memories
-            if stale_memories:
-                out["stale_memories"] = stale_memories
-            out["all_contracts_valid"] = all_valid
-            out["verdict"] = imp_res.get("verdict", "SAFE_TO_PROCEED")
-        elif not claims and not plan_files:
-            # Repo-wide boundary & stale-invariant audit when check() runs with no modified files
-            b_violations = self._memory.check_boundary_violations(
-                self._index, self._import_targets, self._graph, focus_rels=None,
-            )
-            if b_violations:
-                out["boundary_violations"] = b_violations
-                out["contract_diagnostics"] = [bv["message"] for bv in b_violations]
-                out["all_contracts_valid"] = False
-                out["verdict"] = "UNSAFE_CONTRACT_VIOLATION"
-            else:
-                out["all_contracts_valid"] = True
-            stale_all = [m for m in self._memory.list_all(self._ast_hashes) if m.get("stale")]
-            if stale_all:
-                out["stale_memories"] = stale_all
-
-        if not files_modified and not claims and not plan_files:
-            out["health"] = self.health()
-
-        return out
+        return learn_repository_governance(
+            self,
+            apply=apply,
+            pin_hubs=pin_hubs,
+            max_rules=max_rules,
+            days=days,
+            min_cochanges=min_cochanges,
+            min_confidence=min_confidence,
+        )
 
     def remember(
         self,
@@ -1019,18 +944,24 @@ class ProjectBrain:
         tags: list[str] | None = None,
         *,
         forbid: str | None = None,
+        co_change: str | None = None,
         action: str = "save",
     ) -> dict:
-        """Manage AST-anchored architectural invariants & boundary rules in `.projectbrain_memory.json`."""
+        """Manage AST-anchored architectural invariants, boundary rules, & co-change contracts in `.projectbrain_memory.json`."""
         act = (action or "save").strip().lower()
         if act == "list":
             return self.list_memories()
         if act == "stale":
             res = self.list_memories()
             stale = [m for m in res["memories"] if m.get("stale")]
-            return {"memories": stale, "count": len(stale), "boundary_rules": res["boundary_rules"]}
+            return {
+                "memories": stale,
+                "count": len(stale),
+                "boundary_rules": res["boundary_rules"],
+                "co_change_rules": res["co_change_rules"],
+            }
         if act == "forget":
-            key = (target or forbid or note).strip()
+            key = (target or forbid or co_change or note).strip()
             if not key:
                 return {"error": "Provide `target` (id, symbol, file, or rule) to forget."}
             return {"status": "removed", **self._memory.forget(key)}
@@ -1052,9 +983,16 @@ class ProjectBrain:
                 "existing_violations": rule_violations,
             }
 
+        if co_change:
+            c_rule = self._memory.add_co_change_rule(co_change, reason=note)
+            return {
+                "status": "saved_co_change_rule",
+                "co_change_rule": c_rule,
+            }
+
         target = target.strip()
         if not target or not note.strip():
-            return {"error": "Provide both `target` and `note` (or `forbid='<src_glob> -> <dst_glob>'`)."}
+            return {"error": "Provide both `target` and `note` (or `forbid` / `co_change`)."}
 
         node_id = target
         rel_path = ""
@@ -1081,12 +1019,14 @@ class ProjectBrain:
         return {"status": "saved", "memory": entry}
 
     def list_memories(self) -> dict:
+        self._memory._ensure_fresh()
         if not self._index and self._is_db_fresh_fast(allow_zero_disk=True):
             raw_notes = getattr(self._memory, "_notes", [])
             nids = [m.get("target_id", "") for m in raw_notes if m.get("target_id")]
             fast_hashes = self._db_store.get_ast_hashes_fast(nids) if nids else {}
             notes = self._memory.list_all(fast_hashes)
             rules = self._memory.list_boundary_rules()
+            co_rules = self._memory.list_co_change_rules()
             stale_count = sum(1 for m in notes if m.get("stale"))
             return {
                 "memories": notes,
@@ -1094,10 +1034,13 @@ class ProjectBrain:
                 "stale_count": stale_count,
                 "boundary_rules": rules,
                 "boundary_rules_count": len(rules),
+                "co_change_rules": co_rules,
+                "co_change_rules_count": len(co_rules),
             }
         self._ensure_fresh()
-        notes = self._memory.list_all(self._ast_hashes)
+        notes = self._memory.list_all(self._ast_hashes, indexed_files=set(self._index.keys()))
         rules = self._memory.list_boundary_rules()
+        co_rules = self._memory.list_co_change_rules()
         stale_count = sum(1 for m in notes if m.get("stale"))
         return {
             "memories": notes,
@@ -1105,13 +1048,18 @@ class ProjectBrain:
             "stale_count": stale_count,
             "boundary_rules": rules,
             "boundary_rules_count": len(rules),
+            "co_change_rules": co_rules,
+            "co_change_rules_count": len(co_rules),
         }
 
     def _normalize_rel(self, file_path: str) -> str:
         try:
             return str(Path(file_path).resolve().relative_to(self.root)).replace("\\", "/")
         except ValueError:
-            return file_path.replace("\\", "/").lstrip("./")
+            norm = file_path.replace("\\", "/")
+            while norm.startswith("./"):
+                norm = norm[2:]
+            return norm.lstrip("/")
 
     def _score_symbol_for_query(
         self,
@@ -1985,7 +1933,7 @@ class ProjectBrain:
             was_in_index = rel in self._index
             old_info = self._index.get(rel) or {}
             if was_in_index and old_info:
-                self._pre_edit_index[rel] = dict(old_info)
+                self._pre_edit_index.setdefault(rel, dict(old_info))
             old_iface_hash = compute_file_interface_hash(old_info) if old_info else None
 
             pending = self._pending_parsed_files.pop(rel, None)
@@ -2585,6 +2533,7 @@ class ProjectBrain:
         if reset:
             return self._ledger.reset()
         self._reset_partial_index()
+        self._memory._ensure_fresh()
         if not self._index and self._db_store.db_path.exists():
             self.load()
         cached_s = getattr(self, "_cached_stats_summary", None) or compute_stats_summary(self._index)
@@ -2598,6 +2547,7 @@ class ProjectBrain:
             "cells_4d": cached_s["cells_4d"],
             "memories": len(self._memory._notes),
             "boundary_rules": len(self._memory._boundary_rules),
+            "co_change_rules": len(self._memory._co_change_rules),
             "storage_backend": "sqlite" if self._db_store.db_path.exists() else "json",
             "schema_version": SCHEMA_VERSION,
             "parser_version": PARSER_VERSION,
@@ -2621,6 +2571,7 @@ class ProjectBrain:
 
     def health(self) -> dict:
         self._ensure_fresh()
+        self._memory._ensure_fresh()
         per_language: dict[str, int] = {}
         partial_files: list[str] = []
         unsupported_files: list[str] = []

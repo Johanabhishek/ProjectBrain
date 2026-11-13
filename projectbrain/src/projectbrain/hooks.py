@@ -119,9 +119,34 @@ def parse_hook_payload(
                 if isinstance(fp, str) and fp:
                     candidates.append(fp)
 
+    orig_root = root
+    if default_root is None and not (
+        (root / ".projectbrain.db").exists()
+        or (root / ".projectbrain_memory.json").exists()
+        or (root / ".git").exists()
+    ):
+        for anc in root.parents:
+            if anc.name.startswith(("pytest-of-", ".pytest")):
+                break
+            if (
+                (anc / ".projectbrain.db").exists()
+                or (anc / ".projectbrain_memory.json").exists()
+                or (anc / ".git").exists()
+            ):
+                root = anc
+                break
+
     filtered: list[str] = []
     seen: set[str] = set()
+    governance_edited = False
     for raw in candidates:
+        if orig_root != root and raw and not Path(raw).is_absolute():
+            cand_abs = orig_root / raw
+            if cand_abs.exists() or Path(raw).name == ".projectbrain_memory.json":
+                raw = str(cand_abs.resolve())
+        if Path(raw).name == ".projectbrain_memory.json":
+            governance_edited = True
+            continue
         if not _is_auditable_code_path(raw):
             continue
         norm = raw.replace("\\", "/")
@@ -133,6 +158,7 @@ def parse_hook_payload(
         "protocol": protocol,
         "root": root,
         "files": filtered,
+        "governance_edited": governance_edited,
     }
 
 
@@ -290,7 +316,10 @@ def _norm_rel_fast(root: Path, raw_f: str) -> str:
                 return str(p.relative_to(root)).replace("\\", "/")
             except ValueError:
                 return ""
-    return raw_f.replace("\\", "/").lstrip("./")
+    norm = raw_f.replace("\\", "/")
+    while norm.startswith("./"):
+        norm = norm[2:]
+    return norm.lstrip("/")
 
 
 def audit_edited_files(
@@ -452,8 +481,28 @@ def audit_edited_files(
     ]
 
     # 4. Public Signature Mutation Blast Radius (only when signatures changed or symbols deleted)
+    from .graph import fn_id
+    from .reporters import _clean_uri, _norm_line_key
+
+    def _dedup_blast_callers(items: list[dict], limit: int) -> list[dict]:
+        deduped: list[dict] = []
+        seen_locs: set[tuple[str, int | str]] = set()
+        for c in items:
+            cf = _clean_uri(c.get("caller_file") or c.get("in_file") or "", fallback="")
+            if not cf:
+                continue
+            ln_key = _norm_line_key(c.get("line"))
+            loc_key = (cf, ln_key)
+            if loc_key not in seen_locs:
+                seen_locs.add(loc_key)
+                deduped.append({**c, "caller_file": cf})
+                if len(deduped) >= limit:
+                    break
+        return deduped
+
     signature_blast: list[dict] = []
     covering_tests: list[str] = []
+    rel_files_set = set(rel_files)
     for r in rel_files:
         post_inf = brain._index.get(r)
         pre_inf = pre_snapshots.get(r)
@@ -464,28 +513,61 @@ def audit_edited_files(
         if not mutated:
             continue
         det = details_by_rel.get(r, {})
+        direct_mut_callers: list[dict] = []
+        if brain._graph:
+            for m in mutated:
+                sym = m.get("symbol") or ""
+                if not sym or m.get("kind") != "function":
+                    continue
+                p_cls, bare_nm = sym.split(".", 1) if "." in sym else (None, sym)
+                m_nid = fn_id(r, bare_nm, p_cls)
+                for ei in brain._graph._radj.get(m_nid, ()):
+                    edge = brain._graph.edges[ei]
+                    if edge["type"] != "calls":
+                        continue
+                    s_nd = brain._graph.nodes.get(edge["src"], {})
+                    cf_norm = _clean_uri(s_nd.get("rel_path") or "", fallback="")
+                    if cf_norm and cf_norm not in rel_files_set:
+                        direct_mut_callers.append({
+                            "caller_file": cf_norm,
+                            "caller": edge["src"],
+                            "callee": bare_nm,
+                            "line": edge.get("line"),
+                        })
         ext_callers = [
-            c for c in det.get("called_by", [])
-            if c.get("caller_file") and c.get("caller_file") not in rel_files
+            {
+                "caller_file": _clean_uri(c.get("caller_file") or c.get("in_file") or "", fallback=""),
+                "caller": c.get("caller") or c.get("called_by") or "",
+                "callee": c.get("callee") or c.get("function") or "",
+                "line": c.get("line"),
+            }
+            for c in det.get("called_by", [])
+            if _clean_uri(c.get("caller_file") or c.get("in_file") or "", fallback="")
+            and _clean_uri(c.get("caller_file") or c.get("in_file") or "", fallback="") not in rel_files_set
         ]
         ext_importers = [
             imp_f for imp_f in det.get("direct_consumers", [])
-            if imp_f not in rel_files
+            if imp_f not in rel_files_set
         ]
         for tf in det.get("test_consumers", []):
             if tf not in covering_tests:
                 covering_tests.append(tf)
 
-        if ext_callers or ext_importers:
+        if direct_mut_callers or ext_callers or ext_importers:
             mutated_names = {m["symbol"].split(".")[-1] for m in mutated} | {m["symbol"] for m in mutated}
-            relevant_callers = [
+            matched_callers = direct_mut_callers + [
                 c for c in ext_callers
                 if c.get("callee") in mutated_names or c.get("callee", "").split(".")[-1] in mutated_names
-            ] or ext_callers[:6]
+            ]
+            relevant_callers = (
+                _dedup_blast_callers(matched_callers, limit=8)
+                if matched_callers
+                else _dedup_blast_callers(ext_callers, limit=6)
+            )
             signature_blast.append({
                 "file": r,
                 "mutations": mutated,
-                "callers": relevant_callers[:8],
+                "callers": relevant_callers,
                 "consumers": ext_importers[:8],
                 "tests": det.get("test_consumers", [])[:6],
             })
@@ -532,17 +614,23 @@ def audit_edited_files(
     for sb in signature_blast:
         for mut in sb["mutations"][:4]:
             if "new_signature" in mut:
-                lines.append(
-                    f"  ~ [SIGNATURE CHANGED] {sb['file']} :: `{mut['old_signature']}` -> `{mut['new_signature']}`"
-                )
+                if mut.get("old_signature") == mut.get("new_signature"):
+                    lines.append(
+                        f"  ~ [SIGNATURE CHANGED] {sb['file']} :: return/interface contract updated for `{mut['new_signature']}`"
+                    )
+                else:
+                    lines.append(
+                        f"  ~ [SIGNATURE CHANGED] {sb['file']} :: `{mut['old_signature']}` -> `{mut['new_signature']}`"
+                    )
             else:
                 lines.append(
                     f"  ~ [SYMBOL REMOVED] {sb['file']} :: `{mut['old_signature']}`"
                 )
         if sb["callers"]:
+            dedup_sb_callers = _dedup_blast_callers(sb["callers"], limit=5)
             caller_locs = ", ".join(
-                f"{c['caller_file']}:L{c.get('line') or '?'} ({c.get('caller', '?')})"
-                for c in sb["callers"][:5]
+                f"{c['caller_file']}:L{_norm_line_key(c.get('line'))} ({c.get('caller', '?')})"
+                for c in dedup_sb_callers
             )
             lines.append(f"    Downstream callers to verify: {caller_locs}")
         elif sb["consumers"]:
@@ -578,33 +666,59 @@ def run_post_edit_hook(
     """Execute post-edit hook and return `(exit_code, formatted_stdout)`."""
     parsed = parse_hook_payload(raw_stdin, explicit_files=explicit_files, default_root=default_root)
     files = parsed.get("files", [])
-    if not files:
+    gov_edited = bool(parsed.get("governance_edited"))
+    if not files and not gov_edited:
         return 0, ""
 
     protocol = parsed["protocol"]
     root: Path = parsed["root"]
-    audit = audit_edited_files(root, files, source=f"hook:{protocol}")
-    if audit["clean"] or not audit["report"]:
+    report_parts: list[str] = []
+
+    if gov_edited:
+        from .git_diff import check_governance_tamper, find_git_context
+        if find_git_context(root)[0] is not None:
+            tampers = check_governance_tamper(root, ref_commit="HEAD")
+            if tampers:
+                gov_lines = [
+                    f"[ProjectBrain Guardrail — ACTION REQUIRED] (hook:{protocol} on .projectbrain_memory.json)"
+                ]
+                for tp in tampers:
+                    gov_lines.append(f"  X {tp['message']}")
+                report_parts.append("\n".join(gov_lines))
+
+    if files:
+        audit = audit_edited_files(root, files, source=f"hook:{protocol}")
+        if not audit["clean"] and audit["report"]:
+            report_parts.append(audit["report"])
+
+    if not report_parts:
         return 0, ""
 
+    combined_report = "\n\n".join(report_parts)
     if protocol == "claude":
         payload = {
             "hookSpecificOutput": {
                 "hookEventName": "PostToolUse",
-                "additionalContext": audit["report"],
+                "additionalContext": combined_report,
             }
         }
         return 0, json.dumps(payload)
 
-    return 0, audit["report"]
+    return 0, combined_report
 
 
 def run_pre_commit_hook(root: Path, strict: bool = False) -> tuple[int, str]:
     """Audit git staged files before commit; return `(exit_code, message)`."""
+    from .git_diff import _to_local_rel, check_governance_tamper, find_git_context
+
+    git_root, sub_prefix = find_git_context(root)
+    if git_root is None:
+        return 0, ""
+
     try:
         proc = subprocess.run(
-            ["git", "diff", "--cached", "--name-only", "--diff-filter=ACMR"],
-            cwd=str(root),
+            ["git", "-c", "core.quotepath=false", "diff", "--cached", "--name-status"],
+            cwd=str(git_root),
             capture_output=True,
             text=True,
             encoding="utf-8",
@@ -617,27 +731,53 @@ def run_pre_commit_hook(root: Path, strict: bool = False) -> tuple[int, str]:
     if proc.returncode != 0 or not proc.stdout.strip():
         return 0, ""
 
-    staged = [
-        ln.strip()
-        for ln in proc.stdout.splitlines()
-        if _is_auditable_code_path(ln.strip())
-    ]
-    if not staged:
-        return 0, ""
+    staged: list[str] = []
+    gov_staged = False
+    for raw_ln in proc.stdout.splitlines():
+        parts = raw_ln.strip().split("\t")
+        if len(parts) < 2:
+            continue
+        status_code = parts[0].strip().upper()[:1]
+        cand_path = parts[-1].strip()
+        if any(_to_local_rel(p.strip(), sub_prefix) == ".projectbrain_memory.json" for p in parts[1:]):
+            gov_staged = True
+            continue
+        local_cand = _to_local_rel(cand_path, sub_prefix)
+        if local_cand and status_code in ("A", "C", "M", "R") and _is_auditable_code_path(local_cand):
+            staged.append(local_cand)
 
-    audit = audit_edited_files(root, staged, source="pre-commit")
-    if audit["clean"]:
-        return 0, ""
+    gov_fail = False
+    report_blocks: list[str] = []
+    if gov_staged and os.environ.get("PROJECTBRAIN_ALLOW_GOVERNANCE_CHANGE") != "1":
+        tampers = check_governance_tamper(root, ref_commit="HEAD", from_git_index=True)
+        if tampers:
+            gov_fail = True
+            gov_lines = [
+                "[ProjectBrain Guardrail — ACTION REQUIRED] (pre-commit on .projectbrain_memory.json)"
+            ]
+            for tp in tampers:
+                gov_lines.append(f"  X {tp['message']}")
+            report_blocks.append("\n".join(gov_lines))
 
-    # By default, only deterministic failures (syntax errors and explicit boundary rules)
-    # block `git commit`; heuristic cross-file contract warnings and stale invariants
-    # are advisory unless `--strict` is passed.
-    deterministic_fail = bool(audit["syntax_errors"] or audit["boundary_violations"])
-    should_fail = deterministic_fail or (strict and bool(audit["contract_violations"] or audit["stale_memories"]))
-    return (1 if should_fail else 0), audit["report"]
+    should_fail = gov_fail
+    if staged:
+        audit = audit_edited_files(root, staged, source="pre-commit")
+        if not audit["clean"] and audit["report"]:
+            report_blocks.append(audit["report"])
+            # By default, only deterministic failures (syntax errors, explicit boundary rules,
+            # and governance tampering) block `git commit`; heuristic cross-file contract warnings
+            # and stale invariants are advisory unless `--strict` is passed.
+            deterministic_fail = bool(audit["syntax_errors"] or audit["boundary_violations"])
+            if deterministic_fail or (strict and bool(audit["contract_violations"] or audit["stale_memories"])):
+                should_fail = True
+
+    if not report_blocks:
+        return 0, ""
+    return (1 if should_fail else 0), "\n\n".join(report_blocks)
 
 
 _GIT_HOOK_MARKER = "# [ProjectBrain pre-commit]"
+GITHUB_WORKFLOW_MARKER = "# projectbrain-generated-workflow"
 
 
 def resolve_cli_shell_prefix() -> str:
@@ -651,14 +791,27 @@ def resolve_cli_shell_prefix() -> str:
     return f"{exe_q} -m projectbrain.cli"
 
 
-def build_hook_command(resolved_root: str, subcmd: str = "hook post-edit") -> str:
+def build_hook_command(
+    resolved_root: str,
+    subcmd: str = "hook post-edit",
+    *,
+    portable: bool = False,
+) -> str:
+    """Build a hook shell command (either local absolute-path or OS-portable team command)."""
+    if portable:
+        return f"projectbrain {subcmd}"
     prefix = resolve_cli_shell_prefix()
     root_q = f'"{resolved_root}"'
     return f"{prefix} --path {root_q} {subcmd}"
 
 
-def merge_claude_hooks(claude_hooks_path: Path, resolved_root: str) -> None:
-    """Configure active `PostToolUse` guardrail hooks in `.claude/settings.local.json`."""
+def merge_claude_hooks(
+    claude_hooks_path: Path,
+    resolved_root: str,
+    *,
+    portable: bool = False,
+) -> None:
+    """Configure active `PostToolUse` guardrail hooks in `.claude/settings[.local].json`."""
     claude_hooks_path.parent.mkdir(parents=True, exist_ok=True)
     data: dict = {}
     if claude_hooks_path.exists():
@@ -686,7 +839,7 @@ def merge_claude_hooks(claude_hooks_path: Path, resolved_root: str) -> None:
             else:
                 hooks_dict.pop(event_key, None)
 
-    post_cmd = build_hook_command(resolved_root, "hook post-edit")
+    post_cmd = build_hook_command(resolved_root, "hook post-edit", portable=portable)
     pb_post_entry = {
         "matcher": "Edit|MultiEdit|Write|NotebookEdit",
         "hooks": [
@@ -700,7 +853,12 @@ def merge_claude_hooks(claude_hooks_path: Path, resolved_root: str) -> None:
     claude_hooks_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
-def merge_cursor_hooks(cursor_hooks_path: Path, resolved_root: str) -> None:
+def merge_cursor_hooks(
+    cursor_hooks_path: Path,
+    resolved_root: str,
+    *,
+    portable: bool = False,
+) -> None:
     """Configure Cursor `afterFileEdit` guardrail hook in `.cursor/hooks.json`."""
     cursor_hooks_path.parent.mkdir(parents=True, exist_ok=True)
     data: dict = {"version": 1, "hooks": {}}
@@ -718,19 +876,48 @@ def merge_cursor_hooks(cursor_hooks_path: Path, resolved_root: str) -> None:
     if not isinstance(after_edit, list):
         after_edit = []
     after_edit = [e for e in after_edit if "hook post-edit" not in json.dumps(e)]
-    after_edit.append({"command": build_hook_command(resolved_root, "hook post-edit")})
+    after_edit.append({"command": build_hook_command(resolved_root, "hook post-edit", portable=portable)})
     data["hooks"]["afterFileEdit"] = after_edit
     cursor_hooks_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
 
 
-def install_git_pre_commit_hook(root_path: Path, resolved_root: str) -> bool:
+def _resolve_git_hooks_dir(root_path: Path) -> Path | None:
+    """Resolve `.git/hooks` directory, supporting both standard repos and linked `git worktree`s."""
+    git_entry = root_path / ".git"
+    if git_entry.is_dir():
+        return git_entry / "hooks"
+    if git_entry.is_file():
+        try:
+            proc = subprocess.run(
+                ["git", "rev-parse", "--git-path", "hooks"],
+                cwd=str(root_path),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+            )
+            if proc.returncode == 0 and proc.stdout.strip():
+                raw_p = Path(proc.stdout.strip())
+                return raw_p if raw_p.is_absolute() else (root_path / raw_p).resolve()
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+    return None
+
+
+def install_git_pre_commit_hook(
+    root_path: Path,
+    resolved_root: str,
+    *,
+    portable: bool = False,
+) -> bool:
     """Install or append ProjectBrain pre-commit guardrail into `.git/hooks/pre-commit`."""
-    git_dir = root_path / ".git"
-    if not git_dir.is_dir():
+    hooks_dir = _resolve_git_hooks_dir(root_path)
+    if hooks_dir is None:
         return False
-    hook_file = git_dir / "hooks" / "pre-commit"
+    hook_file = hooks_dir / "pre-commit"
     hook_file.parent.mkdir(parents=True, exist_ok=True)
-    cmd_line = build_hook_command(resolved_root, "hook pre-commit")
+    cmd_line = build_hook_command(resolved_root, "hook pre-commit", portable=portable)
     snippet = f"\n{_GIT_HOOK_MARKER}\n{cmd_line}\n"
     if hook_file.exists():
         existing = hook_file.read_text(encoding="utf-8", errors="ignore")
@@ -748,41 +935,162 @@ def install_git_pre_commit_hook(root_path: Path, resolved_root: str) -> bool:
     return True
 
 
+def write_github_action_workflow(root_path: Path) -> Path:
+    """Write a production-ready GitHub Actions PR guardrail workflow to `.github/workflows/projectbrain.yml`."""
+    wf_path = root_path / ".github" / "workflows" / "projectbrain.yml"
+    wf_path.parent.mkdir(parents=True, exist_ok=True)
+    workflow_yaml = f"""{GITHUB_WORKFLOW_MARKER}
+name: ProjectBrain Guardrail
+
+on:
+  pull_request:
+  push:
+    branches: [main, master]
+
+permissions:
+  contents: read
+  pull-requests: write
+  security-events: write
+
+jobs:
+  guardrail:
+    name: Architectural & Contract Verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository (full history for merge-base & co-change diffing)
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install ProjectBrain
+        run: |
+          python -m pip install --upgrade pip
+          if [ -f "projectbrain/pyproject.toml" ]; then
+            pip install -e ./projectbrain
+          else
+            pip install projectbrain-mcp
+          fi
+
+      - name: Build code graph index
+        run: projectbrain index
+
+      - name: Generate SARIF v2.1.0 report
+        continue-on-error: true
+        run: projectbrain check --format sarif > projectbrain.sarif
+
+      - name: Upload SARIF report Artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: projectbrain-sarif
+          path: projectbrain.sarif
+          if-no-files-found: ignore
+
+      - name: Upload SARIF to GitHub Code Scanning
+        if: always()
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: projectbrain.sarif
+
+      - name: Render sticky PR guardrail report
+        if: github.event_name == 'pull_request'
+        continue-on-error: true
+        run: projectbrain check --format pr-comment > projectbrain-pr-comment.md
+
+      - name: Upsert sticky PR comment
+        if: always() && github.event_name == 'pull_request'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            if (!fs.existsSync('projectbrain-pr-comment.md')) return;
+            const body = fs.readFileSync('projectbrain-pr-comment.md', 'utf8');
+            const marker = '<!-- projectbrain-pr-guardrail -->';
+            const comments = await github.paginate(github.rest.issues.listComments, {{
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            }});
+            const existing = comments.find(c => c.body && c.body.includes(marker));
+            if (existing) {{
+              await github.rest.issues.updateComment({{
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              }});
+            }} else {{
+              await github.rest.issues.createComment({{
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              }});
+            }}
+
+      - name: Enforce ProjectBrain CI gate
+        run: projectbrain check --ci
+"""
+    wf_path.write_text(workflow_yaml, encoding="utf-8")
+    return wf_path
+
+
+def _clean_claude_settings_file(claude_hooks_path: Path, action_label: str, removed: list[str]) -> None:
+    if not claude_hooks_path.exists():
+        return
+    try:
+        data = json.loads(claude_hooks_path.read_text(encoding="utf-8", errors="ignore"))
+        if isinstance(data, dict) and isinstance(data.get("hooks"), dict):
+            hooks_dict = data["hooks"]
+            changed = False
+            for event_key in ("PreToolUse", "PostToolUse"):
+                existing_list = hooks_dict.get(event_key)
+                if isinstance(existing_list, list):
+                    cleaned = [
+                        entry for entry in existing_list
+                        if "[ProjectBrain]" not in json.dumps(entry)
+                        and "hook post-edit" not in json.dumps(entry)
+                    ]
+                    if len(cleaned) != len(existing_list):
+                        changed = True
+                    if cleaned:
+                        hooks_dict[event_key] = cleaned
+                    else:
+                        hooks_dict.pop(event_key, None)
+            if not hooks_dict:
+                data.pop("hooks", None)
+            if changed:
+                if data:
+                    claude_hooks_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
+                else:
+                    claude_hooks_path.unlink(missing_ok=True)
+                removed.append(action_label)
+    except (OSError, json.JSONDecodeError):
+        pass
+
+
 def remove_projectbrain_hooks(root_path: Path) -> list[str]:
-    """Remove ProjectBrain hooks from `.claude/settings.local.json`, `.cursor/hooks.json`, and `.git/hooks/pre-commit`."""
+    """Remove ProjectBrain hooks from `.claude/settings[.local].json`, `.cursor/hooks.json`, `.git/hooks/pre-commit`, and generated CI workflow."""
     removed: list[str] = []
 
-    claude_hooks_path = root_path / ".claude" / "settings.local.json"
-    if claude_hooks_path.exists():
-        try:
-            data = json.loads(claude_hooks_path.read_text(encoding="utf-8", errors="ignore"))
-            if isinstance(data, dict) and isinstance(data.get("hooks"), dict):
-                hooks_dict = data["hooks"]
-                changed = False
-                for event_key in ("PreToolUse", "PostToolUse"):
-                    existing_list = hooks_dict.get(event_key)
-                    if isinstance(existing_list, list):
-                        cleaned = [
-                            entry for entry in existing_list
-                            if "[ProjectBrain]" not in json.dumps(entry)
-                            and "hook post-edit" not in json.dumps(entry)
-                        ]
-                        if len(cleaned) != len(existing_list):
-                            changed = True
-                        if cleaned:
-                            hooks_dict[event_key] = cleaned
-                        else:
-                            hooks_dict.pop(event_key, None)
-                if not hooks_dict:
-                    data.pop("hooks", None)
-                if changed:
-                    if data:
-                        claude_hooks_path.write_text(json.dumps(data, indent=2) + "\n", encoding="utf-8")
-                    else:
-                        claude_hooks_path.unlink(missing_ok=True)
-                    removed.append("removed_.claude/settings.local.json_hooks")
-        except (OSError, json.JSONDecodeError):
-            pass
+    _clean_claude_settings_file(
+        root_path / ".claude" / "settings.local.json",
+        "removed_.claude/settings.local.json_hooks",
+        removed,
+    )
+    _clean_claude_settings_file(
+        root_path / ".claude" / "settings.json",
+        "removed_.claude/settings.json_hooks",
+        removed,
+    )
 
     cursor_hooks_path = root_path / ".cursor" / "hooks.json"
     if cursor_hooks_path.exists():
@@ -806,7 +1114,21 @@ def remove_projectbrain_hooks(root_path: Path) -> list[str]:
         except (OSError, json.JSONDecodeError):
             pass
 
-    hook_file = root_path / ".git" / "hooks" / "pre-commit"
+    wf_path = root_path / ".github" / "workflows" / "projectbrain.yml"
+    if wf_path.exists():
+        try:
+            wf_txt = wf_path.read_text(encoding="utf-8", errors="ignore")
+            if GITHUB_WORKFLOW_MARKER in wf_txt:
+                wf_path.unlink(missing_ok=True)
+                removed.append("removed_.github/workflows/projectbrain.yml")
+                for parent_dir in (wf_path.parent, wf_path.parent.parent):
+                    if parent_dir.exists() and not any(parent_dir.iterdir()):
+                        parent_dir.rmdir()
+        except OSError:
+            pass
+
+    hooks_dir = _resolve_git_hooks_dir(root_path)
+    hook_file = hooks_dir / "pre-commit" if hooks_dir is not None else (root_path / ".git" / "hooks" / "pre-commit")
     if hook_file.exists():
         try:
             existing = hook_file.read_text(encoding="utf-8", errors="ignore")

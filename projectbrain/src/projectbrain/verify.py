@@ -446,14 +446,14 @@ def verify_plan(
         if not info:
             continue
 
+        from .reporters import _is_test_file_path
+
         importers = brain._imported_by.get(rel_path, [])
         for imp in importers:
             if imp in plan_set:
                 continue
 
-            imp_lower = imp.lower()
-            is_test = any(seg in imp_lower for seg in ("test", "spec", "__tests__", "tests/"))
-            if is_test:
+            if _is_test_file_path(imp):
                 test_files.append(imp)
             else:
                 missing_files.append({
@@ -583,6 +583,8 @@ def impact(brain: "ProjectBrain", files_changed: list[str] | str, *, _already_fr
         importer_count = len(importers)
         all_impacted.update(importers)
 
+        from .reporters import _is_test_file_path
+
         defined_fns = [fn for fn in info.get("functions", [])]
         callers: list[dict] = []
         if brain._graph and defined_fns:
@@ -594,12 +596,24 @@ def impact(brain: "ProjectBrain", files_changed: list[str] | str, *, _already_fr
                         edge = brain._graph.edges[ei]
                         if edge["type"] == "calls":
                             src_node = brain._graph.nodes.get(edge["src"], {})
+                            in_file = (src_node.get("rel_path") or "").replace("\\", "/")
+                            if not in_file or in_file == rel_path:
+                                continue
+                            ln = edge.get("line")
+                            if any(
+                                prev["function"] == fn_name
+                                and prev["in_file"] == in_file
+                                and prev["line"] == ln
+                                and ln is not None
+                                for prev in callers
+                            ):
+                                continue
                             callers.append({
                                 "function": fn_name,
                                 "signature": fn.get("signature", ""),
                                 "called_by": edge["src"],
-                                "in_file": src_node.get("rel_path", ""),
-                                "line": edge.get("line"),
+                                "in_file": in_file,
+                                "line": ln,
                                 "confidence": edge.get("confidence", "candidate"),
                             })
 
@@ -624,8 +638,7 @@ def impact(brain: "ProjectBrain", files_changed: list[str] | str, *, _already_fr
         test_importers = []
         prod_importers = []
         for imp in importers:
-            imp_lower = imp.lower()
-            if any(seg in imp_lower for seg in ("test", "spec", "__tests__")):
+            if _is_test_file_path(imp):
                 test_importers.append(imp)
             else:
                 prod_importers.append(imp)
@@ -639,7 +652,7 @@ def impact(brain: "ProjectBrain", files_changed: list[str] | str, *, _already_fr
             "test_consumer_count": len(test_importers),
         }
         if callers:
-            entry["called_by"] = callers[:20]
+            entry["called_by"] = callers[:40]
         if behavior_summary:
             entry["behaviors"] = behavior_summary
         routes = info.get("routes", [])
@@ -1147,5 +1160,451 @@ def load_neighborhood_for_check(brain: "ProjectBrain", candidate_files: list[str
     }
     brain._graph = CodeGraph.from_json(data["graph_json"])
     return True
+
+
+def run_check(
+    brain: "ProjectBrain",
+    files_modified: list[str] | None = None,
+    claims: list[list[str]] | list[tuple[str, str, str]] | None = None,
+    plan_files: list[str] | None = None,
+    task: str = "",
+    *,
+    base_ref: str | None = None,
+    allow_governance_change: bool = False,
+) -> dict:
+    """Unified verification gate supporting working-tree edits AND committed PR merge-base diffs."""
+    from .git_diff import (
+        check_governance_tamper,
+        compute_git_diff,
+        find_git_context,
+        load_parsed_snapshots_at_ref,
+        mine_ad_hoc_co_change_drift,
+        resolve_git_base,
+        verify_deleted_or_renamed_file_consumers,
+    )
+    from .hooks import _file_diag_lines, _is_auditable_code_path, compute_interface_diff
+    from .memory import extract_note_rel_path
+
+    brain._memory._ensure_fresh()
+    should_resolve_base = (base_ref is not None) or (not files_modified and not claims and not plan_files)
+    base_info = (
+        resolve_git_base(brain.root, explicit_base=base_ref)
+        if should_resolve_base
+        else {
+            "active": False,
+            "valid": True,
+            "requested_ref": None,
+            "resolved_ref": None,
+            "merge_base": None,
+            "source": None,
+            "env_key": None,
+            "error": None,
+        }
+    )
+    if base_info.get("active") and not base_info.get("valid", True):
+        err_msg = base_info.get("error") or f"[GIT BASE ERROR] Invalid base ref '{base_ref}'."
+        return {
+            "all_contracts_valid": False,
+            "verdict": "INVALID_BASE_REF",
+            "contract_diagnostics": [err_msg],
+            "base_ref_info": base_info,
+        }
+
+    merge_base: str | None = base_info.get("merge_base") if base_info.get("active") else None
+    git_diff: dict | None = None
+    deleted_or_moved_paths: list[str] = []
+    renamed_from_old: dict[str, str] = {}
+    pinned_note_rels = {
+        p
+        for m in getattr(brain._memory, "_notes", [])
+        for p in (extract_note_rel_path(m),)
+        if p
+    }
+
+    saved_pre_edit: dict[str, dict] | None = None
+    if merge_base:
+        saved_pre_edit = {k: dict(v) for k, v in brain._pre_edit_index.items()}
+
+    try:
+        if merge_base:
+            git_diff = compute_git_diff(brain.root, ref_commit=merge_base, include_untracked=True)
+            deleted_or_moved_paths = [
+                r for r in git_diff.get("deleted_or_moved_paths", [])
+                if _is_auditable_code_path(r) or r in pinned_note_rels
+            ]
+            renamed_from_old = dict(git_diff.get("renamed_from_old", {}))
+            target_active = (
+                [brain._normalize_rel(str(f)) for f in files_modified]
+                if files_modified
+                else [r for r in git_diff.get("active_changed_files", []) if _is_auditable_code_path(r)]
+            )
+            pre_base_infos, _ = load_parsed_snapshots_at_ref(
+                brain.root,
+                merge_base,
+                target_active,
+                git_diff.get("renamed_files", {}),
+                deleted_or_moved_paths,
+            )
+            brain._pre_edit_index = {r: dict(inf) for r, inf in pre_base_infos.items()}
+        else:
+            brain._capture_pre_edit_snapshots(files_modified)
+            if (
+                not files_modified
+                and not claims
+                and not plan_files
+                and not brain._pre_edit_index
+                and find_git_context(brain.root)[0] is not None
+            ):
+                git_diff = compute_git_diff(brain.root, ref_commit="HEAD", include_untracked=True)
+                deleted_or_moved_paths = [
+                    r for r in git_diff.get("deleted_or_moved_paths", [])
+                    if _is_auditable_code_path(r) or r in pinned_note_rels
+                ]
+                renamed_from_old = dict(git_diff.get("renamed_from_old", {}))
+                active_head = [r for r in git_diff.get("active_changed_files", []) if _is_auditable_code_path(r)]
+                if active_head or deleted_or_moved_paths:
+                    saved_pre_edit = {}
+                    pre_head_infos, _ = load_parsed_snapshots_at_ref(
+                        brain.root,
+                        "HEAD",
+                        active_head,
+                        git_diff.get("renamed_files", {}),
+                        deleted_or_moved_paths,
+                    )
+                    for r, inf in pre_head_infos.items():
+                        brain._pre_edit_index.setdefault(r, dict(inf))
+
+        if files_modified:
+            effective_modified = list(files_modified)
+        elif not claims and not plan_files:
+            if git_diff is not None:
+                effective_modified = [
+                    r for r in git_diff.get("active_changed_files", [])
+                    if _is_auditable_code_path(r)
+                ]
+            elif brain._pre_edit_index:
+                effective_modified = list(brain._pre_edit_index.keys())
+            else:
+                effective_modified = []
+        else:
+            effective_modified = []
+
+        fast_check_scope = bool(
+            effective_modified
+            and not deleted_or_moved_paths
+            and not claims
+            and not plan_files
+        )
+        if fast_check_scope:
+            if not brain._index:
+                if not brain._load_neighborhood_for_check(effective_modified):
+                    brain.load()
+            if not brain._index:
+                brain.index()
+            else:
+                brain.incremental_index(candidate_files=effective_modified)
+                for r_cand in effective_modified:
+                    brain._pending_parsed_files.pop(brain._normalize_rel(str(r_cand)), None)
+        else:
+            brain._ensure_fresh()
+
+        out: dict = {}
+        if base_info.get("active"):
+            out["base_ref_info"] = base_info
+        if git_diff is not None and (base_info.get("active") or git_diff.get("all_touched_paths")):
+            filtered_diff = {
+                **git_diff,
+                "deleted_files": [
+                    r for r in git_diff.get("deleted_files", [])
+                    if _is_auditable_code_path(r) or r in pinned_note_rels
+                ],
+                "renamed_files": {
+                    nf: of
+                    for nf, of in (git_diff.get("renamed_files") or {}).items()
+                    if _is_auditable_code_path(nf) or _is_auditable_code_path(of)
+                },
+            }
+            out["git_diff"] = filtered_diff
+
+        if claims:
+            tuples = [(c[0], c[1], c[2]) for c in claims if len(c) >= 3]
+            out["claim_verification"] = brain.verify_batch(tuples)
+
+        if plan_files:
+            out["plan_validation"] = brain.verify_plan(task or "planned edit", plan_files)
+
+        all_indexed_set = (
+            set(brain._all_indexed_files)
+            if brain._all_indexed_files is not None
+            else set(brain._index.keys())
+        )
+        has_diff_scope = bool(effective_modified or deleted_or_moved_paths)
+
+        if has_diff_scope:
+            norm_focus = {brain._normalize_rel(str(f)) for f in effective_modified if f}
+            valid_focus = {r for r in norm_focus if r in brain._index}
+            if effective_modified:
+                imp_res = brain.impact(effective_modified, _already_fresh=fast_check_scope)
+                diags = list(imp_res.get("contract_diagnostics", []))
+            else:
+                imp_res = {
+                    "files_analyzed": 0,
+                    "total_impact_zone": 0,
+                    "overall_risk": "low",
+                    "verdict": "SAFE_TO_PROCEED",
+                    "all_contracts_valid": True,
+                    "contract_diagnostics": [],
+                    "details": [],
+                    "all_impacted_files": [],
+                }
+                diags = []
+
+            syntax_errs: list[str] = []
+            files_with_syntax_err: set[str] = set()
+            for r in sorted(valid_focus):
+                if brain._index.get(r, {}).get("parse_status") == "partial":
+                    s_lines = _file_diag_lines(brain.root, r)
+                    if s_lines:
+                        files_with_syntax_err.add(r)
+                    for msg in s_lines:
+                        syntax_errs.append(msg)
+                        if msg not in diags:
+                            diags.insert(0, msg)
+
+            b_violations = (
+                brain._memory.check_boundary_violations(
+                    brain._index, brain._import_targets, brain._graph, focus_rels=valid_focus,
+                )
+                if valid_focus
+                else []
+            )
+            for bv in b_violations:
+                if bv["message"] not in diags:
+                    diags.append(bv["message"])
+
+            del_set = set(deleted_or_moved_paths)
+            if del_set:
+                del_diags, del_records = verify_deleted_or_renamed_file_consumers(
+                    brain, del_set, renamed_from_old=renamed_from_old,
+                )
+                for dd in del_diags:
+                    if dd not in diags:
+                        diags.append(dd)
+                if del_records:
+                    out["deleted_file_violations"] = del_records
+
+            from .reporters import _clean_uri, _norm_line_key
+
+            details_by_rel = {
+                d["rel_path"]: d for d in imp_res.get("details", []) if d.get("rel_path")
+            }
+
+            def _dedup_blast_callers(items: list[dict], limit: int) -> list[dict]:
+                deduped: list[dict] = []
+                seen_locs: set[tuple[str, int | str]] = set()
+                for c in items:
+                    cf = _clean_uri(c.get("caller_file") or c.get("in_file") or "", fallback="")
+                    if not cf:
+                        continue
+                    ln_key = _norm_line_key(c.get("line"))
+                    loc_key = (cf, ln_key)
+                    if loc_key not in seen_locs:
+                        seen_locs.add(loc_key)
+                        deduped.append({**c, "caller_file": cf})
+                        if len(deduped) >= limit:
+                            break
+                return deduped
+
+            signature_blast: list[dict] = []
+            for r in sorted(valid_focus):
+                if r in files_with_syntax_err:
+                    continue
+                post_inf = brain._index.get(r)
+                pre_inf = brain._pre_edit_index.get(r) or brain._get_git_head_info(r)
+                if not pre_inf or not post_inf:
+                    continue
+                idiff = compute_interface_diff(pre_inf, post_inf)
+                mutated = idiff["changed_signatures"] + idiff["removed_symbols"]
+                if not mutated:
+                    continue
+                det = details_by_rel.get(r, {})
+                direct_mut_callers: list[dict] = []
+                if brain._graph:
+                    for m in mutated:
+                        sym = m.get("symbol") or ""
+                        if not sym or m.get("kind") != "function":
+                            continue
+                        p_cls, bare_nm = sym.split(".", 1) if "." in sym else (None, sym)
+                        m_nid = fn_id(r, bare_nm, p_cls)
+                        for ei in brain._graph._radj.get(m_nid, ()):
+                            edge = brain._graph.edges[ei]
+                            if edge["type"] != "calls":
+                                continue
+                            s_nd = brain._graph.nodes.get(edge["src"], {})
+                            cf_norm = _clean_uri(s_nd.get("rel_path") or "", fallback="")
+                            if cf_norm and cf_norm not in valid_focus:
+                                direct_mut_callers.append({
+                                    "caller_file": cf_norm,
+                                    "caller": edge["src"],
+                                    "callee": bare_nm,
+                                    "line": edge.get("line"),
+                                })
+                ext_callers = [
+                    {
+                        "caller_file": _clean_uri(c.get("caller_file") or c.get("in_file") or "", fallback=""),
+                        "caller": c.get("caller") or c.get("called_by") or "",
+                        "callee": c.get("callee") or c.get("function") or "",
+                        "line": c.get("line"),
+                    }
+                    for c in det.get("called_by", [])
+                    if _clean_uri(c.get("caller_file") or c.get("in_file") or "", fallback="")
+                    and _clean_uri(c.get("caller_file") or c.get("in_file") or "", fallback="") not in valid_focus
+                ]
+                ext_importers = [
+                    imp_f for imp_f in det.get("direct_consumers", [])
+                    if imp_f not in valid_focus
+                ]
+                if direct_mut_callers or ext_callers or ext_importers:
+                    mutated_names = {m["symbol"].split(".")[-1] for m in mutated} | {m["symbol"] for m in mutated}
+                    matched_callers = direct_mut_callers + [
+                        c for c in ext_callers
+                        if c.get("callee") in mutated_names or c.get("callee", "").split(".")[-1] in mutated_names
+                    ]
+                    relevant_callers = (
+                        _dedup_blast_callers(matched_callers, limit=8)
+                        if matched_callers
+                        else _dedup_blast_callers(ext_callers, limit=6)
+                    )
+                    signature_blast.append({
+                        "file": r,
+                        "mutations": mutated,
+                        "callers": relevant_callers,
+                        "consumers": ext_importers[:8],
+                        "tests": det.get("test_consumers", [])[:6],
+                    })
+
+            focus_node_ids: set[str] = set()
+            if brain._graph and valid_focus:
+                brain._graph._ensure_registries()
+                for r in valid_focus:
+                    focus_node_ids.update(brain._graph._nodes_by_file.get(r, set()))
+            matched_memories = brain._memory.get_notes_for(
+                valid_focus | del_set,
+                focus_node_ids,
+                brain._ast_hashes,
+                deleted_rels=del_set,
+                indexed_files=all_indexed_set,
+            )
+            stale_memories = [m for m in matched_memories if m.get("stale")]
+
+            all_changed_for_cochange = {
+                r for r in (
+                    valid_focus
+                    | (set(git_diff.get("all_touched_paths", [])) if git_diff else set())
+                    | del_set
+                    | norm_focus
+                )
+                if r and not Path(r).name.startswith(".projectbrain")
+            }
+            co_warnings = brain._memory.check_co_change_drift(
+                all_changed_for_cochange,
+                existing_files=all_indexed_set,
+            )
+            if merge_base and all_changed_for_cochange:
+                covered_pairs = {
+                    (cw["trigger_file"], cw["missing_partner"]) for cw in co_warnings
+                }
+                co_warnings.extend(
+                    mine_ad_hoc_co_change_drift(
+                        brain.root,
+                        merge_base,
+                        all_changed_for_cochange,
+                        existing_files=all_indexed_set,
+                        covered_pairs=covered_pairs,
+                    )
+                )
+
+            all_valid = len(diags) == 0
+            imp_res["contract_diagnostics"] = diags
+            imp_res["all_contracts_valid"] = all_valid
+            if not all_valid:
+                imp_res["verdict"] = "UNSAFE_CONTRACT_VIOLATION"
+
+            out["impact_analysis"] = imp_res
+            out["contract_diagnostics"] = diags
+            out["boundary_violations"] = b_violations
+            if syntax_errs:
+                out["syntax_errors"] = syntax_errs
+            if signature_blast:
+                out["signature_blast"] = signature_blast
+            if matched_memories:
+                out["memories"] = matched_memories
+            if stale_memories:
+                out["stale_memories"] = stale_memories
+            if co_warnings:
+                out["co_change_warnings"] = co_warnings
+            out["all_contracts_valid"] = all_valid
+            out["verdict"] = imp_res.get("verdict", "SAFE_TO_PROCEED")
+        elif not claims and not plan_files:
+            b_violations = brain._memory.check_boundary_violations(
+                brain._index, brain._import_targets, brain._graph, focus_rels=None,
+            )
+            if b_violations:
+                out["boundary_violations"] = b_violations
+                out["contract_diagnostics"] = [bv["message"] for bv in b_violations]
+                out["all_contracts_valid"] = False
+                out["verdict"] = "UNSAFE_CONTRACT_VIOLATION"
+            else:
+                out["all_contracts_valid"] = True
+                out["verdict"] = "SAFE_TO_PROCEED"
+            stale_all = [
+                m for m in brain._memory.list_all(brain._ast_hashes, indexed_files=all_indexed_set)
+                if m.get("stale")
+            ]
+            if stale_all:
+                out["stale_memories"] = stale_all
+            if git_diff and git_diff.get("all_touched_paths"):
+                touched_non_code = {
+                    r for r in git_diff["all_touched_paths"]
+                    if r and not Path(r).name.startswith(".projectbrain")
+                }
+                co_w = brain._memory.check_co_change_drift(touched_non_code, existing_files=all_indexed_set)
+                if co_w:
+                    out["co_change_warnings"] = co_w
+
+        should_check_governance = (
+            bool(merge_base)
+            or (not files_modified and not claims and not plan_files)
+            or any(Path(str(f)).name == ".projectbrain_memory.json" for f in (files_modified or ()))
+        )
+        if should_check_governance and find_git_context(brain.root)[0] is not None:
+            gov_ref = merge_base or "HEAD"
+            tampers = check_governance_tamper(brain.root, ref_commit=gov_ref)
+            if tampers:
+                out["governance_tamper"] = tampers
+                if allow_governance_change:
+                    out["governance_tamper_allowed"] = True
+                else:
+                    out["governance_tamper_blocked"] = True
+                    cur_diags = list(out.get("contract_diagnostics", []))
+                    for tp in tampers:
+                        if tp["message"] not in cur_diags:
+                            cur_diags.append(tp["message"])
+                    out["contract_diagnostics"] = cur_diags
+                    if "impact_analysis" in out and isinstance(out["impact_analysis"], dict):
+                        out["impact_analysis"]["contract_diagnostics"] = cur_diags
+                        out["impact_analysis"]["all_contracts_valid"] = False
+                        out["impact_analysis"]["verdict"] = "UNSAFE_GOVERNANCE_TAMPER"
+                    out["all_contracts_valid"] = False
+                    out["verdict"] = "UNSAFE_GOVERNANCE_TAMPER"
+
+        if not files_modified and not claims and not plan_files:
+            out["health"] = brain.health()
+
+        return out
+    finally:
+        if saved_pre_edit is not None:
+            brain._pre_edit_index = saved_pre_edit
+
 
 

@@ -64,20 +64,78 @@ def parse_forbid_spec(spec: str) -> tuple[str, str]:
     )
 
 
+def _clean_rel_path(raw: str) -> str:
+    p = raw.strip().replace("\\", "/")
+    while p.startswith("./"):
+        p = p[2:]
+    return p.lstrip("/")
+
+
+def extract_note_rel_path(entry: dict) -> str:
+    """Resolve the repository-relative file path for a memory note from `rel_path` or `target_id`."""
+    rpath = _clean_rel_path(str(entry.get("rel_path") or ""))
+    if rpath:
+        return rpath
+    tid = str(entry.get("target_id") or "").strip()
+    if ":" in tid:
+        parts = tid.split(":")
+        if len(parts) >= 3 and parts[0] in ("fn", "cls"):
+            return _clean_rel_path(parts[1])
+        if len(parts) == 2 and parts[0] == "file":
+            return _clean_rel_path(parts[1])
+    return ""
+
+
+def parse_co_change_spec(spec: str) -> tuple[str, str, bool]:
+    """Parse `'file_a <-> file_b'` (bidirectional) or `'file_a -> file_b'` (directional)."""
+    for sep in ("<->", "<=>", "=="):
+        if sep in spec:
+            left, right = spec.split(sep, 1)
+            fa = _clean_rel_path(left)
+            fb = _clean_rel_path(right)
+            if fa and fb and fa != fb:
+                return fa, fb, True
+    for sep in ("->", "=>"):
+        if sep in spec:
+            left, right = spec.split(sep, 1)
+            fa = _clean_rel_path(left)
+            fb = _clean_rel_path(right)
+            if fa and fb and fa != fb:
+                return fa, fb, False
+    raise ValueError(
+        f"Invalid co-change rule '{spec}'. Expected '<file_a> <-> <file_b>' or '<file_a> -> <file_b>'."
+    )
+
+
 class RepoMemory:
-    """Manages persistent AST-anchored notes & structural boundary rules in `.projectbrain_memory.json`."""
+    """Manages persistent AST-anchored notes, boundary rules, & co-change rules in `.projectbrain_memory.json`."""
 
     def __init__(self, root: Path) -> None:
         self.root = root
         self.path = root / ".projectbrain_memory.json"
         self._notes: list[dict] = []
         self._boundary_rules: list[dict] = []
+        self._co_change_rules: list[dict] = []
+        self._loaded_sig: tuple[int, int] | None = None
         self.load()
+
+    def _disk_sig(self) -> tuple[int, int] | None:
+        try:
+            st = self.path.stat()
+            return (st.st_mtime_ns, st.st_size)
+        except OSError:
+            return None
+
+    def _ensure_fresh(self) -> None:
+        if self._disk_sig() != self._loaded_sig:
+            self.load()
 
     def load(self) -> None:
         if not self.path.exists():
             self._notes = []
             self._boundary_rules = []
+            self._co_change_rules = []
+            self._loaded_sig = None
             return
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
@@ -88,12 +146,21 @@ class RepoMemory:
                     if isinstance(data.get("boundary_rules"), list)
                     else []
                 )
+                self._co_change_rules = (
+                    data.get("co_change_rules", [])
+                    if isinstance(data.get("co_change_rules"), list)
+                    else []
+                )
             else:
                 self._notes = []
                 self._boundary_rules = []
+                self._co_change_rules = []
+            self._loaded_sig = self._disk_sig()
         except (json.JSONDecodeError, OSError):
             self._notes = []
             self._boundary_rules = []
+            self._co_change_rules = []
+            self._loaded_sig = self._disk_sig()
 
     def save(self) -> None:
         payload: dict = {
@@ -103,8 +170,11 @@ class RepoMemory:
         }
         if self._boundary_rules:
             payload["boundary_rules"] = self._boundary_rules
+        if self._co_change_rules:
+            payload["co_change_rules"] = self._co_change_rules
         try:
             self.path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+            self._loaded_sig = self._disk_sig()
         except OSError:
             pass
 
@@ -118,6 +188,7 @@ class RepoMemory:
         tags: list[str] | None = None,
     ) -> dict:
         """Record or update an architectural note anchored to a symbol or file."""
+        self._ensure_fresh()
         target_id = target_id.strip()
         note = note.strip()
         for existing in self._notes:
@@ -151,6 +222,7 @@ class RepoMemory:
         edge_types: list[str] | None = None,
     ) -> dict:
         """Add or update a deterministic forbidden dependency boundary rule (`src_glob -> dst_glob`)."""
+        self._ensure_fresh()
         if dst_glob is None:
             src_g, dst_g = parse_forbid_spec(src_glob)
         else:
@@ -185,14 +257,131 @@ class RepoMemory:
         return rule
 
     def list_boundary_rules(self) -> list[dict]:
+        self._ensure_fresh()
         return [dict(r) for r in self._boundary_rules]
 
+    def add_co_change_rule(
+        self,
+        file_a: str,
+        file_b: str | None = None,
+        *,
+        bidirectional: bool = True,
+        confidence: float = 1.0,
+        co_change_count: int = 0,
+        reason: str = "",
+        mode: str = "advisory",
+    ) -> dict:
+        """Add or update a co-change coupling rule (`file_a <-> file_b` or `file_a -> file_b`)."""
+        self._ensure_fresh()
+        if file_b is None:
+            fa, fb, bidir = parse_co_change_spec(file_a)
+        else:
+            fa = _clean_rel_path(file_a)
+            fb = _clean_rel_path(file_b)
+            bidir = bool(bidirectional)
+            if not fa or not fb or fa == fb:
+                raise ValueError("Both file_a and file_b must be distinct non-empty paths.")
+        if bidir and fa > fb:
+            fa, fb = fb, fa
+        arrow = "<->" if bidir else "->"
+        rule_lbl = f"{fa} {arrow} {fb}"
+        reason_clean = reason.strip()
+
+        for existing in self._co_change_rules:
+            ex_a = existing.get("file_a", "")
+            ex_b = existing.get("file_b", "")
+            ex_bi = bool(existing.get("bidirectional", True))
+            same_pair = (ex_a == fa and ex_b == fb) or (bidir and ex_bi and ex_a == fb and ex_b == fa)
+            if same_pair:
+                existing["file_a"] = fa
+                existing["file_b"] = fb
+                existing["bidirectional"] = bidir or ex_bi
+                existing["rule"] = f"{fa} {'<->' if existing['bidirectional'] else '->'} {fb}"
+                existing["confidence"] = round(float(confidence), 3)
+                if co_change_count:
+                    existing["co_change_count"] = int(co_change_count)
+                if reason_clean:
+                    existing["reason"] = reason_clean
+                existing["mode"] = mode
+                existing["updated_at"] = round(time.time(), 2)
+                self.save()
+                return existing
+
+        entry = {
+            "id": f"cochange_{len(self._co_change_rules) + 1}_{int(time.time()) % 10000}",
+            "file_a": fa,
+            "file_b": fb,
+            "rule": rule_lbl,
+            "bidirectional": bidir,
+            "confidence": round(float(confidence), 3),
+            "co_change_count": int(co_change_count),
+            "reason": reason_clean,
+            "mode": mode,
+            "created_at": round(time.time(), 2),
+        }
+        self._co_change_rules.append(entry)
+        self.save()
+        return entry
+
+    def list_co_change_rules(self) -> list[dict]:
+        self._ensure_fresh()
+        return [dict(r) for r in self._co_change_rules]
+
+    def check_co_change_drift(
+        self,
+        modified_rels: set[str],
+        existing_files: set[str] | None = None,
+    ) -> list[dict]:
+        """Check pinned `co_change_rules` for missing partner updates in `modified_rels`."""
+        self._ensure_fresh()
+        if not self._co_change_rules or not modified_rels:
+            return []
+        warnings: list[dict] = []
+        seen: set[tuple[str, str]] = set()
+        for rule in self._co_change_rules:
+            fa = rule.get("file_a", "")
+            fb = rule.get("file_b", "")
+            if not fa or not fb:
+                continue
+            bidir = bool(rule.get("bidirectional", True))
+            pairs = [(fa, fb), (fb, fa)] if bidir else [(fa, fb)]
+            for trig, partner in pairs:
+                if trig in modified_rels and partner not in modified_rels:
+                    if existing_files is not None and partner not in existing_files and not (self.root / partner).exists():
+                        continue
+                    if (trig, partner) in seen:
+                        continue
+                    seen.add((trig, partner))
+                    conf = rule.get("confidence", 1.0)
+                    pct = round(float(conf) * 100, 1)
+                    rsn = rule.get("reason", "")
+                    rsn_sfx = f" ({rsn})" if rsn else ""
+                    warnings.append({
+                        "rule_id": rule.get("id", rule.get("rule", "")),
+                        "rule": rule.get("rule", f"{fa} <-> {fb}"),
+                        "trigger_file": trig,
+                        "missing_partner": partner,
+                        "confidence": conf,
+                        "co_change_pct": pct,
+                        "co_change_count": rule.get("co_change_count", 0),
+                        "mode": rule.get("mode", "advisory"),
+                        "source": "pinned_rule",
+                        "reason": rsn,
+                        "message": (
+                            f"[CO-CHANGE DRIFT] `{trig}` was modified without coupled partner `{partner}`"
+                            f"{rsn_sfx}."
+                        ),
+                    })
+        return warnings
+
     def forget(self, target_or_id: str) -> dict:
-        """Remove memory notes or boundary rules matching `id`, `target_id`, `rel_path`, or `rule`."""
+        """Remove memory notes, boundary rules, or co-change rules matching `id`, `target_id`, `rel_path`, or `rule`."""
+        self._ensure_fresh()
         q = target_or_id.strip()
         q_norm = q.replace("\\", "/")
         before_n = len(self._notes)
         before_r = len(self._boundary_rules)
+        before_c = len(self._co_change_rules)
         self._notes = [
             n for n in self._notes
             if n.get("id") != q
@@ -204,19 +393,30 @@ class RepoMemory:
             r for r in self._boundary_rules
             if r.get("id") != q and r.get("rule") != q_norm
         ]
+        self._co_change_rules = [
+            c for c in self._co_change_rules
+            if c.get("id") != q
+            and c.get("rule") != q_norm
+            and c.get("file_a") != q_norm
+            and c.get("file_b") != q_norm
+        ]
         removed_notes = before_n - len(self._notes)
         removed_rules = before_r - len(self._boundary_rules)
-        if removed_notes or removed_rules:
+        removed_co_changes = before_c - len(self._co_change_rules)
+        if removed_notes or removed_rules or removed_co_changes:
             self.save()
         return {
             "removed_notes": removed_notes,
             "removed_rules": removed_rules,
+            "removed_co_changes": removed_co_changes,
             "remaining_notes": len(self._notes),
             "remaining_rules": len(self._boundary_rules),
+            "remaining_co_changes": len(self._co_change_rules),
         }
 
     def refresh_hashes(self, current_hashes: dict[str, str], target_or_id: str | None = None) -> int:
         """Re-anchor stale notes to current AST hashes once verified."""
+        self._ensure_fresh()
         updated = 0
         q = target_or_id.strip() if target_or_id else None
         for entry in self._notes:
@@ -240,6 +440,7 @@ class RepoMemory:
         focus_rels: set[str] | None = None,
     ) -> list[dict]:
         """Evaluate all boundary rules against resolved cross-file imports and strong call edges."""
+        self._ensure_fresh()
         if not self._boundary_rules:
             return []
 
@@ -351,33 +552,79 @@ class RepoMemory:
         rel_paths: set[str],
         node_ids: set[str],
         current_hashes: dict[str, str],
+        *,
+        deleted_rels: set[str] | None = None,
+        indexed_files: set[str] | None = None,
     ) -> list[dict]:
         """Retrieve all memory notes matching any of the given files or node IDs.
 
         Checks `ast_hash` against `current_hashes` to flag stale notes when
-        the underlying function/class was modified after the note was written.
+        the underlying function/class was modified, renamed, or deleted after the note was written.
         """
+        self._ensure_fresh()
+        deleted_set = deleted_rels or set()
+        all_target_paths = rel_paths | deleted_set
         matched: list[dict] = []
         for entry in self._notes:
             tid = entry.get("target_id", "")
-            rpath = entry.get("rel_path", "")
-            if tid in node_ids or rpath in rel_paths or any(tid.endswith(f":{p}") for p in rel_paths):
+            rpath = extract_note_rel_path(entry)
+            if (
+                tid in node_ids
+                or (rpath and rpath in all_target_paths)
+                or any(p and (tid.endswith(f":{p}") or f":{p}:" in tid) for p in all_target_paths)
+            ):
                 out = dict(entry)
+                if rpath and not out.get("rel_path"):
+                    out["rel_path"] = rpath
                 saved_hash = entry.get("ast_hash", "")
                 curr_hash = current_hashes.get(tid, "")
-                if saved_hash and curr_hash and saved_hash != curr_hash:
+                if rpath and rpath in deleted_set:
+                    out["stale"] = True
+                    out["stale_warning"] = (
+                        f"Target file '{rpath}' was deleted or renamed since this memory was recorded; "
+                        "re-verify or update governance."
+                    )
+                elif (
+                    rpath
+                    and (indexed_files is None or rpath not in indexed_files)
+                    and not (self.root / rpath).exists()
+                ):
+                    out["stale"] = True
+                    out["stale_warning"] = (
+                        f"Target file '{rpath}' no longer exists on disk; "
+                        "re-verify or update governance."
+                    )
+                elif saved_hash and curr_hash and saved_hash != curr_hash:
                     out["stale"] = True
                     out["stale_warning"] = (
                         "Target symbol AST changed since this memory was recorded; "
                         "re-verify before relying on it."
+                    )
+                elif (
+                    saved_hash
+                    and not curr_hash
+                    and tid.startswith(("fn:", "cls:"))
+                    and indexed_files is not None
+                    and rpath in indexed_files
+                ):
+                    out["stale"] = True
+                    out["stale_warning"] = (
+                        f"Target symbol '{tid}' is no longer present in '{rpath}'; "
+                        "re-verify or refresh governance."
                     )
                 else:
                     out["stale"] = False
                 matched.append(out)
         return matched
 
-    def list_all(self, current_hashes: dict[str, str] | None = None) -> list[dict]:
+    def list_all(
+        self,
+        current_hashes: dict[str, str] | None = None,
+        *,
+        indexed_files: set[str] | None = None,
+    ) -> list[dict]:
+        self._ensure_fresh()
         current_hashes = current_hashes or {}
-        all_paths = {n.get("rel_path", "") for n in self._notes}
+        all_paths = {p for n in self._notes for p in (extract_note_rel_path(n),) if p}
         all_ids = {n.get("target_id", "") for n in self._notes}
-        return self.get_notes_for(all_paths, all_ids, current_hashes)
+        return self.get_notes_for(all_paths, all_ids, current_hashes, indexed_files=indexed_files)

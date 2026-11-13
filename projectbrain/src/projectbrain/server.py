@@ -1,4 +1,4 @@
-"""ProjectBrain MCP Server (v1.0: Zero-LSP Code Graph & Blast-Radius Guardrail).
+"""ProjectBrain MCP Server (v1.1: Zero-LSP Code Graph, PR Merge-Base & Blast-Radius Guardrail).
 
 Exposes 5 primary non-overlapping power tools by default (`--lean`):
   1. `brain_dossier`  — One-call Architecture & Context Compiler: returns PDG/AST code
@@ -15,7 +15,7 @@ Exposes 5 primary non-overlapping power tools by default (`--lean`):
                         (`.projectbrain_memory.json`) with automatic staleness detection.
 
 Pass `--full` (or `PROJECTBRAIN_FULL_TOOLS=1`) to also expose auxiliary tools
-(`brain_context`, `brain_stats`, `brain_run`, `brain_patch`).
+(`brain_learn`, `brain_context`, `brain_stats`, `brain_run`, `brain_patch`).
 """
 from __future__ import annotations
 
@@ -178,15 +178,17 @@ def brain_check(
     claims: list[list[str]] | None = None,
     plan_files: list[str] | None = None,
     task: str = "",
+    base_ref: str | None = None,
+    allow_governance_change: bool = False,
     repo_path: str | None = None,
 ) -> dict:
-    """Verification & blast-radius gate: check claims, edit plans, contracts, and invariants.
+    """Verification & blast-radius gate: check claims, edit plans, PR merge-base diffs, contracts, and invariants.
 
     Modes:
       - Pre-edit plan gate (`plan_files=[...]`, `task="..."`): flags missing connected importers/tests.
-      - Post-edit impact & contract gate (`files_modified=[...]` or git diff): checks syntax,
-        4-pillar cross-file arity/import/key/SQL contracts, architectural boundary rules,
-        downstream callers, and stale AST invariants.
+      - Post-edit / PR merge-base gate (`files_modified=[...]`, `base_ref="main"`, or git diff): checks syntax,
+        4-pillar cross-file arity/import/key/SQL contracts, deleted/renamed file consumers, architectural
+        boundary rules, governance tamper lock, downstream callers, co-change drift, and stale AST invariants.
       - Fact-check claims (`claims=[["Router", "calls", "dispatch"]]`): returns `SUPPORTED`,
         `REFUTED`, or `UNKNOWN` (never guesses on dynamic dispatch or partial ASTs).
     """
@@ -195,6 +197,8 @@ def brain_check(
         claims=claims,
         plan_files=plan_files,
         task=task,
+        base_ref=base_ref,
+        allow_governance_change=allow_governance_change,
     )
 
 
@@ -203,15 +207,17 @@ def brain_remember(
     target: str = "",
     note: str = "",
     forbid: str | None = None,
+    co_change: str | None = None,
     action: str = "save",
     tags: list[str] | None = None,
     repo_path: str | None = None,
 ) -> dict:
-    """Pin AST-anchored invariants or enforceable architectural boundary rules in `.projectbrain_memory.json`.
+    """Pin AST-anchored invariants, architectural boundary rules, or co-change contracts in `.projectbrain_memory.json`.
 
     Usage:
       - Pin invariant: `brain_remember(target="AuthService.verify", note="Must strip Bearer prefix before HMAC")`
       - Enforce layer rule: `brain_remember(forbid="routes/* -> db/*", note="Routes must call services, not DB")`
+      - Pin co-change rule: `brain_remember(co_change="schema.sql <-> models/user.py", note="Keep ORM synced")`
       - Audit invariants: `brain_remember(action="list")` or `brain_remember(action="stale")`
       - Remove/refresh: `brain_remember(target="mem_1", action="forget")` or `action="refresh"`
     """
@@ -220,11 +226,32 @@ def brain_remember(
         note=note,
         tags=tags,
         forbid=forbid,
+        co_change=co_change,
         action=action,
     )
 
 
 # ── Auxiliary / Legacy Tools (`--full` Mode) ─────────────────────────────────
+
+@mcp.tool()
+def brain_learn(
+    apply: bool = False,
+    pin_hubs: bool = False,
+    max_rules: int = 12,
+    days: int = 180,
+    min_cochanges: int = 3,
+    min_confidence: float = 0.70,
+    repo_path: str | None = None,
+) -> dict:
+    """Auto-discover zero-violation architectural `--forbid` boundaries, git co-change contracts, and hub symbols."""
+    return _get_brain(repo_path).learn(
+        apply=apply,
+        pin_hubs=pin_hubs,
+        max_rules=max_rules,
+        days=days,
+        min_cochanges=min_cochanges,
+        min_confidence=min_confidence,
+    )
 
 @mcp.tool()
 def brain_context(
@@ -287,15 +314,21 @@ LEAN_CORE_TOOLS = {
 }
 
 
+_ALL_REGISTERED_TOOLS: dict[str, object] | None = None
+
+
 def configure_mcp_tools(full_mode: bool = False) -> set[str]:
     """Filter registered FastMCP tools according to `--lean` (default) vs `--full`."""
+    global _ALL_REGISTERED_TOOLS
     tm = getattr(mcp, "_tool_manager", None)
     tools_dict = getattr(tm, "_tools", None)
     if isinstance(tools_dict, dict):
-        if not full_mode:
-            for t_name in list(tools_dict.keys()):
-                if t_name not in LEAN_CORE_TOOLS:
-                    tools_dict.pop(t_name, None)
+        if _ALL_REGISTERED_TOOLS is None:
+            _ALL_REGISTERED_TOOLS = dict(tools_dict)
+        tools_dict.clear()
+        for t_name, t_obj in _ALL_REGISTERED_TOOLS.items():
+            if full_mode or t_name in LEAN_CORE_TOOLS:
+                tools_dict[t_name] = t_obj
         return set(tools_dict.keys())
     return set(LEAN_CORE_TOOLS)
 

@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ProjectBrain v1.0 (projectbrain-mcp) — Zero-LSP Code Graph &amp; Blast-Radius Guardrail for AI Agents</title>
-  <meta name="description" content="Zero-LSP SQLite Code Graph, Real-Time Post-Edit Blast-Radius &amp; Contract Guardrail, and Surgical PDG Context Compiler for AI Coding Agents." />
+  <title>ProjectBrain v1.1 (projectbrain-mcp) — Zero-LSP Code Graph, PR Merge-Base &amp; Blast-Radius Guardrail for AI Agents</title>
+  <meta name="description" content="Zero-LSP SQLite Code Graph, Real-Time Post-Edit &amp; PR Merge-Base Contract Guardrail, Governance Tamper Lock, SARIF v2.1.0, and Surgical PDG Context Compiler for AI Coding Agents." />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -226,7 +226,7 @@
 
   <nav>
     <div class="container">
-      <div class="nav-brand">ProjectBrain <code>projectbrain-mcp v1.0</code></div>
+      <div class="nav-brand">ProjectBrain <code>projectbrain-mcp v1.1</code></div>
       <div class="nav-links">
         <a href="#setup">Setup</a>
         <a href="#workflow">Guardrails &amp; CLI</a>
@@ -241,23 +241,23 @@
 
   <header class="hero">
     <div class="container">
-      <h1>Zero-LSP Code Graph &amp; Blast-Radius Firewall<br />for <span>AI Coding Agents</span></h1>
+      <h1>Zero-LSP Code Graph &amp; PR Blast-Radius Firewall<br />for <span>AI Coding Agents &amp; Teams</span></h1>
       <p class="subtitle">
         Give Claude Code, Cursor, Antigravity, and CI pipelines 1-turn PDG/AST architecture context <strong>(Offense)</strong>
-        and silent-when-clean real-time post-edit contract, syntax, and layer-boundary guardrails <strong>(Defense)</strong> —
+        plus silent-when-clean post-edit hooks, PR merge-base contract verification, Governance Tamper Lock, OASIS SARIF v2.1.0, and Day-1 architecture learning <strong>(Defense)</strong> —
         powered by local SQLite WAL + lazy Tree-sitter.
       </p>
       <div class="hero-install-group">
         <div class="hero-install">
           uv tool install projectbrain-mcp<br />
-          projectbrain --path /path/to/your/repo init --git-hook
+          projectbrain --path /path/to/your/repo init --team --learn
         </div>
       </div>
       <div class="hero-badges">
         <span>&#9889; &lt;30ms Stdlib Hook Fast-Path</span>
-        <span>&#128737; 5-Layer Post-Edit Firewall</span>
-        <span>&#129517; 5-Tool Lean Zero-LSP MCP</span>
-        <span>&#128274; 100% Local SQLite WAL + FTS5</span>
+        <span>&#128737; PR Merge-Base &amp; Governance Tamper Lock</span>
+        <span>&#129517; Day-1 <code>learn</code> + 5-Tool Lean MCP</span>
+        <span>&#128274; OASIS SARIF v2.1.0 + Sticky Mermaid PRs</span>
         <span>&#9989; &lt;2s GitHub Actions CI Gate</span>
       </div>
     </div>
@@ -277,32 +277,29 @@
       </div>
 
       <div class="setup-card">
-        <h3><span class="setup-step-badge">Step 2</span> Initialize Your Repository</h3>
-        <p>Index the codebase into <code>.projectbrain.db</code>, wire ENOENT-proof MCP configs, and enable active post-edit hooks:</p>
-        <pre><code>projectbrain --path /path/to/your/repo init --git-hook</code></pre>
+        <h3><span class="setup-step-badge">Step 2</span> Initialize Your Repository (Personal or Team + CI Mode)</h3>
+        <p>Index the codebase into <code>.projectbrain.db</code>, wire MCP + editor hooks, and optionally bootstrap OS-portable team configs, GitHub Actions, and Day-1 governance:</p>
+        <pre><code><span class="comment"># Personal workstation (ENOENT-proof absolute IDE paths):</span>
+projectbrain --path /path/to/your/repo init --git-hook
+
+<span class="comment"># Team + CI setup (OS-portable hooks, GitHub Action workflow, &amp; zero-violation rule discovery):</span>
+projectbrain --path /path/to/your/repo init --team --learn</code></pre>
         <p style="margin-top: 0.75rem; margin-bottom: 0;">
-          <strong>What <code>init</code> configures non-destructively:</strong><br />
+          <strong>What <code>init --team --learn</code> configures non-destructively:</strong><br />
           1. Builds <code>.projectbrain.db</code> (SQLite WAL + FTS5) honoring <code>.gitignore</code>.<br />
-          2. Resolves absolute executable paths so GUI IDEs never fail with <code>spawn ENOENT</code>.<br />
-          3. Installs active Claude Code <code>PostToolUse</code> (<code>.claude/settings.local.json</code>), Cursor <code>afterFileEdit</code> (<code>.cursor/hooks.json</code>), and optional Git <code>pre-commit</code> guardrails.<br />
-          4. Leaves <code>.projectbrain_memory.json</code> git-trackable so pinned invariants and <code>--forbid</code> boundary rules travel with your team's PRs.
+          2. Writes OS-portable <code>.claude/settings.json</code>, <code>.cursor/hooks.json</code>, <code>.mcp.json</code>, and <code>.github/workflows/projectbrain.yml</code> with zero local machine paths.<br />
+          3. Runs <code>projectbrain learn</code> to auto-discover zero-violation <code>--forbid</code> layer boundaries and git co-change contracts on Day 1.<br />
+          4. Leaves <code>.projectbrain_memory.json</code> git-trackable and protected by the <strong>Governance Tamper Lock</strong> across every PR.
         </p>
       </div>
 
       <div class="setup-card">
-        <h3><span class="setup-step-badge">Step 3</span> Add the <code>&lt;2s</code> GitHub Actions PR Gate</h3>
-        <p>Enforce cross-file contracts, architectural boundaries, and invariant checks on every pull request:</p>
-        <pre><code>name: ProjectBrain Architecture &amp; Contract Gate
-on: [pull_request]
-jobs:
-  guardrail:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: astral-sh/setup-uv@v4
-      - run: uvx --from projectbrain-mcp projectbrain check --ci</code></pre>
+        <h3><span class="setup-step-badge">Step 3</span> Automated PR Merge-Base Gate, SARIF v2.1.0 &amp; Sticky Mermaid Comments</h3>
+        <p>Generated automatically by <code>projectbrain init --team</code> in <code>.github/workflows/projectbrain.yml</code> — audits multi-commit PRs against <code>git merge-base</code>, uploads OASIS SARIF v2.1.0 to GitHub Code Scanning, and upserts a zero-noise sticky PR comment (<code>&lt;!-- projectbrain-pr-guardrail --&gt;</code>) with Mermaid blast-radius graphs:</p>
+        <pre><code><span class="comment"># CLI equivalents run in CI (auto-detects GITHUB_BASE_REF / GitLab MR / Bitbucket / Azure PR envs):</span>
+projectbrain check --base main --format sarif &gt; projectbrain.sarif
+projectbrain check --base main --format pr-comment &gt; projectbrain-pr-comment.md
+projectbrain check --base main --ci</code></pre>
       </div>
     </div>
   </section>
@@ -313,28 +310,32 @@ jobs:
       <p>Use ProjectBrain from your terminal, CI pipeline, or automatically through its 5-tool MCP server and active editor hooks.</p>
 
       <div class="demo-block">
-        <div class="demo-label">1. Compile a 1-Turn Architecture Dossier (<code>dossier</code>)</div>
-        <pre><code><span class="comment"># Prints class-qualified AST slices, 1-2 hop call/state chains, and covering tests directly to stdout</span>
-$ projectbrain --path /path/to/repo dossier <span class="string">"how are exceptions routed to error handlers"</span></code></pre>
+        <div class="demo-label">1. Zero-Config Day-1 Architecture &amp; Co-Change Discovery (<code>learn</code>)</div>
+        <pre><code><span class="comment"># Auto-discover zero-violation --forbid layer rules, git co-change contracts, and high-fan-in hub symbols</span>
+$ projectbrain --path /path/to/repo learn
+$ projectbrain --path /path/to/repo learn --apply</code></pre>
       </div>
 
       <div class="demo-block">
-        <div class="demo-label">2. Surgical Symbol &amp; Intra-Function PDG Slicing (<code>slice --focus</code>)</div>
-        <pre><code><span class="comment"># Slice exact backward defs + forward uses + control guards for a variable in &lt;20ms from SQLite</span>
+        <div class="demo-label">2. Compile a 1-Turn Architecture Dossier &amp; <code>&lt;20ms</code> PDG Slice (<code>dossier</code> / <code>slice --focus</code>)</div>
+        <pre><code><span class="comment"># Prints class-qualified AST slices, 1-2 hop call/state chains, and covering tests directly to stdout</span>
+$ projectbrain --path /path/to/repo dossier <span class="string">"how are exceptions routed to error handlers"</span>
 $ projectbrain --path /path/to/repo slice billing.py:compute_invoice --focus discount_total</code></pre>
       </div>
 
       <div class="demo-block">
-        <div class="demo-label">3. Pin Enforceable Layer Boundaries &amp; AST Invariants (<code>remember</code>)</div>
-        <pre><code><span class="comment"># Block forbidden cross-layer imports/calls in real-time hooks and CI</span>
+        <div class="demo-label">3. Pin Enforceable Boundaries, Co-Change Contracts &amp; AST Invariants (<code>remember</code>)</div>
+        <pre><code><span class="comment"># Protected against silent agent tampering in PRs by the Governance Tamper Lock</span>
 $ projectbrain --path /path/to/repo remember --forbid <span class="string">"routes/* -&gt; db/*"</span> --reason <span class="string">"Routes must call services/*"</span>
-$ projectbrain --path /path/to/repo remember settle_invoice <span class="string">"Must preserve idempotency on duplicate invoice_id"</span>
-$ projectbrain --path /path/to/repo memories</code></pre>
+$ projectbrain --path /path/to/repo remember --co-change <span class="string">"schema.sql &lt;-&gt; models/user.py"</span> --reason <span class="string">"Keep ORM synced"</span>
+$ projectbrain --path /path/to/repo remember settle_invoice <span class="string">"Must preserve idempotency on duplicate invoice_id"</span></code></pre>
       </div>
 
       <div class="demo-block">
-        <div class="demo-label">4. Guardrail Scorecard &amp; PR Reports (<code>check</code> &amp; <code>stats --summary</code>)</div>
-        <pre><code>$ projectbrain --path /path/to/repo check --format markdown
+        <div class="demo-label">4. PR Merge-Base Gate, OASIS SARIF v2.1.0, Sticky Mermaid PR Comments &amp; Scorecard</div>
+        <pre><code>$ projectbrain --path /path/to/repo check --base main --ci
+$ projectbrain --path /path/to/repo check --base main --format pr-comment
+$ projectbrain --path /path/to/repo check --base main --format sarif &gt; projectbrain.sarif
 $ projectbrain --path /path/to/repo stats --summary
 ===============================================================
   ProjectBrain Guardrail &amp; Code-Graph Scorecard
@@ -425,14 +426,14 @@ $ projectbrain --path /path/to/repo stats --summary
           <p>Extracts exact symbol bodies or variable-focused intra-function Program Dependence Graph slices (<code>--focus var</code>) without loading full files.</p>
         </div>
         <div class="feature">
-          <div class="feature-tag tag-unique">Epistemic</div>
-          <h3>3-Valued Claim &amp; CI Gate (<code>brain_check</code>)</h3>
-          <p>Verifies structural claims (<code>SUPPORTED</code> / <code>REFUTED</code> / <code>UNKNOWN</code>) and 4-pillar contracts, outputting Ruff-style text, PR markdown, or GitHub Actions annotations.</p>
+          <div class="feature-tag tag-unique">CI / PR Gate</div>
+          <h3>PR Merge-Base, SARIF v2.1.0 &amp; Sticky Mermaid PRs (<code>brain_check</code>)</h3>
+          <p>Audits committed PR branches via <code>check --base main</code>, verifies 3-valued claims (<code>SUPPORTED</code> / <code>REFUTED</code> / <code>UNKNOWN</code>), emits OASIS SARIF v2.1.0 (<code>PB001</code>&ndash;<code>PB010</code>), and renders zero-noise sticky PR comments with Mermaid blast-radius graphs.</p>
         </div>
         <div class="feature">
           <div class="feature-tag tag-core">Governance</div>
-          <h3>Enforceable Repo Memory (<code>brain_remember</code>)</h3>
-          <p>Git-tracked <code>.projectbrain_memory.json</code> stores AST-hash symbol invariants and enforceable <code>--forbid "src/* -&gt; dst/*"</code> boundary rules.</p>
+          <h3>Tamper-Locked Governance &amp; Day-1 <code>learn</code></h3>
+          <p>Auto-discovers zero-violation <code>--forbid</code> boundaries and git co-change contracts via <code>projectbrain learn</code>, and blocks unauthorized rule deletion or hash tampering in PRs via the Governance Tamper Lock.</p>
         </div>
         <div class="feature">
           <div class="feature-tag tag-core">Graph</div>
@@ -445,7 +446,7 @@ $ projectbrain --path /path/to/repo stats --summary
 
   <section id="compare">
     <div class="container">
-      <h2>How ProjectBrain v1.0 Compares</h2>
+      <h2>How ProjectBrain v1.1 Compares</h2>
       <div style="overflow-x: auto;">
         <table class="comparison-table">
           <thead>
@@ -454,7 +455,7 @@ $ projectbrain --path /path/to/repo stats --summary
               <th>Aider Repo-Map</th>
               <th>Serena (LSP)</th>
               <th>Generic Graph MCPs</th>
-              <th>ProjectBrain v1.0</th>
+              <th>ProjectBrain v1.1</th>
             </tr>
           </thead>
           <tbody>
@@ -487,18 +488,18 @@ $ projectbrain --path /path/to/repo stats --summary
               <td class="check">Backward defs + forward uses + guards</td>
             </tr>
             <tr>
-              <td>Enforceable Layer Rules &amp; AST Invariants</td>
+              <td>Day-1 Rule Discovery &amp; Governance Tamper Lock</td>
               <td class="cross">No</td>
               <td class="partial">Unchecked prose</td>
               <td class="cross">No</td>
-              <td class="check"><code>--forbid</code> globs + AST-hash staleness</td>
+              <td class="check"><code>learn</code> + <code>--forbid</code> + PR Tamper Lock</td>
             </tr>
             <tr>
-              <td><code>&lt;2s</code> GitHub Actions PR Gate</td>
+              <td>PR Merge-Base Gate, SARIF v2.1.0 &amp; Sticky Mermaid PRs</td>
               <td class="cross">No</td>
               <td class="cross">No</td>
               <td class="cross">No</td>
-              <td class="check"><code>projectbrain check --ci</code> / <code>--format markdown</code></td>
+              <td class="check"><code>check --base main</code> + SARIF + <code>pr-comment</code></td>
             </tr>
           </tbody>
         </table>
@@ -509,7 +510,7 @@ $ projectbrain --path /path/to/repo stats --summary
   <section class="cta">
     <div class="container">
       <h2>Ship Faster Without Cross-File Regressions</h2>
-      <p>Install via <code>uv</code>, run <code>projectbrain init</code>, and equip your AI coding agents with instant code-graph intelligence and active blast-radius guardrails.</p>
+      <p>Install via <code>uv</code>, run <code>projectbrain init --team --learn</code>, and equip your AI coding agents and CI pipeline with instant code-graph intelligence and active blast-radius guardrails.</p>
       <div class="cta-buttons">
         <a href="https://pypi.org/project/projectbrain-mcp/" class="btn btn-primary" target="_blank">View on PyPI</a>
         <a href="https://github.com/Johanabhishek/ProjectBrain" class="btn btn-secondary" target="_blank">Star on GitHub</a>
@@ -519,7 +520,7 @@ $ projectbrain --path /path/to/repo stats --summary
 
   <footer>
     <div class="container">
-      <p>ProjectBrain (<code>projectbrain-mcp</code> v1.0.0) &mdash; Zero-LSP SQLite Code Graph &amp; Blast-Radius Guardrail for AI Coding Agents. MIT License.</p>
+      <p>ProjectBrain (<code>projectbrain-mcp</code> v1.1.0) &mdash; Zero-LSP SQLite Code Graph, PR Merge-Base &amp; Blast-Radius Guardrail for AI Coding Agents. MIT License.</p>
     </div>
   </footer>
 
