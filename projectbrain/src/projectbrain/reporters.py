@@ -93,6 +93,27 @@ _SARIF_RULE_CATALOG: dict[str, dict] = {
         "defaultConfiguration": {"level": "warning"},
         "helpUri": _INFO_URI,
     },
+    "PB011": {
+        "id": "PB011",
+        "name": "CrossStackHttpSchemaViolation",
+        "shortDescription": {"text": "Cross-stack HTTP verb, request body schema, query param, or response key mismatch"},
+        "defaultConfiguration": {"level": "error"},
+        "helpUri": _INFO_URI,
+    },
+    "PB012": {
+        "id": "PB012",
+        "name": "ReactLifecycleOrRaceViolation",
+        "shortDescription": {"text": "React post-mount stateful child unmount, nested component remount, or async effect race"},
+        "defaultConfiguration": {"level": "error"},
+        "helpUri": _INFO_URI,
+    },
+    "PB013": {
+        "id": "PB013",
+        "name": "PythonPydanticOrIoHazard",
+        "shortDescription": {"text": "Pydantic partial-update default clobber without exclude_unset=True or silent I/O exception swallow"},
+        "defaultConfiguration": {"level": "error"},
+        "helpUri": _INFO_URI,
+    },
 }
 
 _BACKTICK_LOC_RE = re.compile(r"`([^`\r\n]+?\.[A-Za-z0-9]{1,8}):L?(\d+)(?::(\d+))?`")
@@ -216,6 +237,12 @@ def _classify_diag_rule_id(msg: str) -> str:
         or "Deleted/Renamed File Import" in msg
     ):
         return "PB005"
+    if "HTTP Route Method Mismatch" in msg or "Cross-Stack HTTP" in msg:
+        return "PB011"
+    if "React Lifecycle" in msg or "React Stateful Child" in msg or "React Async Effect" in msg:
+        return "PB012"
+    if "Pydantic Partial-Update" in msg or "Silent Side-Effect" in msg:
+        return "PB013"
     return "PB006"
 
 
@@ -303,6 +330,24 @@ def format_sarif_report(res: dict) -> str:
         uri = _clean_uri(cw.get("trigger_file"), fallback=default_uri)
         msg = cw.get("message") or f"Modified without coupled partner `{cw.get('missing_partner')}`."
         raw_results.append(("PB010", "warning", uri, 1, None, msg))
+
+    # 7. Semantic warnings & `--audit` warning-level ranked hotspots
+    for sw in res.get("semantic_warnings", []):
+        if sw in consumed_msgs:
+            continue
+        consumed_msgs.add(sw)
+        rid = _classify_diag_rule_id(sw)
+        uri, ln, col = _extract_location(sw, fallback_uri=default_uri)
+        raw_results.append((rid, "warning", uri, ln, col, sw))
+    for hs in res.get("ranked_hotspots", []):
+        if hs.get("severity") != "warning":
+            continue
+        rid = hs.get("rule_id") or "PB006"
+        uri = _clean_uri(hs.get("rel_path"), fallback=default_uri)
+        ln = max(1, int(hs.get("line") or 1))
+        if any(r_uri == uri and r_ln == ln and r_rid == rid for r_rid, _, r_uri, r_ln, _, _ in raw_results):
+            continue
+        raw_results.append((rid, "warning", uri, ln, None, hs.get("summary") or "Semantic warning"))
 
     used_rule_ids: list[str] = []
     for rid, *_ in raw_results:
@@ -814,6 +859,20 @@ def format_check_report(res: dict, fmt: str = "text") -> str:
             md.append("\n### Co-Change Drift Advisories")
             for cw in co_warnings[:8]:
                 md.append(f"- ⚠️ {cw.get('message')}")
+        if res.get("semantic_warnings"):
+            md.append("\n### Semantic Hazards & Race Advisories")
+            for sw in res["semantic_warnings"][:10]:
+                md.append(f"- ⚠️ {sw[2:].strip() if sw.startswith('- ') else sw}")
+        if res.get("ranked_hotspots"):
+            cov = res.get("audit_coverage") or {}
+            md.append(
+                f"\n### Ranked Semantic Hotspots (`{cov.get('flagged_files_count', 0)}` / `{cov.get('files_scanned', 0)}` files flagged)"
+            )
+            for hs in res["ranked_hotspots"][:15]:
+                md.append(
+                    f"- `#{hs.get('rank')}` **[{hs.get('rule_id')}:{hs.get('severity')}]** "
+                    f"`{hs.get('recommended_read')}` — {hs.get('summary')}"
+                )
         tests = sorted({t for d in details for t in d.get("test_consumers", [])})
         if tests:
             md.append(f"\n### Affected Tests\n```bash\npytest {' '.join(tests[:10])}\n```")
@@ -822,7 +881,14 @@ def format_check_report(res: dict, fmt: str = "text") -> str:
     # Default `text` (Ruff-style scannable terminal output)
     out: list[str] = []
     status_lbl = "PASS" if all_valid else "VIOLATION"
-    if details or diags or co_warnings or sig_blast:
+    cov = res.get("audit_coverage") or {}
+    if cov:
+        out.append(
+            f"ProjectBrain Audit [{status_lbl}] — Verdict: {verdict} · "
+            f"{cov.get('files_scanned', 0)} files scanned ({cov.get('clean_files_verified', 0)} clean, "
+            f"{cov.get('flagged_files_count', 0)} flagged) in {cov.get('elapsed_ms', 0)}ms"
+        )
+    elif details or diags or co_warnings or sig_blast:
         out.append(f"ProjectBrain Check [{status_lbl}] — Verdict: {verdict}")
     elif health:
         out.append(
@@ -835,6 +901,14 @@ def format_check_report(res: dict, fmt: str = "text") -> str:
 
     for d in diags:
         out.append(f"  error: {d}")
+    for sw in res.get("semantic_warnings", [])[:10]:
+        out.append(f"  warning: {sw}")
+    if cov and res.get("ranked_hotspots"):
+        for hs in res["ranked_hotspots"][:15]:
+            out.append(
+                f"  hotspot #{hs.get('rank')} [{hs.get('rule_id')}/{hs.get('severity')}] "
+                f"{hs.get('recommended_read')} :: {hs.get('summary')}"
+            )
 
     for sb in sig_blast:
         for mut in sb.get("mutations", [])[:4]:

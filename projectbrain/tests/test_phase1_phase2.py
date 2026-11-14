@@ -1689,15 +1689,17 @@ def test_nested_caller_deduplication_sarif_upload_and_v1_1_docs_sync(tmp_path: P
     except ImportError:
         pass
 
-    # 5. Repo-wide v1.2.0 docs, READMEs, and `server.py` docstring synchronization gate
+    # 5. Repo-wide v1.3.0 docs, READMEs, and `server.py` docstring synchronization gate
     repo_root = Path(__file__).resolve().parents[2]
     docs_html = (repo_root / "docs" / "index.html").read_text(encoding="utf-8")
-    assert "v1.2" in docs_html and "v1.2.0" in docs_html
-    assert "v1.0" not in docs_html and "v1.1" not in docs_html
+    assert "v1.3" in docs_html and "v1.3.0" in docs_html
+    assert "v1.0" not in docs_html and "v1.1" not in docs_html and "v1.2" not in docs_html
     for expected_doc_feature in (
         "init --team --learn",
         "projectbrain learn",
         "check --base main",
+        "check --audit",
+        "PB011",
         "Governance Tamper Lock",
         "SARIF v2.1.0",
         "pr-comment",
@@ -1707,14 +1709,14 @@ def test_nested_caller_deduplication_sarif_upload_and_v1_1_docs_sync(tmp_path: P
     server_first_line = (
         repo_root / "projectbrain" / "src" / "projectbrain" / "server.py"
     ).read_text(encoding="utf-8").splitlines()[0]
-    assert "v1.2" in server_first_line and "v1.0" not in server_first_line and "v1.1" not in server_first_line
+    assert "v1.3" in server_first_line and "v1.0" not in server_first_line and "v1.1" not in server_first_line and "v1.2" not in server_first_line
 
     root_readme_bytes = (repo_root / "README.md").read_bytes()
     sub_readme_bytes = (repo_root / "projectbrain" / "README.md").read_bytes()
     assert root_readme_bytes == sub_readme_bytes
     root_readme = root_readme_bytes.decode("utf-8")
-    assert "(220 tests)" not in root_readme and "(256 tests)" not in root_readme
-    assert "(260 tests)" in root_readme
+    assert "(220 tests)" not in root_readme and "(256 tests)" not in root_readme and "(260 tests)" not in root_readme
+    assert "(265 tests)" in root_readme
 
 
 

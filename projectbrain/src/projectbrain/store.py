@@ -2567,6 +2567,7 @@ class SQLiteIndexStore:
         extra_called_names: set[str] | None = None,
         boundary_src_globs: list | None = None,
         need_sql_schemas: bool = False,
+        need_http_routes: bool = False,
         symbols_changed: bool = False,
         mutated_node_ids: set[str] | None = None,
         min_repo_files: int = 200,
@@ -2719,6 +2720,24 @@ class SQLiteIndexStore:
                         r[0]
                         for r in cur.execute("SELECT rel_path FROM files WHERE has_sql = 1;").fetchall()
                     )
+                if need_http_routes:
+                    route_rels = [
+                        r[0]
+                        for r in cur.execute(
+                            "SELECT DISTINCT rel_path FROM graph_nodes WHERE node_type = 'route' AND rel_path != '' LIMIT 80;"
+                        ).fetchall()
+                    ]
+                    seed_rels.update(route_rels)
+                    if has_fimp and route_rels:
+                        ph_rt = ",".join("?" for _ in route_rels)
+                        seed_rels.update(
+                            r[0]
+                            for r in cur.execute(
+                                f"SELECT DISTINCT dst_rel FROM file_imports WHERE src_rel IN ({ph_rt}) LIMIT 120;",
+                                route_rels,
+                            ).fetchall()
+                            if r[0] in all_files
+                        )
 
                 has_if_col = "interface_hash" in cols
                 files_dict: dict[str, dict] = {}

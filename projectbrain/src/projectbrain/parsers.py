@@ -549,7 +549,411 @@ def _py_bases(cls_node) -> list[str]:
             attr = child.child_by_field_name("attribute")
             if attr:
                 result.append(_text(attr))
+        elif child.type == "subscript":
+            val = child.child_by_field_name("value")
+            if val:
+                if val.type == "identifier":
+                    result.append(_text(val))
+                elif val.type == "attribute":
+                    attr = val.child_by_field_name("attribute")
+                    if attr:
+                        result.append(_text(attr))
     return result
+
+
+_PY_SCHEMA_ROOT_BASES = frozenset({
+    "BaseModel", "SQLModel", "TypedDict", "Schema", "APIModel", "CamelModel", "ModelSchema",
+})
+_PY_INJECTED_ROUTE_TYPES = frozenset({
+    "Request", "Response", "BackgroundTasks", "WebSocket", "HTTPConnection",
+    "Session", "AsyncSession", "Connection", "Cursor", "UploadFile",
+    "SecurityScopes", "AuthCredentials", "HTTPAuthorizationCredentials",
+})
+_PY_SCALAR_QUERY_TYPES = frozenset({
+    "str", "int", "float", "bool", "bytes", "UUID", "Decimal", "date", "datetime", "time",
+})
+_PY_NON_SCHEMA_RETURN_TYPES = frozenset({
+    "Response", "JSONResponse", "ORJSONResponse", "UJSONResponse", "HTMLResponse",
+    "PlainTextResponse", "RedirectResponse", "StreamingResponse", "FileResponse",
+    "Any", "dict", "Dict", "list", "List", "tuple", "Tuple", "set", "Set",
+    "None", "bool", "str", "int", "float", "bytes", "object",
+})
+_PY_FIELD_ALIAS_RE = re.compile(
+    r"\b(?:validation_alias|serialization_alias|alias)\s*=\s*(?:AliasChoices\s*\(([^)]+)\)|['\"]([A-Za-z_][\w\-]*)['\"])"
+)
+_PY_STR_LIT_RE = re.compile(r"['\"]([A-Za-z_][\w\-]*)['\"]")
+_PY_INJECTED_CALL_RE = re.compile(r"\b(?:Depends|Security|Header|Cookie|Path|File|Form)\s*\(")
+
+
+def _is_optional_py_type(type_txt: str) -> bool:
+    t = type_txt.strip()
+    if not t:
+        return True
+    if "Optional[" in t or "NotRequired[" in t or "Any" == t or t.endswith(".Any"):
+        return True
+    if re.search(r"\bNone\b", t) and ("|" in t or "Union[" in t):
+        return True
+    return False
+
+
+def _is_field_rhs_optional(rhs_txt: str) -> bool:
+    """Return True if an attribute default RHS makes the schema field optional."""
+    r = rhs_txt.strip()
+    if not r:
+        return False
+    m_f = re.match(r"^(?:[\w.]*\.)?(?:Field|field)\s*\(([\s\S]*)\)$", r)
+    if not m_f:
+        return r != "..."
+    inner = m_f.group(1).strip()
+    if not inner:
+        return False
+    if re.search(r"\b(?:default|default_factory)\s*=\s*(?!\.\.\.\b)", inner):
+        return True
+    # Inspect first positional argument (before any top-level comma or `=`)
+    depth = 0
+    in_str: str | None = None
+    first_tok_chars: list[str] = []
+    for ch in inner:
+        if in_str:
+            first_tok_chars.append(ch)
+            if ch == in_str:
+                in_str = None
+        else:
+            if ch in ("'", '"'):
+                in_str = ch
+                first_tok_chars.append(ch)
+            elif ch in ("(", "[", "{"):
+                depth += 1
+                first_tok_chars.append(ch)
+            elif ch in (")", "]", "}"):
+                depth = max(0, depth - 1)
+                first_tok_chars.append(ch)
+            elif ch == "," and depth == 0:
+                break
+            else:
+                first_tok_chars.append(ch)
+    first_arg = "".join(first_tok_chars).strip()
+    if not first_arg or "=" in first_arg:
+        return False
+    return first_arg != "..."
+
+
+def _extract_py_schema_spec(
+    cls_node,
+    bases: list[str],
+    body_node,
+    method_names: list[str],
+) -> dict | None:
+    """Extract structured Pydantic / SQLModel / TypedDict / dataclass field contracts."""
+    if not body_node:
+        return None
+    is_dataclass = False
+    if cls_node.parent and cls_node.parent.type == "decorated_definition":
+        for dec in cls_node.parent.children:
+            if dec.type == "decorator" and re.search(r"\bdataclass\b", _text(dec)):
+                is_dataclass = True
+                break
+    sup_node = cls_node.child_by_field_name("superclasses") or cls_node.child_by_field_name("bases")
+    sup_txt = _collapse_ws(_text(sup_node)) if sup_node else ""
+    total_false = bool(re.search(r"\btotal\s*=\s*False\b", sup_txt))
+    is_table_model = bool(re.search(r"\btable\s*=\s*True\b", sup_txt))
+    direct_roots = set(bases) & _PY_SCHEMA_ROOT_BASES
+    is_direct_schema = bool(direct_roots) or is_dataclass
+
+    required_fields: list[str] = []
+    optional_fields: list[str] = []
+    field_aliases: dict[str, list[str]] = {}
+    computed_fields: list[str] = []
+    populate_by_name = "CamelModel" in bases
+    has_alias_generator = "CamelModel" in bases
+    extra_policy = "ignore"
+    has_custom_serializer = any(m in ("model_dump", "dict") for m in method_names)
+
+    for child in body_node.children:
+        if child.type == "decorated_definition":
+            decs = [_collapse_ws(_text(c)) for c in child.children if c.type == "decorator"]
+            defn = child.child_by_field_name("definition")
+            if defn and defn.type == "function_definition":
+                nm_n = defn.child_by_field_name("name")
+                m_nm = _text(nm_n) if nm_n else ""
+                if any("model_serializer" in d for d in decs):
+                    has_custom_serializer = True
+                elif m_nm and not m_nm.startswith("_") and any(
+                    re.search(r"\b(?:computed_field|property)\b", d) for d in decs
+                ):
+                    if m_nm not in computed_fields:
+                        computed_fields.append(m_nm)
+            continue
+        if child.type == "class_definition":
+            c_nm = child.child_by_field_name("name")
+            if c_nm and _text(c_nm) == "Config":
+                cfg_txt = _collapse_ws(_text(child))
+                if re.search(r"\b(?:allow_population_by_field_name|populate_by_name)\s*=\s*True\b", cfg_txt):
+                    populate_by_name = True
+                if "alias_generator" in cfg_txt:
+                    has_alias_generator = True
+                if re.search(r"\bextra\s*=\s*(?:['\"]allow['\"]|Extra\.allow)\b", cfg_txt):
+                    extra_policy = "allow"
+                elif re.search(r"\bextra\s*=\s*(?:['\"]forbid['\"]|Extra\.forbid)\b", cfg_txt):
+                    extra_policy = "forbid"
+            continue
+        if child.type != "expression_statement":
+            continue
+        for sub in child.children:
+            if sub.type != "assignment":
+                continue
+            left = sub.child_by_field_name("left")
+            typ = sub.child_by_field_name("type")
+            right = sub.child_by_field_name("right")
+            if not left or left.type != "identifier":
+                continue
+            fname = _text(left)
+            rhs_txt = _collapse_ws(_text(right)) if right else ""
+            if fname == "model_config":
+                if re.search(r"\bpopulate_by_name\s*=\s*True\b", rhs_txt):
+                    populate_by_name = True
+                if "alias_generator" in rhs_txt:
+                    has_alias_generator = True
+                if re.search(r"\bextra\s*=\s*['\"]allow['\"]", rhs_txt):
+                    extra_policy = "allow"
+                elif re.search(r"\bextra\s*=\s*['\"]forbid['\"]", rhs_txt):
+                    extra_policy = "forbid"
+                continue
+            if fname.startswith("_") or not typ:
+                continue
+            type_txt = _collapse_ws(_text(typ))
+            if "ClassVar" in type_txt or "PrivateAttr" in rhs_txt or "Relationship(" in rhs_txt:
+                continue
+            if rhs_txt:
+                aliases_found: list[str] = []
+                for m_al in _PY_FIELD_ALIAS_RE.finditer(rhs_txt):
+                    if m_al.group(1):
+                        for s_lit in _PY_STR_LIT_RE.findall(m_al.group(1)):
+                            if s_lit not in aliases_found:
+                                aliases_found.append(s_lit)
+                    elif m_al.group(2) and m_al.group(2) not in aliases_found:
+                        aliases_found.append(m_al.group(2))
+                if aliases_found:
+                    field_aliases[fname] = aliases_found
+
+            is_opt = (
+                total_false
+                or _is_optional_py_type(type_txt)
+                or (is_table_model and fname in ("id", "pk", "created_at", "updated_at"))
+                or (bool(rhs_txt) and _is_field_rhs_optional(rhs_txt))
+            )
+            if is_opt:
+                if fname not in optional_fields and fname not in required_fields:
+                    optional_fields.append(fname)
+            else:
+                if fname not in required_fields and fname not in optional_fields:
+                    required_fields.append(fname)
+
+    has_fields = bool(required_fields or optional_fields or computed_fields)
+    if not is_direct_schema:
+        # Only retain candidate schema metadata for subclasses of another class (e.g. `OrderCreate(OrderBase)`)
+        if not bases or "__init__" in method_names or not has_fields:
+            return None
+
+    kind = (
+        "typed_dict" if "TypedDict" in direct_roots
+        else ("dataclass" if is_dataclass else "pydantic")
+    )
+    spec: dict = {
+        "kind": kind,
+        "is_direct_schema": is_direct_schema,
+        "required_fields": required_fields[:60],
+        "optional_fields": optional_fields[:60],
+    }
+    if field_aliases:
+        spec["field_aliases"] = field_aliases
+    if computed_fields:
+        spec["computed_fields"] = computed_fields[:30]
+    if populate_by_name:
+        spec["populate_by_name"] = True
+    if has_alias_generator:
+        spec["has_alias_generator"] = True
+    if extra_policy != "ignore":
+        spec["extra_policy"] = extra_policy
+    if has_custom_serializer:
+        spec["has_custom_serializer"] = True
+    if is_table_model:
+        spec["is_table_model"] = True
+    return spec
+
+
+def _unwrap_model_type_expr(raw_type: str) -> tuple[str | None, bool, bool]:
+    """Unwrap `OrderOut`, `schemas.OrderOut`, `list[OrderOut]` -> `(model_name, is_list, is_dynamic)`."""
+    t = raw_type.strip().strip("'\"")
+    if not t:
+        return None, False, False
+    m_ann = re.match(r"^(?:typing\.)?Annotated\[\s*([^,\]]+)", t)
+    if m_ann:
+        t = m_ann.group(1).strip()
+    if "|" in t or "Union[" in t or "Optional[" in t:
+        return None, False, True
+    m_list = re.match(r"^(?:list|List|Sequence|Iterable)\[\s*([^\[\],]+)\s*\]$", t)
+    is_list = False
+    if m_list:
+        t = m_list.group(1).strip()
+        is_list = True
+    base = t.rsplit(".", 1)[-1].split("[", 1)[0].strip()
+    if not base or base in _PY_NON_SCHEMA_RETURN_TYPES:
+        return None, is_list, True
+    if base[:1].isupper() and base.isidentifier():
+        return base, is_list, False
+    return None, is_list, True
+
+
+def _extract_py_route_contract(
+    verb: str,
+    full_path: str,
+    args_node,
+    func_node,
+) -> dict:
+    """Extract FastAPI/Flask route `body_schema`, `response_schema`, and `required_query_params`."""
+    info: dict = {}
+    resp_model: str | None = None
+    resp_is_list = False
+    resp_dynamic = False
+    resp_filtered = False
+
+    if args_node is not None:
+        for ch in args_node.children:
+            if ch.type != "keyword_argument":
+                continue
+            kn = ch.child_by_field_name("name")
+            vn = ch.child_by_field_name("value")
+            if not (kn and vn):
+                continue
+            k_txt = _text(kn)
+            v_txt = _collapse_ws(_text(vn))
+            if k_txt == "response_model":
+                resp_model, resp_is_list, resp_dynamic = _unwrap_model_type_expr(v_txt)
+            elif k_txt in ("response_model_exclude", "response_model_include") and v_txt not in ("None", "set()", "{}"):
+                resp_filtered = True
+
+    if func_node is None or func_node.type != "function_definition":
+        return info
+
+    if resp_model is None and not resp_dynamic:
+        ret_n = func_node.child_by_field_name("return_type")
+        if ret_n is not None:
+            resp_model, resp_is_list, _ = _unwrap_model_type_expr(_collapse_ws(_text(ret_n)))
+
+    if resp_model and not resp_filtered:
+        info["response_schema"] = resp_model
+        if resp_is_list:
+            info["response_is_list"] = True
+    elif resp_dynamic or resp_filtered:
+        info["response_is_dynamic"] = True
+
+    params_node = func_node.child_by_field_name("parameters")
+    if params_node is None:
+        return info
+
+    path_params = set(re.findall(r"\{([A-Za-z_]\w*)", full_path))
+    req_query: list[str] = []
+    body_candidates: list[tuple[str, str]] = []
+    body_dynamic = False
+
+    for p_ch in params_node.children:
+        pt = p_ch.type
+        if pt in ("(", ")", ",", "*", "/", "list_splat_pattern"):
+            continue
+        if pt == "dictionary_splat_pattern":
+            body_dynamic = True
+            continue
+        p_name = ""
+        p_type = ""
+        p_def = ""
+        if pt == "identifier":
+            p_name = _text(p_ch)
+        elif pt == "typed_parameter":
+            for sc in p_ch.children:
+                if sc.type == "identifier" and not p_name:
+                    p_name = _text(sc)
+                elif sc.type == "type":
+                    p_type = _collapse_ws(_text(sc))
+                elif sc.type in ("list_splat_pattern", "dictionary_splat_pattern"):
+                    p_name = ""
+                    if sc.type == "dictionary_splat_pattern":
+                        body_dynamic = True
+                    break
+        elif pt == "default_parameter":
+            nn = p_ch.child_by_field_name("name")
+            vn = p_ch.child_by_field_name("value")
+            p_name = _text(nn) if nn else ""
+            p_def = _collapse_ws(_text(vn)) if vn else ""
+        elif pt == "typed_default_parameter":
+            nn = p_ch.child_by_field_name("name")
+            tn = p_ch.child_by_field_name("type")
+            vn = p_ch.child_by_field_name("value")
+            p_name = _text(nn) if nn else ""
+            p_type = _collapse_ws(_text(tn)) if tn else ""
+            p_def = _collapse_ws(_text(vn)) if vn else ""
+
+        if not p_name or p_name in ("self", "cls") or p_name in path_params:
+            continue
+        combined_meta = f"{p_type} = {p_def}"
+        if _PY_INJECTED_CALL_RE.search(combined_meta):
+            continue
+        unwrapped_t = p_type
+        m_ann_p = re.match(r"^(?:typing\.)?Annotated\[\s*([^,\]]+)\s*,\s*([\s\S]+)\]$", p_type)
+        ann_extra = ""
+        if m_ann_p:
+            unwrapped_t = m_ann_p.group(1).strip()
+            ann_extra = m_ann_p.group(2).strip()
+        bare_t = unwrapped_t.rsplit(".", 1)[-1].split("[", 1)[0].strip()
+        if bare_t in _PY_INJECTED_ROUTE_TYPES or (bare_t.endswith("Dep") and "Body(" not in combined_meta):
+            continue
+
+        is_query_explicit = "Query(" in p_def or "Query(" in ann_extra
+        is_body_explicit = "Body(" in p_def or "Body(" in ann_extra
+        if is_query_explicit or (not is_body_explicit and (bare_t in _PY_SCALAR_QUERY_TYPES or bare_t == "Literal")):
+            if not _is_optional_py_type(unwrapped_t):
+                q_rhs = p_def or (ann_extra if is_query_explicit else "")
+                is_q_opt = False
+                if q_rhs:
+                    if "Query(" in q_rhs:
+                        m_qi = re.search(r"Query\s*\(([\s\S]*)\)", q_rhs)
+                        qi = m_qi.group(1).strip() if m_qi else ""
+                        if re.search(r"\b(?:default|default_factory)\s*=\s*(?!\.\.\.\b)", qi):
+                            is_q_opt = True
+                        elif qi and not qi.startswith("...") and "=" not in qi.split(",", 1)[0]:
+                            is_q_opt = True
+                    else:
+                        is_q_opt = q_rhs != "..."
+                if not is_q_opt:
+                    m_qa = re.search(r"\balias\s*=\s*['\"]([A-Za-z_][\w\-]*)['\"]", combined_meta)
+                    q_wire = m_qa.group(1) if m_qa else p_name
+                    if q_wire not in req_query:
+                        req_query.append(q_wire)
+            continue
+
+        if verb in ("POST", "PUT", "PATCH", "DELETE"):
+            if not unwrapped_t or bare_t in ("dict", "Dict", "Any", "list", "List"):
+                body_dynamic = True
+                continue
+            if re.search(r"\bembed\s*=\s*True\b", combined_meta):
+                body_dynamic = True
+                continue
+            cand_m, cand_is_list, cand_dyn = _unwrap_model_type_expr(unwrapped_t)
+            if cand_dyn or cand_is_list or not cand_m:
+                body_dynamic = True
+            else:
+                body_candidates.append((p_name, cand_m))
+
+    if req_query:
+        info["required_query_params"] = req_query[:20]
+    if body_dynamic:
+        info["body_is_dynamic"] = True
+    elif len(body_candidates) == 1:
+        info["body_schema"] = body_candidates[0][1]
+        info["body_param"] = body_candidates[0][0]
+    elif len(body_candidates) > 1:
+        info["multi_body_keys"] = [p for p, _ in body_candidates]
+    return info
 
 
 def _flask_methods(arg_list_node) -> list[str]:
@@ -931,10 +1335,11 @@ def _parse_python(root) -> dict:
                 method_to_class[meth_node.start_point] = cls_name
 
         fields = _py_class_fields(body_node)
+        schema_spec = _extract_py_schema_spec(cls_node, bases, body_node, method_names)
         base_str = f"({', '.join(bases)})" if bases else ""
         cls_sig = f"class {cls_name}{base_str}:"
 
-        classes.append({
+        cls_entry: dict = {
             "name": cls_name,
             "line_start": _line(cls_node),
             "line_end": _end_line(cls_node),
@@ -945,7 +1350,10 @@ def _parse_python(root) -> dict:
             "fields": fields,
             "interface_hash": _ast_hash(f"{cls_sig}|{'|'.join(method_names)}|{'|'.join(fields)}"),
             "ast_hash": _ast_hash(_text(cls_node)),
-        })
+        }
+        if schema_spec:
+            cls_entry["schema_spec"] = schema_spec
+        classes.append(cls_entry)
 
     # Phase 2 — all functions
     root_span = max(1, _end_line(root) - _line(root))
@@ -1092,10 +1500,19 @@ def _parse_python(root) -> dict:
             rk = (method.upper(), full_path, handler)
             if rk not in seen_routes:
                 seen_routes.add(rk)
-                routes.append({
+                r_entry = {
                     "method": method.upper(), "path": path, "full_path": full_path,
                     "handler": handler, "line": line, "framework": "fastapi",
-                })
+                }
+                r_contract = _extract_py_route_contract(
+                    method.upper(),
+                    full_path,
+                    a_nodes[0] if a_nodes else None,
+                    h_nodes[0].parent,
+                )
+                if r_contract:
+                    r_entry.update(r_contract)
+                routes.append(r_entry)
         elif method == "route" and a_nodes:
             for verb in _flask_methods(a_nodes[0]):
                 rk = (verb, full_path, handler)
@@ -1277,6 +1694,36 @@ def _js_class_fields(body_node) -> list[str]:
     return fields[:25]
 
 
+def _js_parse_ts_prop_fields(body_node) -> tuple[list[str], list[str], list[str], str]:
+    """Return `(raw_fields, required_fields, optional_fields, extra_policy)` from TS object/interface body."""
+    raw_fields: list[str] = []
+    req_f: list[str] = []
+    opt_f: list[str] = []
+    extra_policy = "ignore"
+    if not body_node:
+        return raw_fields, req_f, opt_f, extra_policy
+    for prop in body_node.children:
+        if prop.type == "index_signature":
+            extra_policy = "allow"
+            continue
+        if prop.type not in ("property_signature", "method_signature"):
+            continue
+        txt = _collapse_ws(_text(prop)).rstrip(";,").strip()
+        raw_fields.append(txt)
+        if prop.type == "property_signature":
+            nm_n = prop.child_by_field_name("name")
+            p_nm = _text(nm_n).strip("'\"") if nm_n else ""
+            if p_nm and p_nm.isidentifier():
+                has_q = any(c.type == "?" for c in prop.children) or "| undefined" in txt
+                if has_q:
+                    if p_nm not in opt_f:
+                        opt_f.append(p_nm)
+                else:
+                    if p_nm not in req_f:
+                        req_f.append(p_nm)
+    return raw_fields[:25], req_f[:60], opt_f[:60], extra_policy
+
+
 def _js_extract_ts_interfaces_and_types(root) -> list[dict]:
     """Extract TypeScript interface_declaration and type_alias_declaration as schema classes."""
     schemas: list[dict] = []
@@ -1291,24 +1738,64 @@ def _js_extract_ts_interfaces_and_types(root) -> list[dict]:
             body_node = node.child_by_field_name("body")
             if name_node:
                 name = _text(name_node)
-                fields = []
-                if body_node:
-                    for prop in body_node.children:
-                        if prop.type in ("property_signature", "method_signature"):
-                            fields.append(_collapse_ws(_text(prop)).rstrip(";,").strip())
-                f_list = fields[:25]
-                schemas.append({
+                bases: list[str] = []
+                for hc in node.children:
+                    if hc.type == "extends_type_clause":
+                        for tc in hc.children:
+                            if tc.type in ("type_identifier", "identifier"):
+                                bases.append(_text(tc))
+                f_list, req_f, opt_f, extra_pol = _js_parse_ts_prop_fields(body_node)
+                sc_entry: dict = {
                     "name": name,
                     "line_start": _line(node),
                     "line_end": _end_line(node),
                     "signature": f"interface {name}",
-                    "bases": [],
+                    "bases": bases,
                     "methods": [],
                     "fields": f_list,
                     "is_interface": True,
                     "interface_hash": _ast_hash(f"interface {name}|{'|'.join(f_list)}"),
                     "ast_hash": _ast_hash(_text(node)),
-                })
+                }
+                if req_f or opt_f or bases:
+                    spec_d: dict = {
+                        "kind": "ts_interface",
+                        "is_direct_schema": True,
+                        "required_fields": req_f,
+                        "optional_fields": opt_f,
+                    }
+                    if extra_pol != "ignore":
+                        spec_d["extra_policy"] = extra_pol
+                    sc_entry["schema_spec"] = spec_d
+                schemas.append(sc_entry)
+        elif node.type == "type_alias_declaration":
+            name_node = node.child_by_field_name("name")
+            val_node = node.child_by_field_name("value")
+            if name_node and val_node and val_node.type == "object_type":
+                name = _text(name_node)
+                f_list, req_f, opt_f, extra_pol = _js_parse_ts_prop_fields(val_node)
+                if req_f or opt_f:
+                    spec_t: dict = {
+                        "kind": "ts_interface",
+                        "is_direct_schema": True,
+                        "required_fields": req_f,
+                        "optional_fields": opt_f,
+                    }
+                    if extra_pol != "ignore":
+                        spec_t["extra_policy"] = extra_pol
+                    schemas.append({
+                        "name": name,
+                        "line_start": _line(node),
+                        "line_end": _end_line(node),
+                        "signature": f"type {name}",
+                        "bases": [],
+                        "methods": [],
+                        "fields": f_list,
+                        "is_interface": True,
+                        "schema_spec": spec_t,
+                        "interface_hash": _ast_hash(f"type {name}|{'|'.join(f_list)}"),
+                        "ast_hash": _ast_hash(_text(node)),
+                    })
     return schemas
 
 
@@ -1673,6 +2160,7 @@ def _parse_js(root, lang: Language) -> dict:
 
     # Phase 2 — standard declarations, arrow declarators, and class methods
     seen_fn_keys: set[tuple[str | None, str, int]] = set()
+    fn_raw_pairs: list[tuple[dict, str]] = []
     for func_node in func_nodes:
         name_node = func_node.child_by_field_name("name")
         if not name_node:
@@ -1727,6 +2215,7 @@ def _parse_js(root, lang: Language) -> dict:
         if is_nested_fn:
             entry["is_nested"] = True
         functions.append(entry)
+        fn_raw_pairs.append((entry, fn_body_raw))
 
     # Phase 2b — CommonJS / prototype / object method assignments (`res.send = function...`,
     # `exports.foo = ...`, `View.prototype.lookup = ...`) and `defineGetter(obj, 'prop', fn)`
@@ -1745,15 +2234,15 @@ def _parse_js(root, lang: Language) -> dict:
             rhs_n = curr
             if rhs_n is None:
                 continue
-            if rhs_n.type == "identifier":
+            if rhs_n.type not in ("function_expression", "arrow_function", "generator_function"):
                 for l_n in lhs_list:
                     lt = _collapse_ws(_text(l_n))
-                    if lt in ("module.exports", "exports"):
+                    if rhs_n.type == "identifier" and lt in ("module.exports", "exports"):
                         assigned_exports.append(_text(rhs_n))
                     elif lt.startswith(("module.exports.", "exports.")):
-                        assigned_exports.append(lt.split(".", 2)[-1])
-                continue
-            if rhs_n.type not in ("function_expression", "arrow_function", "generator_function"):
+                        after_exp = lt[15:] if lt.startswith("module.exports.") else lt[8:]
+                        if after_exp != "prototype" and re.fullmatch(r"[A-Za-z_$][\w$]*", after_exp):
+                            assigned_exports.append(after_exp)
                 continue
             l_start = _line(stmt)
             l_end = _end_line(stmt)
@@ -1932,6 +2421,9 @@ def _parse_js(root, lang: Language) -> dict:
             if u_tgt and u_tgt not in ("express", "cors", "json", "urlencoded", "helmet"):
                 js_router_mounts.append({"target": u_tgt, "prefix": u_pref})
 
+    if fn_raw_pairs:
+        _annotate_js_state_and_http_wrappers(fn_raw_pairs)
+
     js_out: dict = {
         "functions": functions,
         "classes": classes,
@@ -1946,7 +2438,215 @@ def _parse_js(root, lang: Language) -> dict:
     return js_out
 
 
-# ── SQL schema & function parser ────────────────────────────────────────────
+_JS_STATE_HOOKS = frozenset({"useState", "useReducer", "useForm", "useImmer"})
+_JS_URL_TEMPLATE_CLEAN_RE = re.compile(r"\$\{[^}]+\}|:[a-zA-Z_]\w*")
+_JS_PARAM_IDENT_ONLY_RE = re.compile(r"^[A-Za-z_$][\w$]*$")
+
+
+def _js_simple_param_names(params_str: str) -> list[str | None]:
+    inner = params_str.strip()
+    if inner.startswith("(") and inner.endswith(")"):
+        inner = inner[1:-1].strip()
+    if not inner:
+        return []
+    parts: list[str] = []
+    depth = 0
+    cur: list[str] = []
+    for ch in inner:
+        if ch in ("(", "[", "{", "<"):
+            depth += 1
+            cur.append(ch)
+        elif ch in (")", "]", "}", ">"):
+            depth = max(0, depth - 1)
+            cur.append(ch)
+        elif ch == "," and depth == 0:
+            parts.append("".join(cur).strip())
+            cur = []
+        else:
+            cur.append(ch)
+    if cur:
+        parts.append("".join(cur).strip())
+    out: list[str | None] = []
+    for p in parts:
+        if not p or p.startswith("..."):
+            out.append(None)
+            continue
+        lhs = p.split("=", 1)[0].split(":", 1)[0].strip().rstrip("?").strip()
+        out.append(lhs if _JS_PARAM_IDENT_ONLY_RE.match(lhs) else None)
+    return out
+
+
+def _annotate_js_state_and_http_wrappers(fn_pairs: list[tuple[dict, str]]) -> None:
+    """Annotate JS/TS function entries in-place with `has_local_state` and `http_wrapper_spec`."""
+    transport_helpers: dict[str, dict] = {}
+    # Pass 1: file-local generic HTTP transport helpers (`postJson(url, data)`, `apiRequest(path, opts)`)
+    for entry, raw_b in fn_pairs:
+        calls = entry.get("calls") or ()
+        if any(h in _JS_STATE_HOOKS for h in calls) or (
+            ("<input" in raw_b or "<textarea" in raw_b)
+            and ("defaultValue=" in raw_b or "defaultChecked=" in raw_b)
+        ):
+            entry["has_local_state"] = True
+
+        p_names = _js_simple_param_names(entry.get("params", ""))
+        if not p_names or not p_names[0]:
+            continue
+        p0 = p_names[0]
+        if not (
+            "fetch(" in raw_b
+            or re.search(r"\b(?:axios|api|client|http|httpClient|apiClient)\.(?:get|post|put|patch|delete|request)\s*\(", raw_b)
+        ):
+            continue
+        # Parameter p0 must flow into URL argument rather than a fixed '/api/...' string
+        uses_p0_url = bool(
+            re.search(rf"\bfetch\s*\([^,)]*\b{re.escape(p0)}\b", raw_b)
+            or re.search(rf"\.(?:get|post|put|patch|delete|request)\s*\([^,)]*\b{re.escape(p0)}\b", raw_b)
+        )
+        if not uses_p0_url:
+            continue
+        fn_nm = entry["name"]
+        m_vb_nm = re.match(r"^(get|post|put|patch|delete)", fn_nm, re.IGNORECASE)
+        fixed_verb: str | None = m_vb_nm.group(1).upper() if m_vb_nm else None
+        if not fixed_verb:
+            m_ax_v = re.search(r"\.(get|post|put|patch|delete)\s*\(", raw_b, re.IGNORECASE)
+            if m_ax_v:
+                fixed_verb = m_ax_v.group(1).upper()
+            else:
+                m_fm = re.search(r"\bmethod\s*:\s*['\"]([A-Za-z]+)['\"]", raw_b)
+                if m_fm and not any(pn and pn.lower() in ("method", "options", "opts", "init") for pn in p_names[1:]):
+                    fixed_verb = m_fm.group(1).upper()
+        body_idx: int | None = None
+        opts_idx: int | None = None
+        for idx_p in range(1, len(p_names)):
+            pn = p_names[idx_p]
+            if not pn:
+                continue
+            if re.search(rf"JSON\.stringify\s*\(\s*{re.escape(pn)}\s*\)", raw_b) or re.search(
+                rf"\.(?:post|put|patch)\s*\([^,]+,\s*{re.escape(pn)}\s*[,)]", raw_b
+            ):
+                body_idx = idx_p
+            elif pn.lower() in ("options", "opts", "init", "config") or re.search(
+                rf"\bfetch\s*\([^,]+,\s*(?:\{{\s*\.\.\.{re.escape(pn)}|{re.escape(pn)}\s*\))", raw_b
+            ):
+                opts_idx = idx_p
+        returns_json = bool(".json()" in raw_b or re.search(r"\.\s*data\b", raw_b))
+        t_spec = {
+            "fixed_method": fixed_verb,
+            "body_param_idx": body_idx,
+            "opts_param_idx": opts_idx,
+            "returns_json": returns_json,
+        }
+        transport_helpers[fn_nm] = t_spec
+        entry["http_transport_spec"] = t_spec
+
+    # Pass 2: concrete single-endpoint client functions (`createInvoice(payload)`, `fetchOrders()`)
+    for entry, raw_b in fn_pairs:
+        fn_nm = entry["name"]
+        if fn_nm in transport_helpers or (fn_nm[:1].isupper() and ("</" in raw_b or "/>" in raw_b)):
+            continue
+        if "/" not in raw_b:
+            continue
+        p_names = _js_simple_param_names(entry.get("params", ""))
+        hits: list[tuple[str, str, int | None, bool]] = []
+
+        # 2A. Direct fetch(...)
+        for m_fe in re.finditer(
+            r"\bfetch\s*\(\s*(?:[A-Za-z_$][\w$.]*\s*\+\s*)?[`'\"](?:\$\{[^{}`]+\})*(/[A-Za-z0-9_/\-${}:.]+)(?:\?[^`'\"]*)?[`'\"](?:\s*,\s*\{([\s\S]{0,320}?)\})?",
+            raw_b,
+        ):
+            u_raw = m_fe.group(1)
+            opts_s = m_fe.group(2) or ""
+            m_mv = re.search(r"\bmethod\s*:\s*['\"]([A-Za-z]+)['\"]", opts_s)
+            vb = m_mv.group(1).upper() if m_mv else "GET"
+            b_idx: int | None = None
+            m_bs = re.search(r"\bbody\s*:\s*JSON\.stringify\s*\(\s*([A-Za-z_$][\w$]*)\s*\)", opts_s)
+            if m_bs and m_bs.group(1) in p_names:
+                b_idx = p_names.index(m_bs.group(1))
+            hits.append((vb, u_raw, b_idx, ".json()" in raw_b))
+
+        # 2B. Direct axios/api/client.<verb>(...)
+        for m_ax in re.finditer(
+            r"\b(?:axios|api|client|http|httpClient|apiClient)\.(get|post|put|patch|delete)\s*\(\s*(?:[A-Za-z_$][\w$.]*\s*\+\s*)?[`'\"](?:\$\{[^{}`]+\})*(/[A-Za-z0-9_/\-${}:.]+)(?:\?[^`'\"]*)?[`'\"](?:\s*,\s*([A-Za-z_$][\w$]*))?",
+            raw_b,
+            re.IGNORECASE,
+        ):
+            vb = m_ax.group(1).upper()
+            u_raw = m_ax.group(2)
+            arg2 = m_ax.group(3)
+            b_idx = p_names.index(arg2) if (vb in ("POST", "PUT", "PATCH") and arg2 and arg2 in p_names) else None
+            ret_j = bool(re.search(r"\.\s*data\b", raw_b))
+            hits.append((vb, u_raw, b_idx, ret_j))
+
+        # 2C. File-local transport helper call (`return postJson('/api/v1/orders', payload)`)
+        if not hits and transport_helpers:
+            for h_nm, h_spec in transport_helpers.items():
+                for m_hc in re.finditer(
+                    rf"\b{re.escape(h_nm)}\s*\(\s*[`'\"](?:\$\{{[^{{}}`]+\}})*(/[A-Za-z0-9_/\-${{}}:.]+)(?:\?[^`'\"]*)?[`'\"](?:\s*,\s*([\s\S]{{0,260}}?))?\)",
+                    raw_b,
+                ):
+                    u_raw = m_hc.group(1)
+                    rest = (m_hc.group(2) or "").strip()
+                    vb = h_spec["fixed_method"] or ""
+                    b_idx = None
+                    if not vb and rest.startswith("{"):
+                        m_mv2 = re.search(r"\bmethod\s*:\s*['\"]([A-Za-z]+)['\"]", rest)
+                        vb = m_mv2.group(1).upper() if m_mv2 else "GET"
+                        m_bs2 = re.search(r"\bbody\s*:\s*(?:JSON\.stringify\s*\(\s*)?([A-Za-z_$][\w$]*)", rest)
+                        if m_bs2 and m_bs2.group(1) in p_names:
+                            b_idx = p_names.index(m_bs2.group(1))
+                    else:
+                        vb = vb or "GET"
+                        if h_spec["body_param_idx"] == 1:
+                            first_rest = rest.split(",", 1)[0].strip()
+                            if first_rest in p_names:
+                                b_idx = p_names.index(first_rest)
+                    hits.append((vb, u_raw, b_idx, h_spec["returns_json"]))
+
+        if len(hits) == 1:
+            vb, u_raw, b_idx, ret_j = hits[0]
+            norm_u = _JS_URL_TEMPLATE_CLEAN_RE.sub("{*}", u_raw).rstrip("/") or "/"
+            w_spec: dict = {
+                "method": vb,
+                "url": u_raw,
+                "norm_url": norm_u,
+                "returns_json": ret_j,
+            }
+            if b_idx is not None:
+                w_spec["body_param_idx"] = b_idx
+            entry["http_wrapper_spec"] = w_spec
+        elif not hits:
+            # 2D. Cross-file imported transport helper candidate (`return await postJson('/api/v1/orders', body)`)
+            ext_hits: list[dict] = []
+            _NON_HTTP_CALLEES = {
+                "if", "for", "while", "switch", "catch", "return", "throw", "typeof",
+                "import", "require", "navigate", "redirect", "replace", "push",
+                "join", "resolve", "match", "startsWith", "endsWith", "includes",
+            }
+            for m_ext in re.finditer(
+                r"\b([A-Za-z_$][\w$]*)\s*\(\s*(?:[A-Za-z_$][\w$.]*\s*\+\s*)?[`'\"](?:\$\{[^{}`]+\})*(/[A-Za-z0-9_/\-${}:.]+)(?:\?[^`'\"]*)?[`'\"](?:\s*,\s*([\s\S]{0,260}?))?\)",
+                raw_b,
+            ):
+                callee_nm = m_ext.group(1)
+                if callee_nm in _NON_HTTP_CALLEES or callee_nm == fn_nm or callee_nm[:1].isupper():
+                    continue
+                u_raw = m_ext.group(2)
+                rest = (m_ext.group(3) or "").strip()
+                norm_u = _JS_URL_TEMPLATE_CLEAN_RE.sub("{*}", u_raw).rstrip("/") or "/"
+                pend: dict = {"callee": callee_nm, "url": u_raw, "norm_url": norm_u}
+                if rest.startswith("{"):
+                    m_mv3 = re.search(r"\bmethod\s*:\s*['\"]([A-Za-z]+)['\"]", rest)
+                    if m_mv3:
+                        pend["inline_method"] = m_mv3.group(1).upper()
+                    m_bs3 = re.search(r"\bbody\s*:\s*(?:JSON\.stringify\s*\(\s*)?([A-Za-z_$][\w$]*)", rest)
+                    if m_bs3 and m_bs3.group(1) in p_names:
+                        pend["inline_body_param_idx"] = p_names.index(m_bs3.group(1))
+                elif rest:
+                    first_rest = rest.split(",", 1)[0].strip()
+                    if first_rest in p_names:
+                        pend["arg1_param_idx"] = p_names.index(first_rest)
+                ext_hits.append(pend)
+            if len(ext_hits) == 1:
+                entry["http_pending_transport_call"] = ext_hits[0]
 
 def extract_sql_table_schemas(source: str) -> dict[str, dict]:
     """Extract CREATE TABLE definitions (columns, NOT NULL without DEFAULT) from SQL or inline strings."""

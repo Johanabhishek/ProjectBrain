@@ -951,8 +951,10 @@ class ProjectBrain:
         *,
         base_ref: str | None = None,
         allow_governance_change: bool = False,
+        audit: bool = False,
+        scope_glob: str | None = None,
     ) -> dict:
-        """Unified verification gate: checks claims, validates plans, and audits working-tree or PR merge-base diffs."""
+        """Unified verification gate: checks claims, validates plans, audits diffs, or runs whole-repo semantic triage."""
         return _verify_run_check(
             self,
             files_modified=files_modified,
@@ -961,6 +963,8 @@ class ProjectBrain:
             task=task,
             base_ref=base_ref,
             allow_governance_change=allow_governance_change,
+            audit=audit,
+            scope_glob=scope_glob,
         )
 
     def learn(
@@ -1131,8 +1135,12 @@ class ProjectBrain:
         task: str,
         focus_files: set[str],
         strict_focus: bool = False,
+        *,
+        skip_http_schemas: bool = False,
     ) -> tuple[list[str], list[str]]:
-        return _compile_6d_contract_diagnostics_fn(self, task, focus_files, strict_focus=strict_focus)
+        return _compile_6d_contract_diagnostics_fn(
+            self, task, focus_files, strict_focus=strict_focus, skip_http_schemas=skip_http_schemas,
+        )
 
     def _score_class_for_query(self, cls: dict, keywords: list[str]) -> float:
         from .dossier import score_class_for_query
@@ -2618,8 +2626,9 @@ class ProjectBrain:
             counts[status] = counts.get(status, 0) + 1
         return counts
 
-    def health(self) -> dict:
-        self._ensure_fresh()
+    def health(self, *, _already_fresh: bool = False) -> dict:
+        if not _already_fresh:
+            self._ensure_fresh()
         self._memory._ensure_fresh()
         per_language: dict[str, int] = {}
         partial_files: list[str] = []

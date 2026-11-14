@@ -15,8 +15,9 @@ This repository is indexed by **ProjectBrain** (`projectbrain`). Choose the fast
    - **Large multi-file chains:** Use `brain_explore` (`projectbrain explore`) or `brain_dossier` (`projectbrain dossier`) when tracing unfamiliar multi-hop call chains, cross-file `/api/...` routes, or git `co_changes` across dozens of files.
 2. **Surgical Symbol & Variable Slicing (`brain_slice` / `projectbrain slice`):**
    When inspecting specific functions, class skeletons, monolith internal component maps, or PDG variable flows (`focus="target_var"`), batch targets into `brain_slice(targets=["file.py:Class.method"])`.
-3. **Edit Natively + Sub-2s Contract & Blast-Radius Gate (`brain_check`):**
-   Edit files natively (`Edit` / `edit_file`). Call `brain_check` (`projectbrain check`) once after multi-file edits (or during bug audits) to catch cross-file arity/import/return-key breaks, React hook/undeclared-setter bugs, and layer boundary violations.
+3. **Edit Natively + Sub-2s Contract Gate & Repo Bug Triage (`brain_check`):**
+   - **Whole-repo bug audit:** Start with `brain_check(audit=True)` (`projectbrain check --audit`) to rank cross-stack HTTP/Pydantic schema bugs (`PB011`), React stateful remount/race bugs (`PB012`), and Python `.model_dump()` clobbers (`PB013`) in `<1.5s`, then `read_file` only the `ranked_hotspots` spans instead of scanning clean files blindly.
+   - **Post-edit gate:** Edit files natively (`Edit` / `edit_file`) and call `brain_check` once after multi-file edits to verify arity/import/schema contracts and blast radius.
 4. **Architectural Invariants (`brain_remember`) & Test Log Compression (`projectbrain run`):**
    Pin function invariants (`brain_remember(target="Symbol", note="...")`) or layer rules (`forbid="routes/* -> db/*"`). Use `projectbrain run "<cmd>"` to fold noisy test output to failing traceback symbols.
 """
@@ -692,6 +693,16 @@ def main(argv: list[str] | None = None) -> int:
     check_parser.add_argument("--json", action="store_true", help="Alias for --format json")
     check_parser.add_argument("--ci", action="store_true", help="CI gate mode: emit GitHub annotations (in Actions) and exit 1 on violations")
     check_parser.add_argument(
+        "--audit",
+        action="store_true",
+        help="Run <1.5s whole-repo deep semantic & cross-stack anomaly triage (PB011/PB012/PB013) even when git is dirty",
+    )
+    check_parser.add_argument(
+        "--scope",
+        default=None,
+        help="Optional glob filter for --audit (e.g. 'frontend/*' or 'backend/routers/*')",
+    )
+    check_parser.add_argument(
         "--fail-on-violation",
         action="store_true",
         help="Exit with non-zero code (1) if any syntax, contract, boundary, or governance violation is detected",
@@ -943,6 +954,8 @@ def main(argv: list[str] | None = None) -> int:
             files_modified=args.files or None,
             base_ref=getattr(args, "base", None),
             allow_governance_change=bool(getattr(args, "allow_governance_change", False)),
+            audit=bool(getattr(args, "audit", False)),
+            scope_glob=getattr(args, "scope", None),
         )
         chosen_fmt = args.format
         if args.json:

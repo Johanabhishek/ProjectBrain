@@ -110,7 +110,7 @@ class CodeGraph:
             nid = fn_id(rel_path, fn["name"], parent)
             raw_cs = ",".join(fn.get("calls", ())) + "|" + ",".join(sorted((fn.get("qualified_calls") or {}).keys()))
             calls_sig = hashlib.blake2b(raw_cs.encode("utf-8"), digest_size=6).hexdigest()
-            self.nodes[nid] = {
+            fn_nd: dict = {
                 "type": "fn",
                 "rel_path": rel_path,
                 "name": fn["name"],
@@ -123,6 +123,17 @@ class CodeGraph:
                 "ast_hash": fn.get("ast_hash", ""),
                 "calls_sig": calls_sig,
             }
+            if fn.get("return_keys"):
+                fn_nd["return_keys"] = fn["return_keys"]
+            if fn.get("has_local_state"):
+                fn_nd["has_local_state"] = True
+            if fn.get("http_wrapper_spec"):
+                fn_nd["http_wrapper_spec"] = fn["http_wrapper_spec"]
+            if fn.get("http_transport_spec"):
+                fn_nd["http_transport_spec"] = fn["http_transport_spec"]
+            if fn.get("http_pending_transport_call"):
+                fn_nd["http_pending_transport_call"] = fn["http_pending_transport_call"]
+            self.nodes[nid] = fn_nd
             f_nids.append(nid)
             _reg(fn["name"], nid)
             if parent:
@@ -130,7 +141,7 @@ class CodeGraph:
 
         for c in info.get("classes", []):
             nid = cls_id(rel_path, c["name"])
-            self.nodes[nid] = {
+            cls_nd: dict = {
                 "type": "cls",
                 "rel_path": rel_path,
                 "name": c["name"],
@@ -142,13 +153,16 @@ class CodeGraph:
                 "interface_hash": c.get("interface_hash", ""),
                 "ast_hash": c.get("ast_hash", ""),
             }
+            if c.get("schema_spec"):
+                cls_nd["schema_spec"] = c["schema_spec"]
+            self.nodes[nid] = cls_nd
             f_nids.append(nid)
             _reg(c["name"], nid)
 
         for r in info.get("routes", []):
             eff_path = r.get("full_path") or r["path"]
             nid = route_id(r["method"], eff_path)
-            self.nodes[nid] = {
+            r_nd: dict = {
                 "type": "route",
                 "rel_path": rel_path,
                 "method": r["method"],
@@ -157,6 +171,19 @@ class CodeGraph:
                 "handler": r.get("handler"),
                 "line": r.get("line"),
             }
+            for rk_opt in (
+                "body_schema",
+                "body_param",
+                "body_is_dynamic",
+                "multi_body_keys",
+                "response_schema",
+                "response_is_list",
+                "response_is_dynamic",
+                "required_query_params",
+            ):
+                if rk_opt in r:
+                    r_nd[rk_opt] = r[rk_opt]
+            self.nodes[nid] = r_nd
             f_nids.append(nid)
         for imp in info.get("imports", []):
             nid = mod_id(imp)
@@ -207,13 +234,15 @@ class CodeGraph:
                 if receiver in ("self", "this", "cls", "super") and parent and len(parts) == 2:
                     if receiver != "super":
                         same_cls_id = fn_id(rel_path, callee_name, parent)
-                        if same_cls_id in self.nodes and same_cls_id != nid:
-                            self._add_edge(
-                                nid, same_cls_id, "calls", "exact",
-                                f"'{qual_expr}()' resolved to method on enclosing class {parent}",
-                                line=q_line,
-                            )
-                            added_call_dsts.add(same_cls_id)
+                        if same_cls_id in self.nodes:
+                            resolved_qual_callees.add(callee_name)
+                            if same_cls_id != nid:
+                                self._add_edge(
+                                    nid, same_cls_id, "calls", "exact",
+                                    f"'{qual_expr}()' resolved to method on enclosing class {parent}",
+                                    line=q_line,
+                                )
+                                added_call_dsts.add(same_cls_id)
                             continue
                     # Check base classes of `parent` (1-2 levels of inheritance)
                     parent_cls_nd = self.nodes.get(cls_id(rel_path, parent), {})
@@ -231,6 +260,7 @@ class CodeGraph:
                                     line=q_line,
                                 )
                                 added_call_dsts.add(b_cand)
+                                resolved_qual_callees.add(callee_name)
                                 resolved_base = True
                                 break
                         if resolved_base:
@@ -253,6 +283,7 @@ class CodeGraph:
                                 line=q_line,
                             )
                             added_call_dsts.add(t_cand)
+                            resolved_qual_callees.add(callee_name)
                             continue
 
                 # Case B: `ReceiverClass.method()` or `receiver_instance.method()`
@@ -297,6 +328,7 @@ class CodeGraph:
                             line=q_line,
                         )
                         added_call_dsts.add(cand)
+                        resolved_qual_callees.add(callee_name)
 
             # 2. Resolve bare/remaining calls in O(1) same-file + O(|imports|) cross-file time
             call_sites_all = fn.get("call_sites_all", {})
@@ -307,12 +339,29 @@ class CodeGraph:
                 line = call_sites.get(callee_name)
                 all_lines = call_sites_all.get(callee_name)
 
+                q_recvs = qual_receivers_for_callee.get(callee_name, set())
+                only_self_recv = bool(q_recvs) and q_recvs <= {"self", "this", "cls", "super"}
+
                 same_file_matched = False
                 for cand in by_file_name.get((rel_path, callee_name), ()):
-                    if cand != nid and cand not in added_call_dsts:
-                        self._add_edge(nid, cand, "calls", "exact", "same-file function call", line=line, lines=all_lines)
-                        added_call_dsts.add(cand)
+                    if cand == nid:
+                        continue
+                    if cand in added_call_dsts:
                         same_file_matched = True
+                        continue
+                    cand_parent = self.nodes.get(cand, {}).get("parent_class")
+                    if cand_parent and only_self_recv:
+                        if callee_name in resolved_qual_callees:
+                            continue
+                        cand_bases = [
+                            b.split(".")[-1].split("[")[0].strip()
+                            for b in self.nodes.get(cls_id(rel_path, cand_parent), {}).get("bases", ())
+                        ]
+                        if not parent or parent not in cand_bases:
+                            continue
+                    self._add_edge(nid, cand, "calls", "exact", "same-file function call", line=line, lines=all_lines)
+                    added_call_dsts.add(cand)
+                    same_file_matched = True
 
                 if same_file_matched and callee_name not in file_sym_map and callee_name not in qual_receivers_for_callee:
                     continue
@@ -810,6 +859,33 @@ class CodeGraph:
                     nxt_hop = hop + 1
                     via_label = f"via {' -> '.join(nxt_chain)} ({nxt_hop} hop{'s' if nxt_hop > 1 else ''})"
 
+                    if callee_name.startswith("use") and len(callee_name) > 3 and callee_name[3].isupper():
+                        if callee_nd.get("has_local_state") and nd.get("name", "")[:1].isupper():
+                            nd["has_local_state"] = True
+                    pend_tc = nd.get("http_pending_transport_call")
+                    if nxt_hop == 1 and pend_tc and not nd.get("http_wrapper_spec"):
+                        t_spec = callee_nd.get("http_transport_spec")
+                        if t_spec and callee_name == pend_tc.get("callee"):
+                            vb = t_spec.get("fixed_method") or pend_tc.get("inline_method") or "GET"
+                            b_idx = None
+                            if t_spec.get("body_param_idx") == 1 and "arg1_param_idx" in pend_tc:
+                                b_idx = pend_tc["arg1_param_idx"]
+                            elif "inline_body_param_idx" in pend_tc:
+                                b_idx = pend_tc["inline_body_param_idx"]
+                            w_spec: dict = {
+                                "method": vb,
+                                "url": pend_tc["url"],
+                                "norm_url": pend_tc["norm_url"],
+                                "returns_json": bool(t_spec.get("returns_json")),
+                            }
+                            if b_idx is not None:
+                                w_spec["body_param_idx"] = b_idx
+                            nd["http_wrapper_spec"] = w_spec
+                            nd_rel = nd.get("rel_path", "")
+                            if nd_rel in index:
+                                for f_ent in index[nd_rel].get("functions", ()):
+                                    if f_ent.get("name") == nd.get("name") and f_ent.get("parent_class") == nd.get("parent_class"):
+                                        f_ent["http_wrapper_spec"] = w_spec
                     for zw in callee_nd.get("local_z_write", []):
                         if len(trans_zw) < 12 and zw not in own_zw and zw not in trans_zw:
                             trans_zw.append(zw)

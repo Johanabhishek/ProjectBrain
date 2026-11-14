@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ProjectBrain v1.2 (projectbrain-mcp) — Zero-LSP Code Graph, &lt;8KB Inline MCP &amp; Sub-2s Contract Guardrail for AI Agents</title>
+  <title>ProjectBrain v1.3 (projectbrain-mcp) — Zero-LSP Code Graph, Deep Semantic Triage &amp; Sub-2s Contract Guardrail for AI Agents</title>
   <meta name="description" content="Zero-LSP SQLite Code Graph, Real-Time Post-Edit &amp; PR Merge-Base Contract Guardrail, Governance Tamper Lock, SARIF v2.1.0, and Surgical PDG Context Compiler for AI Coding Agents." />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
@@ -226,7 +226,7 @@
 
   <nav>
     <div class="container">
-      <div class="nav-brand">ProjectBrain <code>projectbrain-mcp v1.2</code></div>
+      <div class="nav-brand">ProjectBrain <code>projectbrain-mcp v1.3</code></div>
       <div class="nav-links">
         <a href="#setup">Setup</a>
         <a href="#workflow">Guardrails &amp; CLI</a>
@@ -254,11 +254,11 @@
         </div>
       </div>
       <div class="hero-badges">
-        <span>&#9889; &lt;8KB Zero-Spillover MCP Inline Cap</span>
+        <span>&#9889; &lt;1.5s <code>check --audit</code> Repo Triage</span>
         <span>&#128737; PR Merge-Base &amp; Governance Tamper Lock</span>
-        <span>&#129517; React Monolith Maps + Hook/Setter Checks</span>
-        <span>&#128274; OASIS SARIF v2.1.0 + Sticky Mermaid PRs</span>
-        <span>&#9989; &lt;2s <code>git cat-file --batch</code> Gate</span>
+        <span>&#129517; Cross-Stack HTTP + React + Pydantic Verifiers</span>
+        <span>&#128274; OASIS SARIF v2.1.0 (<code>PB001</code>&ndash;<code>PB013</code>)</span>
+        <span>&#9989; &lt;8KB Zero-Spillover MCP Inline Cap</span>
       </div>
     </div>
   </header>
@@ -332,8 +332,9 @@ $ projectbrain --path /path/to/repo remember settle_invoice <span class="string"
       </div>
 
       <div class="demo-block">
-        <div class="demo-label">4. PR Merge-Base Gate, OASIS SARIF v2.1.0, Sticky Mermaid PR Comments &amp; Scorecard</div>
-        <pre><code>$ projectbrain --path /path/to/repo check --base main --ci
+        <div class="demo-label">4. Whole-Repo Semantic Triage (<code>check --audit</code>), PR Merge-Base Gate, OASIS SARIF v2.1.0 &amp; Scorecard</div>
+        <pre><code>$ projectbrain --path /path/to/repo check --audit
+$ projectbrain --path /path/to/repo check --base main --ci
 $ projectbrain --path /path/to/repo check --base main --format pr-comment
 $ projectbrain --path /path/to/repo check --base main --format sarif &gt; projectbrain.sarif
 $ projectbrain --path /path/to/repo stats --summary
@@ -379,8 +380,14 @@ $ projectbrain --path /path/to/repo stats --summary
             <tr>
               <td><strong><code>pallets/flask</code> Dossiers</strong></td>
               <td>6 multi-hop architectural tasks</td>
-              <td class="check">21 / 21 (100%)</td>
-              <td>2.66 KB cost per hit</td>
+              <td class="check">20 / 21 (95.2%)</td>
+              <td>2.96 KB cost per hit</td>
+            </tr>
+            <tr>
+              <td><strong>Whole-Repo Semantic Audit (<code>check --audit</code>)</strong></td>
+              <td><code>flask</code>, <code>requests</code>, <code>click</code>, <code>express</code>, <code>django</code> (1,077 prod files)</td>
+              <td class="check">0 false positives (100% clean)</td>
+              <td>26 ms &ndash; 1.03 s whole-repo triage</td>
             </tr>
             <tr>
               <td><strong><code>django/django</code> Incremental</strong></td>
@@ -427,8 +434,8 @@ $ projectbrain --path /path/to/repo stats --summary
         </div>
         <div class="feature">
           <div class="feature-tag tag-unique">CI / PR Gate</div>
-          <h3>PR Merge-Base, SARIF v2.1.0 &amp; Sticky Mermaid PRs (<code>brain_check</code>)</h3>
-          <p>Audits committed PR branches via <code>check --base main</code>, verifies 3-valued claims (<code>SUPPORTED</code> / <code>REFUTED</code> / <code>UNKNOWN</code>), emits OASIS SARIF v2.1.0 (<code>PB001</code>&ndash;<code>PB010</code>), and renders zero-noise sticky PR comments with Mermaid blast-radius graphs.</p>
+          <h3>Whole-Repo Semantic Triage, PR Merge-Base &amp; SARIF v2.1.0 (<code>brain_check</code>)</h3>
+          <p>Runs <code>&lt;1.5s</code> whole-repo anomaly triage via <code>check --audit</code>, audits committed PR branches via <code>check --base main</code>, verifies 3-valued claims (<code>SUPPORTED</code> / <code>REFUTED</code> / <code>UNKNOWN</code>), emits OASIS SARIF v2.1.0 (<code>PB001</code>&ndash;<code>PB013</code>, incl. <code>PB011</code> HTTP schemas, <code>PB012</code> React remounts, <code>PB013</code> Pydantic clobbers), and renders sticky PR comments with Mermaid blast-radius graphs.</p>
         </div>
         <div class="feature">
           <div class="feature-tag tag-core">Governance</div>
@@ -446,7 +453,7 @@ $ projectbrain --path /path/to/repo stats --summary
 
   <section id="compare">
     <div class="container">
-      <h2>How ProjectBrain v1.2 Compares</h2>
+      <h2>How ProjectBrain v1.3 Compares</h2>
       <div style="overflow-x: auto;">
         <table class="comparison-table">
           <thead>
@@ -455,7 +462,7 @@ $ projectbrain --path /path/to/repo stats --summary
               <th>Aider Repo-Map</th>
               <th>Serena (LSP)</th>
               <th>Generic Graph MCPs</th>
-              <th>ProjectBrain v1.2</th>
+              <th>ProjectBrain v1.3</th>
             </tr>
           </thead>
           <tbody>
@@ -520,7 +527,7 @@ $ projectbrain --path /path/to/repo stats --summary
 
   <footer>
     <div class="container">
-      <p>ProjectBrain (<code>projectbrain-mcp</code> v1.2.0) &mdash; Zero-LSP SQLite Code Graph, &lt;8KB Inline MCP &amp; Sub-2s Contract Guardrail for AI Coding Agents. MIT License.</p>
+      <p>ProjectBrain (<code>projectbrain-mcp</code> v1.3.0) &mdash; Zero-LSP SQLite Code Graph, Deep Semantic Triage, &lt;8KB Inline MCP &amp; Sub-2s Contract Guardrail for AI Coding Agents. MIT License.</p>
     </div>
   </footer>
 

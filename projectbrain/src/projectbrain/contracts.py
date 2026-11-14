@@ -2063,6 +2063,8 @@ def compile_6d_contract_diagnostics(
     task: str,
     focus_files: set[str],
     strict_focus: bool = False,
+    *,
+    skip_http_schemas: bool = False,
 ) -> tuple[list[str], list[str]]:
     """Cross-check 6D IO cells (SQL INSERT column sets, SQL dialects, exception contracts)
     against indexed CREATE TABLE schemas and database adapter capabilities across the repository.
@@ -2198,12 +2200,15 @@ def compile_6d_contract_diagnostics(
                                 ),
                             )
                             warnings.append(
-                                f"- ?? **[6D Schema Contract Violation]** `{rel}:L{ins_line}` (`{scope}`) ? "
+                                f"- ⚠️ **[6D Schema Contract Violation]** `{rel}:L{ins_line}` (`{scope}`) → "
                                 f"`INSERT INTO {tbl_raw}({', '.join(ins['cols'][:5])}{'...' if len(ins['cols']) > 5 else ''})` "
                                 f"omits required `NOT NULL` column(s) `{', '.join(missing)}` "
                                 f"(declared without `DEFAULT` in `{schema_rel}:L{sc['line_start']}`)."
                             )
-            if sqlite_adapters:
+            if sqlite_adapters and not any(
+                db_tok in rel.lower()
+                for db_tok in ("postgres", "psycopg", "mysql", "oracle", "mssql")
+            ):
                 ad_rel, ad_src = sqlite_adapters[0]
                 for feat in cell.get("sql_dialects", []):
                     if any(
@@ -2237,7 +2242,7 @@ def compile_6d_contract_diagnostics(
                                 ),
                             )
                             warnings.append(
-                                f"- ?? **[6D SQL Dialect Mismatch]** `{rel}:L{c_line}` (`{scope}`) ? "
+                                f"- ⚠️ **[6D SQL Dialect Mismatch]** `{rel}:L{c_line}` (`{scope}`) → "
                                 f"Query uses PostgreSQL construct `{feat}` not translated by SQLite adapter `{ad_rel}`."
                             )
                 exits = cell.get("E_exit", [])
@@ -2265,8 +2270,8 @@ def compile_6d_contract_diagnostics(
                                 ),
                             )
                             warnings.append(
-                                f"- ?? **[6D Exception Contract Mismatch]** `{rel}:L{c_line}` (`{scope}`) ? "
-                                f"Catches `UniqueViolation` on DB write (`?Z:{','.join(cell['Z_write'][:2])}`) "
+                                f"- ⚠️ **[6D Exception Contract Mismatch]** `{rel}:L{c_line}` (`{scope}`) → "
+                                f"Catches `UniqueViolation` on DB write (`ΔZ:{','.join(cell['Z_write'][:2])}`) "
                                 f"without catching `IntegrityError` raised by SQLite adapter `{ad_rel}`."
                             )
             for tc_cmp in cell.get("type_comparisons", []):
@@ -2324,81 +2329,11 @@ def compile_6d_contract_diagnostics(
                         ),
                     )
                     warnings.append(
-                        f"- ?? **[6D Producer-Consumer SQL Shape Violation]** `{rel}:L{sv_line}` (`{scope}`) ? "
+                        f"- ⚠️ **[6D Producer-Consumer SQL Shape Violation]** `{rel}:L{sv_line}` (`{scope}`) → "
                         f"Reads row key `{sv['var']}['{sv['read_key']}']`, which is absent from `SELECT {', '.join(sv['projected_cols'])}` "
-                        f"on `{sv['table']}` (`Post(SELECT) ? Pre(row['{sv['read_key']}'])`)."
+                        f"on `{sv['table']}` (`Post(SELECT) ⊭ Pre(row['{sv['read_key']}'])`)."
                     )
 
-            if brain._graph and cell.get("http_calls"):
-                if not hasattr(brain, "_cached_be_routes") or brain._cached_be_routes_ver != id(brain._graph):
-                    be_routes_by_norm: dict[str, set[str]] = {}
-                    be_ret_keys_by_norm: dict[str, tuple[str, set[str]]] = {}
-                    for r_nid, r_nd in brain._graph.nodes.items():
-                        if r_nd.get("type") == "route":
-                            rf = r_nd.get("full_path") or r_nd.get("path") or ""
-                            rn = re.sub(r"\{[^}]+\}|:[a-zA-Z_]\w*", "{*}", rf).rstrip("/") or "/"
-                            be_routes_by_norm.setdefault(rn, set()).add((r_nd.get("method") or "GET").upper())
-                            for ei_h in brain._graph._adj.get(r_nid, []):
-                                eh = brain._graph.edges[ei_h]
-                                if eh["type"] == "handles":
-                                    h_nd = brain._graph.nodes.get(eh["dst"], {})
-                                    r_keys = set(h_nd.get("return_dict_keys", []))
-                                    if r_keys:
-                                        be_ret_keys_by_norm[rn] = (h_nd.get("name") or eh["dst"], r_keys)
-                    brain._cached_be_routes = (be_routes_by_norm, be_ret_keys_by_norm)
-                    brain._cached_be_routes_ver = id(brain._graph)
-                else:
-                    be_routes_by_norm, be_ret_keys_by_norm = brain._cached_be_routes
-                if be_routes_by_norm:
-                    for hc in cell.get("http_calls", []):
-                        hu = hc["norm_url"]
-                        hm = hc["method"]
-                        h_line = hc.get("line", c_line)
-                        allowed_verbs = be_routes_by_norm.get(hu)
-                        if (
-                            allowed_verbs
-                            and hm not in ("ANY", "ALL")
-                            and "ANY" not in allowed_verbs
-                            and "ALL" not in allowed_verbs
-                            and hm not in allowed_verbs
-                        ):
-                            w_key = (rel, h_line, f"http_verb:{hm}:{hu}")
-                            if w_key not in seen_warn_keys:
-                                seen_warn_keys.add(w_key)
-                                _record_offending_fn(
-                                    rel,
-                                    h_line,
-                                    span_end=h_line + 2,
-                                    inline_msg=(
-                                        f"# >>> [6D-CONTRACT L{h_line}] HTTP verb mismatch: calls {hm} {hc['url']}, "
-                                        f"but backend route only accepts {', '.join(sorted(allowed_verbs))}"
-                                    ),
-                                )
-                                warnings.append(
-                                    f"- ?? **[6D HTTP Route Method Mismatch]** `{rel}:L{h_line}` (`{scope}`) ? "
-                                    f"Frontend calls `{hm} {hc['url']}`, but backend route only accepts `{', '.join(sorted(allowed_verbs))}`."
-                                )
-                        elif hc.get("expected_keys") and hu in be_ret_keys_by_norm:
-                            be_fn_nm, be_keys = be_ret_keys_by_norm[hu]
-                            missing_rk = [k for k in hc["expected_keys"] if k not in be_keys]
-                            if missing_rk:
-                                w_key = (rel, h_line, f"http_shape:{hu}:{missing_rk[0]}")
-                                if w_key not in seen_warn_keys:
-                                    seen_warn_keys.add(w_key)
-                                    _record_offending_fn(
-                                        rel,
-                                        h_line,
-                                        span_end=h_line + 2,
-                                        inline_msg=(
-                                            f"# >>> [6D-CONTRACT L{h_line}] Response property .{missing_rk[0]} is absent "
-                                            f"from backend handler {be_fn_nm} return keys {sorted(be_keys)}"
-                                        ),
-                                    )
-                                    warnings.append(
-                                        f"- ?? **[6D Cross-Stack HTTP Shape Violation]** `{rel}:L{h_line}` (`{scope}`) ? "
-                                        f"Reads response property `.{missing_rk[0]}` from `{hm} {hc['url']}`, "
-                                        f"but backend handler `{be_fn_nm}` only returns `{sorted(be_keys)}` (`Post(BE) ? Pre(FE)`)."
-                                    )
             for jc in (
                 [
                     jc0 for jc0 in cell.get("js_ast_contracts", [])
@@ -2420,8 +2355,39 @@ def compile_6d_contract_diagnostics(
                         inline_msg=jc["inline_msg"],
                     )
                     warnings.append(
-                        f"- ?? **[6D AST Contract Violation (`{j_kind}`)]** `{rel}:L{j_line}` (`{scope}`) ? {jc['summary']}"
+                        f"- ⚠️ **[6D AST Contract Violation (`{j_kind}`)]** `{rel}:L{j_line}` (`{scope}`) → {jc['summary']}"
                     )
+
+    brain._last_http_warnings = []
+    if not skip_http_schemas:
+        from .semantic_contracts import verify_cross_stack_http_schemas
+
+        http_focus = focus_files if (strict_focus and focus_files) else None
+        _, http_hotspots, _ = verify_cross_stack_http_schemas(brain, focus_rels=http_focus)
+        for hh in http_hotspots:
+            h_rel = hh["rel_path"]
+            h_line = int(hh.get("line") or 1)
+            h_msg = hh.get("_diag_msg") or ""
+            if not q_wants_tests_diag and _is_test_file(h_rel):
+                continue
+            if not strict_focus and focus_files and h_rel not in focus_files and not wants_all_repo_diag:
+                if not contract_in_query_scope(brain, h_rel, "", hh.get("summary", ""), q_terms):
+                    continue
+            if hh.get("severity") != "error":
+                if h_msg and h_msg not in brain._last_http_warnings:
+                    brain._last_http_warnings.append(h_msg)
+                continue
+            w_key = (h_rel, h_line, f"http_sc:{hh.get('category')}:{hh.get('summary', '')[:48]}")
+            if w_key not in seen_warn_keys and h_msg:
+                seen_warn_keys.add(w_key)
+                _record_offending_fn(
+                    h_rel,
+                    h_line,
+                    span_end=h_line + 2,
+                    inline_msg=f"# >>> [6D-CONTRACT L{h_line}] {hh['summary']}",
+                )
+                warnings.append(h_msg)
+
     brain._last_line_annotations = line_ann
     brain._last_pin_lines = pin_map
     return warnings, offending_nodes
@@ -2753,15 +2719,22 @@ def verify_cross_file_contracts(
     focus_rels: set[str],
     patched_texts: dict[str, str] | None = None,
     pre_edit_infos: dict[str, dict] | None = None,
+    *,
+    lines_cache: dict[str, list[str]] | None = None,
+    include_deep_semantic: bool = True,
+    deadline: float | None = None,
+    skip_git_head: bool = False,
 ) -> list[str]:
-    """Universal 4-Pillar Cross-File Contract Verifier for both `brain.patch()` and `brain.check()`.
+    """Universal Cross-File & Deep Semantic Contract Verifier for `brain.patch()` and `brain.check()`.
 
     Checks across `focus_rels` and their 1-hop graph neighbors:
       1. Call-site arity, required keyword-only args, unknown keyword args, and duplicate pos+kw args.
       2. Broken explicit symbol imports (`from X import Y` / `import { Y } from './X'`) and deleted/renamed callables.
       3. Closed return-dict / return-object key contract drift (`res['missing_key']` / `const { missingKey } = fn()`).
+      4. Deep React stateful lifecycle/remount/race & Python Pydantic partial-update/IO hazards (when `include_deep_semantic=True`).
     """
     import difflib
+    import time as _time
     from . import resolve
     from .parsers import parse
 
@@ -2775,7 +2748,7 @@ def verify_cross_file_contracts(
 
     info_cache: dict[str, dict] = {}
     text_cache: dict[str, str] = {}
-    lines_cache: dict[str, list[str]] = {}
+    lines_cache = lines_cache if lines_cache is not None else {}
     _symtable_cache: dict[str, object] = {}
     _resolve_cache: dict = {}
 
@@ -2813,7 +2786,7 @@ def verify_cross_file_contracts(
             pre_mem = getattr(brain, "_pre_edit_index", {}).get(f_rel)
             if pre_mem:
                 resolved_pre[f_rel] = pre_mem
-            elif hasattr(brain, "_get_git_head_info"):
+            elif not skip_git_head and hasattr(brain, "_get_git_head_info"):
                 git_inf = brain._get_git_head_info(f_rel)
                 if git_inf:
                     resolved_pre[f_rel] = git_inf
@@ -2821,16 +2794,22 @@ def verify_cross_file_contracts(
     _FRAMEWORK_DECORATOR_RE = re.compile(
         r"\b(?:property|cached_property|fixture|model_validator|field_validator|validator|root_validator|contextmanager|asynccontextmanager)\b"
     )
+    _KW_ARG_EQ_RE = re.compile(r"^[A-Za-z_]\w*\s*=(?!=)")
+    _LOCAL_FROM_IMPORT_RE = re.compile(r"(?m)^\s*from\s+([A-Za-z0-9_.]+)\s+import\s+([^\n#]+)")
+    _SIMPLE_IDENT_FULL_RE = re.compile(r"[A-Za-z_]\w*")
+    _STRIP_PY_COMMENT_RE = re.compile(r"\s+#.*$")
+    _LAMBDA_WORD_RE = re.compile(r"\blambda\b")
+    _QUAL_EDGE_REASON_RE = re.compile(r"^'([^']+?)\(\)'")
 
     def _check_args_against_fn(arg_items: list[str], callee_rel: str, cand_fn: dict, is_meth: bool) -> list[str]:
         arity = cand_fn.get("arity_spec")
         if not arity:
             return []
-        pos_args = [a for a in arg_items if not re.match(r"^[A-Za-z_]\w*\s*=(?!=)", a)]
+        pos_args = [a for a in arg_items if not _KW_ARG_EQ_RE.match(a)]
         kw_names = {
             a.split("=", 1)[0].strip()
             for a in arg_items
-            if re.match(r"^[A-Za-z_]\w*\s*=(?!=)", a)
+            if _KW_ARG_EQ_RE.match(a)
         }
         min_a = arity.get("min_args", 0)
         max_a = arity.get("max_args")
@@ -2929,85 +2908,117 @@ def verify_cross_file_contracts(
                 return
             callee_nested_in_caller = True
         decs = callee_fn.get("decorators") or []
-        if any(_FRAMEWORK_DECORATOR_RE.search(d) for d in decs):
+        if any(
+            _FRAMEWORK_DECORATOR_RE.search(d) or d.endswith((".setter", ".deleter", ".getter"))
+            for d in decs
+        ):
             return
         is_meth = bool(callee_fn.get("parent_class") or callee_fn.get("is_method"))
-        m_qual = re.match(r"^'([^']+?)\(\)'", edge_reason or "")
+        if is_meth and callee_rel.endswith(".py"):
+            callee_l_s = callee_fn.get("line_start", 0)
+            callee_l_e = callee_fn.get("line_end", 0)
+            if callee_l_s and callee_l_e and (callee_l_e - callee_l_s) <= 8:
+                callee_lines = _get_lines(callee_rel)
+                if callee_lines:
+                    callee_body_txt = "\n".join(callee_lines[callee_l_s - 1 : callee_l_e])
+                    if "NotImplementedError" in callee_body_txt and "return " not in callee_body_txt:
+                        return
+        m_qual = _QUAL_EDGE_REASON_RE.match(edge_reason or "")
         qual_expr = m_qual.group(1) if m_qual else ""
         if is_meth and not qual_expr:
             return
-        caller_src = _get_text(caller_rel)
-        if not caller_src:
-            return
         c_lines = _get_lines(caller_rel)
-        if not (1 <= call_line <= len(c_lines)):
+        if not c_lines or not (1 <= call_line <= len(c_lines)):
             return
-        if caller_l_start and 1 <= caller_l_start <= call_line:
-            mod_stem_chk = Path(callee_rel).stem if caller_rel != callee_rel else ""
-            fn_head_lines = "\n".join(c_lines[caller_l_start - 1 : call_line])
-            for m_loc_imp in re.finditer(rf"(?m)^\s*from\s+([A-Za-z0-9_.]+)\s+import\s+([^\n#]+)", fn_head_lines):
-                imp_mod, imp_names = m_loc_imp.group(1), m_loc_imp.group(2)
-                if re.search(rf"\b{re.escape(callee_fn['name'])}\b", imp_names):
-                    mod_tail = imp_mod.lstrip(".").replace(".", "/")
-                    if mod_tail and mod_tail not in callee_rel:
-                        return
-                if mod_stem_chk and re.search(rf"\b{re.escape(mod_stem_chk)}\b", imp_names) and imp_mod.endswith("." + mod_stem_chk):
-                    return
 
-        caller_simple = (caller_name or "").rsplit(".", 1)[-1]
+        def _passes_disambiguation() -> bool:
+            caller_src = _get_text(caller_rel)
+            if not caller_src:
+                return False
+            if caller_l_start and 1 <= caller_l_start <= call_line:
+                mod_stem_chk = Path(callee_rel).stem if caller_rel != callee_rel else ""
+                fn_head_lines = "\n".join(c_lines[caller_l_start - 1 : call_line])
+                if "import " in fn_head_lines:
+                    for m_loc_imp in _LOCAL_FROM_IMPORT_RE.finditer(fn_head_lines):
+                        imp_mod, imp_names = m_loc_imp.group(1), m_loc_imp.group(2)
+                        if re.search(rf"\b{re.escape(callee_fn['name'])}\b", imp_names):
+                            mod_tail = imp_mod.lstrip(".").replace(".", "/")
+                            if mod_tail and mod_tail not in callee_rel:
+                                return False
+                        if mod_stem_chk and re.search(rf"\b{re.escape(mod_stem_chk)}\b", imp_names) and imp_mod.endswith("." + mod_stem_chk):
+                            return False
 
-        # (a) Bare call `name(...)`: if `name` is a parameter or a local binding of the calling
-        #     function (resolved via the CPython `symtable`), the static callee edge is unreliable -> UNKNOWN.
-        if not is_meth and "." not in qual_expr and not callee_nested_in_caller and caller_rel.endswith(".py"):
-            if _py_scope_binds_name(
-                caller_rel, caller_src, caller_simple, caller_l_start, call_line, callee_fn["name"], _symtable_cache
-            ):
-                _log_skip("a_local_binding", caller_rel, call_line)
-                return
-            # Bare name: resolve the caller's own import binding and follow re-exports to the defining file.
-            if caller_rel != callee_rel:
-                final_rel = _resolve_bare_name_defn(brain, caller_rel, caller_src, callee_fn["name"], _resolve_cache)
+            caller_simple = (caller_name or "").rsplit(".", 1)[-1]
+
+            # (a) Bare call `name(...)`: local binding via CPython `symtable` or import to another file -> UNKNOWN.
+            if not is_meth and "." not in qual_expr and not callee_nested_in_caller and caller_rel.endswith(".py"):
+                if _py_scope_binds_name(
+                    caller_rel, caller_src, caller_simple, caller_l_start, call_line, callee_fn["name"], _symtable_cache
+                ):
+                    _log_skip("a_local_binding", caller_rel, call_line)
+                    return False
+                if caller_rel != callee_rel:
+                    final_rel = _resolve_bare_name_defn(brain, caller_rel, caller_src, callee_fn["name"], _resolve_cache)
+                    if final_rel and final_rel != callee_rel:
+                        _log_skip("a_import_elsewhere", caller_rel, call_line)
+                        return False
+
+            # (b) Module-qualified call `pkg.name(...)` resolving to a different defining file -> UNKNOWN.
+            if not is_meth and "." in qual_expr and caller_rel != callee_rel:
+                q_prefix = qual_expr.rsplit(".", 1)[0]
+                final_rel = _resolve_qualified_defn(brain, caller_rel, caller_src, q_prefix, callee_fn["name"], _resolve_cache)
                 if final_rel and final_rel != callee_rel:
-                    _log_skip("a_import_elsewhere", caller_rel, call_line)
-                    return
+                    _log_skip("b_qualifier_elsewhere", caller_rel, call_line)
+                    return False
 
-        # (b) Module-qualified call `pkg.name(...)`: resolve `pkg` from the caller's import statements with
-        #     Python binding semantics (`import a.b` binds `a`), then follow re-exports of `name`. Only when this
-        #     resolves to a *different* defining file than the edge claims is the verdict UNKNOWN.
-        if not is_meth and "." in qual_expr and caller_rel != callee_rel:
-            q_prefix = qual_expr.rsplit(".", 1)[0]
-            final_rel = _resolve_qualified_defn(brain, caller_rel, caller_src, q_prefix, callee_fn["name"], _resolve_cache)
-            if final_rel and final_rel != callee_rel:
-                _log_skip("b_qualifier_elsewhere", caller_rel, call_line)
-                return
+            # (c) Method call on a non-`self` receiver `recv.method(...)`: verify receiver class -> UNKNOWN if unresolved/mismatch.
+            if is_meth and "." in qual_expr:
+                recv_expr = qual_expr.rsplit(".", 1)[0]
+                owner_cls = callee_fn.get("parent_class") or ""
+                if recv_expr not in ("self", "cls", owner_cls) and not recv_expr.startswith("super("):
+                    if not _SIMPLE_IDENT_FULL_RE.fullmatch(recv_expr):
+                        _log_skip("c_receiver_complex", caller_rel, call_line)
+                        return False
+                    lo = max(1, caller_l_start or 1)
+                    scope_txt = "\n".join(c_lines[lo - 1 : call_line])
+                    resolved_cls = _resolve_receiver_class(scope_txt, recv_expr)
+                    if not resolved_cls or resolved_cls != owner_cls:
+                        _log_skip("c_receiver_unresolved" if not resolved_cls else "c_receiver_other_class", caller_rel, call_line)
+                        return False
+            return True
 
-        # (c) Method call on a non-`self` receiver `recv.method(...)`: resolve the receiver's class from
-        #     `recv = ClassName(...)` or a `recv: ClassName` annotation in the calling function. If it cannot
-        #     be resolved, or resolves to a different class than the edge's target, the verdict is UNKNOWN.
-        if is_meth and "." in qual_expr:
-            recv_expr = qual_expr.rsplit(".", 1)[0]
-            owner_cls = callee_fn.get("parent_class") or ""
-            if recv_expr not in ("self", "cls", owner_cls) and not recv_expr.startswith("super("):
-                if not re.fullmatch(r"[A-Za-z_]\w*", recv_expr):
-                    _log_skip("c_receiver_complex", caller_rel, call_line)
-                    return
-                lo = max(1, caller_l_start or 1)
-                scope_txt = "\n".join(c_lines[lo - 1 : call_line])
-                resolved_cls = _resolve_receiver_class(scope_txt, recv_expr)
-                if not resolved_cls or resolved_cls != owner_cls:
-                    _log_skip("c_receiver_unresolved" if not resolved_cls else "c_receiver_other_class", caller_rel, call_line)
-                    return
+        if SKIP_LOG is not None and not _passes_disambiguation():
+            return
+
         end_idx = min(len(c_lines), call_line + 25)
         if caller_l_end and caller_l_end >= call_line:
             end_idx = min(end_idx, caller_l_end)
-        snippet = " ".join(re.sub(r"\s+#.*$", "", ln) for ln in c_lines[call_line - 1 : end_idx])
-        if re.search(rf"\b{re.escape(callee_fn['name'])}\.(?:delay|apply_async|s|si)\s*\(", snippet):
-            return
+        snippet = " ".join(
+            _STRIP_PY_COMMENT_RE.sub("", ln) if "#" in ln else ln
+            for ln in c_lines[call_line - 1 : end_idx]
+        )
+        if ".delay(" in snippet or ".apply_async(" in snippet or ".s(" in snippet or ".si(" in snippet:
+            if re.search(rf"\b{re.escape(callee_fn['name'])}\.(?:delay|apply_async|s|si)\s*\(", snippet):
+                return
         mod_stem = Path(callee_rel).stem if caller_rel != callee_rel else ""
         arg_items = _extract_balanced_call_args(
             snippet, callee_fn["name"], is_method=is_meth, mod_stem=mod_stem, qual_expr=qual_expr
         )
-        if arg_items is None or any(a.startswith("*") or re.search(r"\blambda\b", a) for a in arg_items):
+        if arg_items is None or any(a.startswith("*") or ("lambda" in a and _LAMBDA_WORD_RE.search(a)) for a in arg_items):
+            return
+        if (
+            is_meth
+            and "." in qual_expr
+            and not any("classmethod" in d or "staticmethod" in d for d in decs)
+            and re.match(r"^\(\s*self\b", callee_fn.get("params", ""))
+            and qual_expr.rsplit(".", 1)[0].rsplit(".", 1)[-1] == (callee_fn.get("parent_class") or "")
+            and arg_items
+            and arg_items[0].strip() == "self"
+        ):
+            arg_items = arg_items[1:]
+
+        errs = _check_args_against_fn(arg_items, callee_rel, callee_fn, is_meth)
+        if not errs:
             return
 
         # Support overloaded / conditional definitions of the same callable in `callee_rel`
@@ -3016,10 +3027,6 @@ def verify_cross_file_contracts(
             f for f in callee_info.get("functions", [])
             if f["name"] == callee_fn["name"] and f.get("parent_class") == callee_fn.get("parent_class")
         ] or [callee_fn]
-
-        errs = _check_args_against_fn(arg_items, callee_rel, callee_fn, is_meth)
-        if not errs:
-            return
         for alt_fn in overloads:
             if alt_fn is not callee_fn and not _check_args_against_fn(arg_items, callee_rel, alt_fn, is_meth):
                 return
@@ -3033,6 +3040,9 @@ def verify_cross_file_contracts(
             )
             if alt_args is not None and not _check_args_against_fn(alt_args, callee_rel, callee_fn, is_meth):
                 return
+
+        if SKIP_LOG is None and not _passes_disambiguation():
+            return
 
         for e_msg in errs:
             if e_msg.startswith("__KW__"):
@@ -3110,6 +3120,8 @@ def verify_cross_file_contracts(
 
     if brain._graph:
         for f_rel in sorted(focus_rels):
+            if deadline is not None and _time.perf_counter() > deadline:
+                break
             new_info = _get_info(f_rel)
             old_info = resolved_pre.get(f_rel) or {}
             old_if_map = {}
@@ -3145,8 +3157,16 @@ def verify_cross_file_contracts(
                     e_in = brain._graph.edges[ei]
                     if e_in["type"] != "calls" or e_in.get("confidence") not in ("exact", "import_resolved"):
                         continue
+                    if e_in.get("reason") == "same-file function call" and fn.get("parent_class"):
+                        if sum(
+                            1 for o_fn in new_info.get("functions", ())
+                            if o_fn["name"] == fn["name"] and o_fn.get("parent_class")
+                        ) > 1:
+                            continue
                     caller_nd = brain._graph.nodes.get(e_in["src"], {})
                     caller_rel = caller_nd.get("rel_path", "")
+                    if skip_git_head and caller_rel not in focus_rels:
+                        continue
                     call_line = e_in.get("line", 0)
                     if not (file_was_edited and iface_unchanged and caller_rel not in focus_rels):
                         _verify_call_site(
@@ -3174,17 +3194,31 @@ def verify_cross_file_contracts(
 
                 # Same-file callers of `fn` (including when `fn` is called within `f_rel`)
                 if fn.get("return_keys"):
+                    fn_pcls = fn.get("parent_class")
                     for s_fn in new_info.get("functions", []):
-                        if s_fn["name"] != fn["name"] and fn["name"] in s_fn.get("calls", []):
-                            _verify_return_keys_for_caller(
-                                f_rel,
-                                s_fn["name"],
-                                s_fn.get("line_start", 1),
-                                s_fn.get("line_end", 1),
-                                f_rel,
-                                fn,
-                                removed_ret_keys,
-                            )
+                        if s_fn["name"] == fn["name"] and s_fn.get("parent_class") == fn_pcls:
+                            continue
+                        if fn["name"] not in s_fn.get("calls", []):
+                            continue
+                        if fn_pcls:
+                            s_pcls = s_fn.get("parent_class")
+                            q_calls = s_fn.get("qualified_calls") or {}
+                            if s_pcls != fn_pcls and fn["name"] not in q_calls.get(fn_pcls, ()):
+                                continue
+                        elif any(
+                            o_fn is not fn and o_fn["name"] == fn["name"]
+                            for o_fn in new_info.get("functions", [])
+                        ):
+                            continue
+                        _verify_return_keys_for_caller(
+                            f_rel,
+                            s_fn["name"],
+                            s_fn.get("line_start", 1),
+                            s_fn.get("line_end", 1),
+                            f_rel,
+                            fn,
+                            removed_ret_keys,
+                        )
 
             # Check outgoing calls from functions in `f_rel` to resolved callees in the repo
             for fn in new_info.get("functions", []):
@@ -3305,10 +3339,12 @@ def verify_cross_file_contracts(
                 != [x.get("ast_hash") for x in new_r.get("classes", [])]
             )
         )
-        if not r_edited or not old_r or bool(_top_defined_syms(old_r) - _top_defined_syms(new_r)):
+        if not skip_git_head and (not r_edited or not old_r or bool(_top_defined_syms(old_r) - _top_defined_syms(new_r))):
             files_to_check_imports.update(brain._imported_by.get(r, []))
 
     for imp_rel in sorted(files_to_check_imports):
+        if deadline is not None and _time.perf_counter() > deadline:
+            break
         imp_info = _get_info(imp_rel)
         for local_name, bind in (imp_info.get("import_bindings") or {}).items():
             if local_name.startswith("__star__"):
@@ -3351,16 +3387,24 @@ def verify_cross_file_contracts(
                 | set(target_info.get("exports", []))
                 | {k for k in (target_info.get("import_bindings") or {}) if not k.startswith("__star__")}
             )
-            if sym in defined_syms:
+            if sym in defined_syms or any(
+                k.startswith("__star__") for k in (target_info.get("import_bindings") or {})
+            ):
                 continue
             target_txt = _get_text(unwrapped_rel)
+            if target_txt and re.search(rf"\bfrom\s+\S+\s+import\s+\*|\bexport\s+\*\s+from\b|\bdef\s+__getattr__\s*\(", target_txt):
+                continue
             if target_txt and re.search(rf"\b{re.escape(sym)}\b", target_txt):
                 if (
                     re.search(
-                        rf"(?m)^[ \t]*(?:export\s+)?(?:const|let|var|type|interface|enum|function|class|def|async\s+def)?[ \t]*\b{re.escape(sym)}\b\s*(?:[:=(]|$)",
+                        rf"(?m)^[ \t]*(?:(?:module\.)?exports\.|export\s+)?(?:const|let|var|type|interface|enum|function|class|def|async\s+def)?[ \t]*\b{re.escape(sym)}\b\s*(?:[:=(]|$)",
                         target_txt,
                     )
-                    or re.search(rf"\bfrom\s+\S+\s+import\s+\*|\bexport\s+\*\s+from\b", target_txt)
+                    or re.search(
+                        rf"(?m)^[ \t]*(?:[A-Za-z_]\w*[ \t]*(?:,[ \t]*|=(?!=)[ \t]*))*\b{re.escape(sym)}\b[\w., \t]*=(?!=)",
+                        target_txt,
+                    )
+                    or re.search(rf"\bimport\s+\(?[^;\n#)]*\b{re.escape(sym)}\b", target_txt)
                     or (unwrapped_rel.endswith("__init__.py") and re.search(rf"['\"]{re.escape(sym)}['\"]", target_txt))
                 ):
                     continue
@@ -3371,6 +3415,47 @@ def verify_cross_file_contracts(
                 f"- ⚠️ **[6D Broken Import / Deleted Symbol Violation]** `{imp_rel}:L{imp_line}` → "
                 f"Cannot import `{sym}` from `{unwrapped_rel}` (symbol does not exist in `{unwrapped_rel}`{hint})."
             )
+
+    if include_deep_semantic and focus_rels:
+        from .reporters import _is_test_file_path
+        from .semantic_contracts import (
+            _JS_TS_EXTS,
+            analyze_python_semantic_hazards,
+            analyze_react_lifecycle_and_race_contracts,
+            build_resolved_schema_registry,
+        )
+
+        sem_warnings: list[str] = list(getattr(brain, "_last_http_warnings", None) or ())
+        schema_reg: dict | None = None
+        for s_rel in sorted(focus_rels):
+            if _is_test_file_path(s_rel):
+                continue
+            ext = Path(s_rel).suffix.lower()
+            if ext in _JS_TS_EXTS:
+                s_txt = _get_text(s_rel)
+                if s_txt:
+                    r_errs, r_hots = analyze_react_lifecycle_and_race_contracts(s_rel, s_txt, brain)
+                    for e_msg in r_errs:
+                        _emit(e_msg)
+                    for rh in r_hots:
+                        if rh.get("severity") != "error" and rh.get("_diag_msg"):
+                            if rh["_diag_msg"] not in sem_warnings:
+                                sem_warnings.append(rh["_diag_msg"])
+            elif ext == ".py":
+                s_txt = _get_text(s_rel)
+                if s_txt:
+                    if schema_reg is None:
+                        schema_reg = build_resolved_schema_registry(brain)
+                    p_errs, p_hots = analyze_python_semantic_hazards(s_rel, s_txt, brain, schema_registry=schema_reg)
+                    for e_msg in p_errs:
+                        _emit(e_msg)
+                    for ph in p_hots:
+                        if ph.get("severity") != "error" and ph.get("_diag_msg"):
+                            if ph["_diag_msg"] not in sem_warnings:
+                                sem_warnings.append(ph["_diag_msg"])
+        brain._last_semantic_warnings = sem_warnings
+    else:
+        brain._last_semantic_warnings = list(getattr(brain, "_last_http_warnings", None) or ())
 
     return diag_lines
 

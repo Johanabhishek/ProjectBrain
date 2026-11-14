@@ -662,6 +662,7 @@ def impact(brain: "ProjectBrain", files_changed: list[str] | str, *, _already_fr
         results.append(entry)
 
     contract_diags: list[str] = []
+    sem_warnings: list[str] = []
     if valid_focus_rels:
         diag_6d, _ = brain._compile_6d_contract_diagnostics(
             "impact verification", valid_focus_rels, strict_focus=True
@@ -670,6 +671,7 @@ def impact(brain: "ProjectBrain", files_changed: list[str] | str, *, _already_fr
         for cd in verify_cross_file_contracts(brain, valid_focus_rels):
             if cd not in contract_diags:
                 contract_diags.append(cd)
+        sem_warnings = list(getattr(brain, "_last_semantic_warnings", None) or ())
         if contract_diags and _RISK_ORDER.get(max_risk, 0) < _RISK_ORDER["high"]:
             max_risk = "high"
 
@@ -679,7 +681,7 @@ def impact(brain: "ProjectBrain", files_changed: list[str] | str, *, _already_fr
         else ("HIGH_IMPACT_REVIEW_CALLERS" if max_risk in ("high", "critical") else "SAFE_TO_PROCEED")
     )
 
-    return {
+    imp_out = {
         "files_analyzed": len(results),
         "total_impact_zone": len(all_impacted),
         "overall_risk": max_risk,
@@ -689,6 +691,9 @@ def impact(brain: "ProjectBrain", files_changed: list[str] | str, *, _already_fr
         "details": results,
         "all_impacted_files": sorted(all_impacted),
     }
+    if sem_warnings:
+        imp_out["semantic_warnings"] = sem_warnings
+    return imp_out
 
 
 def url_matches(pattern: str, url: str) -> bool:
@@ -1053,6 +1058,7 @@ def load_neighborhood_for_check(brain: "ProjectBrain", candidate_files: list[str
 
     extra_called_names: set[str] = set()
     need_sql_schemas = False
+    need_http_routes = False
     symbols_changed = False
     has_static_unedited_focus = False
     mutated_set: set[str] = set()
@@ -1108,8 +1114,21 @@ def load_neighborhood_for_check(brain: "ProjectBrain", candidate_files: list[str
             src_up = src.upper()
             if "INSERT " in src_up or "SELECT " in src_up or "sqlite3" in src:
                 need_sql_schemas = True
-        elif pre_inf.get("sql_schemas") or "sqlite3" in (pre_inf.get("imports") or ()):
-            need_sql_schemas = True
+            if any(
+                tok in src
+                for tok in ("fetch(", "axios", "/api/", "router.", "@app.", "BaseModel", "SQLModel", "TypedDict")
+            ):
+                need_http_routes = True
+        else:
+            if pre_inf.get("sql_schemas") or "sqlite3" in (pre_inf.get("imports") or ()):
+                need_sql_schemas = True
+            if (
+                pre_inf.get("routes")
+                or any(fn.get("http_wrapper_spec") for fn in pre_inf.get("functions", []))
+                or any(c.get("schema_spec") for c in pre_inf.get("classes", []))
+                or any(c.get("http_calls") for c in pre_inf.get("cells_4d", []))
+            ):
+                need_http_routes = True
 
         if not pre_inf:
             symbols_changed = True
@@ -1178,6 +1197,7 @@ def load_neighborhood_for_check(brain: "ProjectBrain", candidate_files: list[str
         extra_called_names=extra_called_names,
         boundary_src_globs=boundary_src_globs,
         need_sql_schemas=need_sql_schemas,
+        need_http_routes=need_http_routes,
         symbols_changed=symbols_changed,
         mutated_node_ids=mutated_arg,
     )
@@ -1277,6 +1297,8 @@ def run_check(
     *,
     base_ref: str | None = None,
     allow_governance_change: bool = False,
+    audit: bool = False,
+    scope_glob: str | None = None,
 ) -> dict:
     """Unified verification gate supporting working-tree edits AND committed PR merge-base diffs."""
     from .git_diff import (
@@ -1355,7 +1377,8 @@ def run_check(
         else:
             brain._capture_pre_edit_snapshots(files_modified)
             if (
-                not files_modified
+                not audit
+                and not files_modified
                 and not claims
                 and not plan_files
                 and not brain._pre_edit_index
@@ -1400,7 +1423,8 @@ def run_check(
             effective_modified = []
 
         fast_check_scope = bool(
-            effective_modified
+            not audit
+            and effective_modified
             and not deleted_or_moved_paths
             and not claims
             and not plan_files
@@ -1454,7 +1478,7 @@ def run_check(
             norm_focus = {brain._normalize_rel(str(f)) for f in effective_modified if f}
             valid_focus = {r for r in norm_focus if r in brain._index}
             if effective_modified:
-                imp_res = brain.impact(effective_modified, _already_fresh=fast_check_scope)
+                imp_res = brain.impact(effective_modified, _already_fresh=True)
                 diags = list(imp_res.get("contract_diagnostics", []))
             else:
                 imp_res = {
@@ -1647,6 +1671,8 @@ def run_check(
             out["impact_analysis"] = imp_res
             out["contract_diagnostics"] = diags
             out["boundary_violations"] = b_violations
+            if imp_res.get("semantic_warnings"):
+                out["semantic_warnings"] = imp_res["semantic_warnings"]
             if syntax_errs:
                 out["syntax_errors"] = syntax_errs
             if signature_blast:
@@ -1686,19 +1712,34 @@ def run_check(
                 if co_w:
                     out["co_change_warnings"] = co_w
             # Fast whole-repo static bug audit on small/medium clean checkouts (<160 files)
-            if 0 < len(brain._index) <= 160:
-                from .contracts import verify_cross_file_contracts
-                from .reporters import _is_test_file_path
+            if not audit and 0 < len(brain._index) <= 160:
+                from .semantic_contracts import run_semantic_repo_audit
 
-                prod_rels = {r for r in brain._index if not _is_test_file_path(r)}
-                if prod_rels:
-                    static_6d, _ = brain._compile_6d_contract_diagnostics(
-                        "static contract bug audit", prod_rels, strict_focus=True,
-                    )
-                    static_xf = verify_cross_file_contracts(brain, prod_rels)
-                    combined_static = list(dict.fromkeys([*static_6d, *static_xf]))
-                    if combined_static:
-                        out["static_audit_findings"] = combined_static[:25]
+                audit_auto = run_semantic_repo_audit(brain)
+                if audit_auto["combined_diagnostics"]:
+                    out["static_audit_findings"] = audit_auto["combined_diagnostics"][:25]
+                if audit_auto["ranked_hotspots"]:
+                    out["ranked_hotspots"] = audit_auto["ranked_hotspots"][:15]
+
+        if audit:
+            from .semantic_contracts import run_semantic_repo_audit
+
+            audit_res = run_semantic_repo_audit(brain, scope_glob=scope_glob)
+            out["audit_coverage"] = audit_res["audit_coverage"]
+            out["ranked_hotspots"] = audit_res["ranked_hotspots"]
+            if audit_res["combined_diagnostics"]:
+                out["static_audit_findings"] = audit_res["combined_diagnostics"][:25]
+            if audit_res["error_diagnostics"]:
+                merged_err = list(
+                    dict.fromkeys([*(out.get("contract_diagnostics") or ()), *audit_res["error_diagnostics"]])
+                )
+                out["contract_diagnostics"] = merged_err
+                out["all_contracts_valid"] = False
+                if out.get("verdict") in (None, "SAFE_TO_PROCEED", "HIGH_IMPACT_REVIEW_CALLERS"):
+                    out["verdict"] = "UNSAFE_CONTRACT_VIOLATION"
+            elif "verdict" not in out:
+                out["all_contracts_valid"] = True
+                out["verdict"] = "SAFE_TO_PROCEED"
 
         should_check_governance = (
             bool(merge_base)
@@ -1727,7 +1768,7 @@ def run_check(
                     out["verdict"] = "UNSAFE_GOVERNANCE_TAMPER"
 
         if not files_modified and not claims and not plan_files:
-            out["health"] = brain.health()
+            out["health"] = brain.health(_already_fresh=True)
 
         return out
     finally:

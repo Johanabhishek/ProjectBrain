@@ -1,4 +1,4 @@
-"""ProjectBrain MCP Server (v1.2: <8KB Inline Cap, Monolith Maps, Dynamic Route Flows & Sub-2s Check).
+"""ProjectBrain MCP Server (v1.3: Deep Semantic Triage, Cross-Stack HTTP Schemas & <8KB Inline Cap).
 
 Exposes 5 primary non-overlapping power tools by default (`--lean`):
   1. `brain_dossier`  — One-call Architecture & Context Compiler: returns PDG/AST code
@@ -174,9 +174,14 @@ def _enforce_mcp_inline_budget(res: dict, max_chars: int = MCP_INLINE_CHAR_BUDGE
                 imp_c["details"] = compact_details
             out["impact_analysis"] = imp_c
             out["inline_budget_trimmed"] = True
+        if out.get("ranked_hotspots") and _serialized_len(out) > max_chars:
+            out.pop("static_audit_findings", None)
+            out["inline_budget_trimmed"] = True
         for diag_key, d_cap in (
-            ("contract_diagnostics", 18),
-            ("static_audit_findings", 15),
+            ("ranked_hotspots", 16),
+            ("contract_diagnostics", 16),
+            ("semantic_warnings", 10),
+            ("static_audit_findings", 14),
             ("signature_blast", 6),
             ("memories", 8),
             ("stale_memories", 8),
@@ -191,7 +196,7 @@ def _enforce_mcp_inline_budget(res: dict, max_chars: int = MCP_INLINE_CHAR_BUDGE
         guard_iters += 1
         out["inline_budget_trimmed"] = True
         best_key = max(
-            (k for k in out if k not in ("verdict", "all_contracts_valid", "error", "center")),
+            (k for k in out if k not in ("verdict", "all_contracts_valid", "error", "center", "audit_coverage")),
             key=lambda k: _serialized_len(out[k]),
             default=None,
         )
@@ -329,14 +334,19 @@ def brain_check(
     task: str = "",
     base_ref: str | None = None,
     allow_governance_change: bool = False,
+    audit: bool = False,
+    scope_glob: str | None = None,
     repo_path: str | None = None,
 ) -> dict:
-    """Sub-2s verification, static bug audit & blast-radius gate (<8KB inline).
+    """Sub-2s verification, deep semantic repo bug triage & blast-radius gate (<8KB inline).
 
     Modes:
+      - Whole-repo deep semantic triage (`audit=True`, optional `scope_glob="frontend/*"`): scans the entire
+        repo in <1.5s (even when git is dirty) and returns `ranked_hotspots` + `recommended_read` spans across
+        cross-stack HTTP/Pydantic schemas (`PB011`), React stateful remount/race bugs (`PB012`), Python
+        `.model_dump()` partial-update clobbers & silent exception drops (`PB013`), and 6D/cross-file contracts.
       - Post-edit / PR merge-base gate (`files_modified=[...]`, `base_ref="main"`, or git diff): checks AST validity,
-        cross-file arity/import/key/SQL contracts, React hook/undeclared-setter bugs, boundary rules, and callers.
-      - Clean-repo bug audit (no args on repos <=160 files): surfaces static 6D & cross-file contract violations.
+        cross-stack HTTP/Pydantic/SQL/arity/import contracts, React lifecycle bugs, boundary rules, and callers.
       - Pre-edit plan gate (`plan_files=[...]`, `task="..."`) or fact-check (`claims=[["A", "calls", "B"]]`).
     """
     b = _get_brain(repo_path)
@@ -348,6 +358,8 @@ def brain_check(
             task=task,
             base_ref=base_ref,
             allow_governance_change=allow_governance_change,
+            audit=audit,
+            scope_glob=scope_glob,
         )
     return _enforce_mcp_inline_budget(res)
 
