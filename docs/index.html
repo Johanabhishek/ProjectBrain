@@ -3,514 +3,922 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ProjectBrain v1.4 (projectbrain-mcp) — Zero-LLM Cross-Stack Contract Firewall &amp; Satellite Coordinate Router</title>
-  <meta name="description" content="Zero-LLM Cross-Stack Contract Firewall, Satellite Coordinate Router, PR Merge-Base SARIF Gate, Code-Native @pb-invariant Rules &amp; Bundled MCP Server for AI-Generated Code." />
+  <title>ProjectBrain (projectbrain-mcp) — Zero-LLM Cross-Stack Contract Firewall</title>
+  <meta name="description" content="Zero-LLM Cross-Stack Contract Firewall, Satellite Coordinate Router & Sub-2s PR Architecture Gate for AI-Generated Code. Apache-2.0. CLI, CI SARIF & Optional MCP." />
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet" />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
     :root {
-      --bg:        #0b0f19;
-      --surface:   #131825;
-      --border:    #1e2536;
-      --text:      #c9d1d9;
-      --text-dim:  #7d8590;
-      --heading:   #e6edf3;
-      --accent:    #58a6ff;
-      --accent-2:  #3fb950;
-      --accent-3:  #d2a8ff;
-      --code-bg:   #161b22;
-      --code-text: #c9d1d9;
-      --radius:    8px;
-      --max-w:     980px;
+      --bg:          #080a0f;
+      --bg-elev:     #0f121a;
+      --bg-card:     #121620;
+      --bg-code:     #0c0f16;
+      --border:      rgba(255, 255, 255, 0.08);
+      --border-hi:   rgba(255, 255, 255, 0.16);
+      --text:        #cbd5e1;
+      --text-dim:    #7e8ca0;
+      --heading:     #f8fafc;
+      --blue:        #60a5fa;
+      --green:       #34d399;
+      --amber:       #fbbf24;
+      --red:         #f87171;
+      --purple:      #c084fc;
+      --radius:      12px;
+      --radius-sm:   8px;
+      --max-w:       1080px;
     }
 
     html { scroll-behavior: smooth; font-size: 16px; }
 
     body {
-      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
-      background: var(--bg);
+      font-family: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:
+        radial-gradient(900px 500px at 50% -120px, rgba(96, 165, 250, 0.12), transparent 70%),
+        radial-gradient(600px 380px at 85% 10%, rgba(52, 211, 153, 0.06), transparent 65%),
+        var(--bg);
       color: var(--text);
-      line-height: 1.7;
+      line-height: 1.65;
       -webkit-font-smoothing: antialiased;
+      overflow-x: hidden;
     }
 
-    h1, h2, h3 { color: var(--heading); font-weight: 600; letter-spacing: -0.02em; }
-    h1 { font-size: 2.75rem; line-height: 1.15; }
-    h2 { font-size: 1.75rem; line-height: 1.3; margin-bottom: 1rem; }
-    h3 { font-size: 1.15rem; margin-bottom: 0.5rem; }
-    p  { margin-bottom: 1rem; }
-    a  { color: var(--accent); text-decoration: none; }
-    a:hover { text-decoration: underline; }
+    a { color: var(--blue); text-decoration: none; transition: color 0.15s ease; }
+    a:hover { color: #93c5fd; }
 
-    code, pre {
-      font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", "Consolas", monospace;
-      font-size: 0.875rem;
+    code, pre, .mono {
+      font-family: "JetBrains Mono", "Fira Code", "Cascadia Code", Consolas, monospace;
     }
 
     code {
-      background: var(--code-bg);
-      padding: 0.15em 0.4em;
-      border-radius: 4px;
-      color: var(--accent);
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid rgba(255, 255, 255, 0.06);
+      padding: 0.14em 0.42em;
+      border-radius: 5px;
+      font-size: 0.84em;
+      color: #e2e8f0;
     }
 
     pre {
-      background: var(--code-bg);
+      background: var(--bg-code);
       border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 1.25rem 1.5rem;
+      border-radius: var(--radius-sm);
+      padding: 1.15rem 1.35rem;
       overflow-x: auto;
-      margin-bottom: 1.5rem;
-      line-height: 1.55;
+      font-size: 0.84rem;
+      line-height: 1.6;
+      color: #dbeafe;
     }
-
-    pre code { background: none; padding: 0; color: var(--code-text); }
+    pre code { background: none; border: none; padding: 0; font-size: inherit; color: inherit; }
 
     .container { max-width: var(--max-w); margin: 0 auto; padding: 0 1.5rem; }
 
-    section { padding: 4.5rem 0; border-bottom: 1px solid var(--border); }
-    section:last-of-type { border-bottom: none; }
-
+    /* Navbar */
     nav {
       position: sticky;
       top: 0;
       z-index: 100;
-      background: rgba(11, 15, 25, 0.88);
-      backdrop-filter: blur(12px);
-      -webkit-backdrop-filter: blur(12px);
+      background: rgba(8, 10, 15, 0.82);
+      backdrop-filter: blur(14px);
+      -webkit-backdrop-filter: blur(14px);
       border-bottom: 1px solid var(--border);
-      padding: 0.85rem 0;
+    }
+    .nav-inner {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      height: 64px;
+      gap: 1rem;
+    }
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 0.65rem;
+      font-weight: 700;
+      font-size: 1rem;
+      color: var(--heading);
+      letter-spacing: -0.02em;
+    }
+    .brand-dot {
+      width: 10px;
+      height: 10px;
+      border-radius: 50%;
+      background: var(--green);
+      box-shadow: 0 0 12px rgba(52, 211, 153, 0.7);
+    }
+    .version-pill {
+      font-size: 0.72rem;
+      font-weight: 600;
+      padding: 0.18rem 0.55rem;
+      border-radius: 999px;
+      background: rgba(96, 165, 250, 0.12);
+      color: var(--blue);
+      border: 1px solid rgba(96, 165, 250, 0.25);
+    }
+    .nav-links { display: flex; align-items: center; gap: 1.5rem; }
+    .nav-links a { font-size: 0.875rem; font-weight: 500; color: var(--text-dim); }
+    .nav-links a:hover { color: var(--heading); }
+    .nav-cta {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.4rem;
+      padding: 0.42rem 0.9rem;
+      border-radius: 8px;
+      background: rgba(255, 255, 255, 0.06);
+      border: 1px solid var(--border-hi);
+      color: var(--heading) !important;
+      font-size: 0.82rem !important;
+      font-weight: 600 !important;
+    }
+    .nav-cta:hover { background: rgba(255, 255, 255, 0.11); }
+
+    /* Hero */
+    .hero { padding: 5.5rem 0 4.5rem; text-align: center; }
+    .eyebrow {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.55rem;
+      padding: 0.32rem 0.85rem;
+      border-radius: 999px;
+      background: rgba(52, 211, 153, 0.08);
+      border: 1px solid rgba(52, 211, 153, 0.22);
+      color: var(--green);
+      font-size: 0.78rem;
+      font-weight: 600;
+      margin-bottom: 1.6rem;
+    }
+    h1 {
+      font-size: clamp(2.2rem, 5vw, 3.6rem);
+      font-weight: 800;
+      line-height: 1.08;
+      letter-spacing: -0.035em;
+      color: var(--heading);
+      max-width: 860px;
+      margin: 0 auto 1.35rem;
+    }
+    h1 .grad {
+      background: linear-gradient(100deg, #93c5fd 0%, #34d399 100%);
+      -webkit-background-clip: text;
+      background-clip: text;
+      color: transparent;
+    }
+    .hero-sub {
+      font-size: 1.08rem;
+      color: var(--text-dim);
+      max-width: 720px;
+      margin: 0 auto 2.25rem;
+      line-height: 1.7;
     }
 
-    nav .container {
+    /* Command bar */
+    .cmd-box {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.9rem;
+      background: var(--bg-card);
+      border: 1px solid var(--border-hi);
+      border-radius: 10px;
+      padding: 0.72rem 0.8rem 0.72rem 1.2rem;
+      box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+      max-width: 100%;
+    }
+    .cmd-prompt { color: var(--green); font-weight: 600; user-select: none; }
+    .cmd-text {
+      font-size: 0.88rem;
+      color: var(--heading);
+      white-space: nowrap;
+      overflow-x: auto;
+    }
+    .copy-btn {
+      background: rgba(255, 255, 255, 0.07);
+      border: 1px solid var(--border);
+      color: var(--text);
+      font-family: inherit;
+      font-size: 0.76rem;
+      font-weight: 600;
+      padding: 0.42rem 0.75rem;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+      white-space: nowrap;
+    }
+    .copy-btn:hover { background: rgba(255, 255, 255, 0.14); color: var(--heading); }
+    .copy-btn.copied { border-color: rgba(52, 211, 153, 0.5); color: var(--green); }
+
+    .hero-actions {
+      margin-top: 1.4rem;
+      display: flex;
+      justify-content: center;
+      gap: 0.85rem;
+      flex-wrap: wrap;
+    }
+    .btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 0.45rem;
+      padding: 0.65rem 1.35rem;
+      border-radius: 9px;
+      font-size: 0.9rem;
+      font-weight: 600;
+      transition: transform 0.15s ease, background 0.15s ease;
+    }
+    .btn:hover { transform: translateY(-1px); }
+    .btn-primary { background: var(--heading); color: #090b10 !important; }
+    .btn-primary:hover { background: #e2e8f0; }
+    .btn-ghost {
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border-hi);
+      color: var(--heading) !important;
+    }
+    .btn-ghost:hover { background: rgba(255, 255, 255, 0.09); }
+
+    .hero-meta {
+      margin-top: 1.75rem;
+      display: flex;
+      justify-content: center;
+      flex-wrap: wrap;
+      gap: 0.65rem 1.6rem;
+      font-size: 0.8rem;
+      color: var(--text-dim);
+    }
+
+    /* Terminal Showcase */
+    .terminal {
+      margin: 3.25rem auto 0;
+      max-width: 880px;
+      text-align: left;
+      background: #0b0e14;
+      border: 1px solid var(--border-hi);
+      border-radius: var(--radius);
+      overflow: hidden;
+      box-shadow: 0 24px 70px rgba(0, 0, 0, 0.6);
+    }
+    .term-bar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0.7rem 1rem;
+      background: rgba(255, 255, 255, 0.03);
+      border-bottom: 1px solid var(--border);
+      font-size: 0.76rem;
+      color: var(--text-dim);
+    }
+    .term-dots { display: flex; gap: 6px; }
+    .term-dots span { width: 10px; height: 10px; border-radius: 50%; background: rgba(255,255,255,0.16); }
+    .term-body {
+      padding: 1.3rem 1.5rem;
+      font-size: 0.82rem;
+      line-height: 1.7;
+      overflow-x: auto;
+      white-space: pre;
+    }
+    .t-dim { color: #64748b; }
+    .t-green { color: var(--green); }
+    .t-red { color: var(--red); font-weight: 600; }
+    .t-amber { color: var(--amber); }
+    .t-blue { color: var(--blue); }
+    .t-white { color: var(--heading); font-weight: 600; }
+
+    /* Sections */
+    section { padding: 4.75rem 0; border-top: 1px solid var(--border); }
+    .sec-head { margin-bottom: 2.25rem; }
+    .sec-kicker {
+      font-size: 0.75rem;
+      font-weight: 700;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--blue);
+      margin-bottom: 0.55rem;
+    }
+    h2 {
+      font-size: clamp(1.55rem, 3vw, 2.15rem);
+      font-weight: 750;
+      letter-spacing: -0.03em;
+      color: var(--heading);
+      margin-bottom: 0.7rem;
+    }
+    .sec-desc { color: var(--text-dim); max-width: 680px; font-size: 0.98rem; }
+
+    /* Stat strip */
+    .stats-grid {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
+      gap: 0.9rem;
+      margin-bottom: 2rem;
+    }
+    .stat-card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-sm);
+      padding: 1.15rem 1.1rem;
+    }
+    .stat-val {
+      font-size: 1.55rem;
+      font-weight: 800;
+      letter-spacing: -0.03em;
+      color: var(--heading);
+      line-height: 1.2;
+    }
+    .stat-val.green { color: var(--green); }
+    .stat-lbl { font-size: 0.76rem; color: var(--text-dim); margin-top: 0.3rem; }
+
+    /* Receipts Grid */
+    .receipts-grid {
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 1.1rem;
+    }
+    .receipt {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.35rem 1.45rem;
+      display: flex;
+      flex-direction: column;
+      gap: 0.65rem;
+      transition: border-color 0.15s ease;
+    }
+    .receipt:hover { border-color: var(--border-hi); }
+    .receipt-top {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 0.75rem;
+      flex-wrap: wrap;
+    }
+    .receipt-repo { font-weight: 700; font-size: 0.94rem; color: var(--heading); }
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      font-size: 0.7rem;
+      font-weight: 700;
+      padding: 0.18rem 0.52rem;
+      border-radius: 6px;
+      letter-spacing: 0.03em;
+    }
+    .pill-pb11 { background: rgba(248, 113, 113, 0.14); color: var(--red); border: 1px solid rgba(248, 113, 113, 0.25); }
+    .pill-pb12 { background: rgba(251, 191, 36, 0.13); color: var(--amber); border: 1px solid rgba(251, 191, 36, 0.25); }
+    .pill-star { background: rgba(255, 255, 255, 0.06); color: var(--text-dim); }
+    .receipt p { font-size: 0.88rem; color: var(--text-dim); margin: 0; }
+    .receipt-foot {
+      margin-top: auto;
+      padding-top: 0.5rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      font-size: 0.8rem;
+      border-top: 1px solid var(--border);
+    }
+    .receipt-foot .pr-link { color: var(--green); font-weight: 600; }
+
+    /* Tabs */
+    .tabs-bar {
+      display: flex;
+      gap: 0.5rem;
+      flex-wrap: wrap;
+      margin-bottom: 1rem;
+    }
+    .tab-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      font-family: inherit;
+      font-size: 0.84rem;
+      font-weight: 600;
+      padding: 0.55rem 1rem;
+      border-radius: 8px;
+      cursor: pointer;
+      transition: all 0.15s ease;
+    }
+    .tab-btn:hover { color: var(--heading); border-color: var(--border-hi); }
+    .tab-btn.active {
+      background: rgba(96, 165, 250, 0.13);
+      border-color: rgba(96, 165, 250, 0.45);
+      color: var(--blue);
+    }
+    .tab-panel { display: none; position: relative; }
+    .tab-panel.active { display: block; }
+    .code-wrap { position: relative; }
+    .code-wrap .copy-btn { position: absolute; top: 0.75rem; right: 0.75rem; }
+
+    /* Capabilities grid */
+    .cards-grid {
+      display: grid;
+      grid-template-columns: repeat(3, 1fr);
+      gap: 1.1rem;
+    }
+    .card {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.45rem;
+    }
+    .card-tag {
+      display: inline-block;
+      font-size: 0.68rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      padding: 0.2rem 0.55rem;
+      border-radius: 5px;
+      margin-bottom: 0.8rem;
+    }
+    .tag-blue   { background: rgba(96, 165, 250, 0.14); color: var(--blue); }
+    .tag-green  { background: rgba(52, 211, 153, 0.13); color: var(--green); }
+    .tag-purple { background: rgba(192, 132, 252, 0.14); color: var(--purple); }
+    .tag-amber  { background: rgba(251, 191, 36, 0.13); color: var(--amber); }
+    .card h3 {
+      font-size: 1rem;
+      font-weight: 700;
+      color: var(--heading);
+      margin-bottom: 0.55rem;
+      letter-spacing: -0.015em;
+    }
+    .card p { font-size: 0.87rem; color: var(--text-dim); margin: 0; }
+
+    /* Table */
+    .table-wrap {
+      overflow-x: auto;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+    }
+    table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+    th, td { text-align: left; padding: 0.95rem 1.15rem; border-bottom: 1px solid var(--border); }
+    tr:last-child td { border-bottom: none; }
+    th {
+      font-size: 0.73rem;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: 0.06em;
+      color: var(--text-dim);
+      background: rgba(255, 255, 255, 0.02);
+    }
+    td:first-child { color: var(--heading); font-weight: 600; white-space: nowrap; }
+
+    /* Tradeoffs box */
+    .honest-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.1rem; }
+    .honest-card {
+      background: var(--bg-elev);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 1.4rem 1.5rem;
+    }
+    .honest-card h3 { font-size: 0.96rem; color: var(--heading); margin-bottom: 0.7rem; }
+    .honest-card ul { padding-left: 1.15rem; color: var(--text-dim); font-size: 0.875rem; }
+    .honest-card li { margin-bottom: 0.45rem; }
+
+    /* Footer */
+    footer {
+      border-top: 1px solid var(--border);
+      padding: 2.5rem 0;
+      color: var(--text-dim);
+      font-size: 0.83rem;
+    }
+    .footer-inner {
       display: flex;
       align-items: center;
       justify-content: space-between;
       flex-wrap: wrap;
       gap: 1rem;
     }
+    .footer-links { display: flex; gap: 1.35rem; flex-wrap: wrap; }
 
-    .nav-brand { font-weight: 700; font-size: 1.1rem; color: var(--heading); }
-    .nav-links { display: flex; gap: 1.5rem; flex-wrap: wrap; }
-    .nav-links a { color: var(--text-dim); font-size: 0.875rem; font-weight: 500; transition: color 0.2s; }
-    .nav-links a:hover { color: var(--heading); text-decoration: none; }
-
-    .hero { padding: 6.5rem 0 4.5rem; text-align: center; border-bottom: 1px solid var(--border); }
-    .hero h1 { margin-bottom: 1.25rem; }
-    .hero h1 span { color: var(--accent); }
-    .hero .subtitle {
-      font-size: 1.15rem;
-      color: var(--text-dim);
-      max-width: 760px;
-      margin: 0 auto 2.25rem;
-      line-height: 1.65;
+    @media (max-width: 900px) {
+      .stats-grid { grid-template-columns: repeat(2, 1fr); }
+      .cards-grid { grid-template-columns: 1fr; }
+      .receipts-grid, .honest-grid { grid-template-columns: 1fr; }
     }
-
-    .hero-install-group { display: flex; flex-direction: column; align-items: center; gap: 0.75rem; }
-    .hero-install {
-      display: inline-block;
-      background: var(--code-bg);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 0.85rem 1.75rem;
-      font-family: "JetBrains Mono", "Fira Code", monospace;
-      font-size: 0.95rem;
-      color: var(--accent-2);
-      text-align: left;
-    }
-
-    .hero-badges {
-      margin-top: 1.75rem;
-      display: flex;
-      justify-content: center;
-      gap: 1.75rem;
-      flex-wrap: wrap;
-      font-size: 0.85rem;
-      color: var(--text-dim);
-    }
-    .hero-badges span { white-space: nowrap; }
-
-    .setup-card {
-      background: var(--surface);
-      border: 1px solid var(--border);
-      border-radius: var(--radius);
-      padding: 1.75rem;
-      margin-top: 1.5rem;
-    }
-    .setup-card h3 { display: flex; align-items: center; gap: 0.75rem; margin-bottom: 0.75rem; color: var(--heading); }
-    .setup-step-badge {
-      display: inline-flex;
-      align-items: center;
-      justify-content: center;
-      background: rgba(88, 166, 255, 0.15);
-      color: var(--accent);
-      font-size: 0.75rem;
-      font-weight: 700;
-      padding: 0.2rem 0.65rem;
-      border-radius: 999px;
-      text-transform: uppercase;
-      letter-spacing: 0.05em;
-    }
-    .setup-card p { color: var(--text-dim); font-size: 0.95rem; margin-bottom: 1rem; }
-    .setup-card pre { margin-bottom: 0.5rem; }
-
-    .features-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1.5rem; margin-top: 2rem; }
-    .feature { background: var(--surface); border: 1px solid var(--border); border-radius: var(--radius); padding: 1.5rem 1.75rem; }
-    .feature h3 { color: var(--heading); }
-    .feature p  { color: var(--text-dim); margin-bottom: 0; font-size: 0.925rem; }
-
-    .feature-tag {
-      display: inline-block;
-      font-size: 0.7rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      padding: 0.2em 0.6em;
-      border-radius: 4px;
-      margin-bottom: 0.75rem;
-    }
-    .tag-core   { background: rgba(88,166,255,0.15); color: var(--accent); }
-    .tag-unique { background: rgba(210,168,255,0.15); color: var(--accent-3); }
-    .tag-roi    { background: rgba(63,185,80,0.15); color: var(--accent-2); }
-
-    .comparison-table { width: 100%; border-collapse: collapse; margin-top: 1.5rem; font-size: 0.9rem; }
-    .comparison-table th, .comparison-table td { text-align: left; padding: 0.85rem 1rem; border-bottom: 1px solid var(--border); }
-    .comparison-table th { color: var(--text-dim); font-weight: 500; font-size: 0.8rem; text-transform: uppercase; letter-spacing: 0.06em; }
-    .comparison-table td:first-child { color: var(--heading); font-weight: 500; }
-    .check { color: var(--accent-2); font-weight: 600; }
-    .cross { color: var(--text-dim); }
-    .partial { color: #d29922; }
-
-    .demo-block { margin-top: 1.75rem; }
-    .demo-block .demo-label {
-      font-size: 0.75rem;
-      font-weight: 600;
-      text-transform: uppercase;
-      letter-spacing: 0.06em;
-      color: var(--text-dim);
-      margin-bottom: 0.5rem;
-    }
-    .comment { color: #6e7681; }
-    .string  { color: #a5d6ff; }
-
-    .cta { text-align: center; padding: 5rem 0; }
-    .cta h2 { margin-bottom: 1rem; }
-    .cta p  { color: var(--text-dim); max-width: 580px; margin: 0 auto 2rem; }
-    .cta-buttons { display: flex; justify-content: center; gap: 1rem; flex-wrap: wrap; }
-    .btn {
-      display: inline-block;
-      padding: 0.75rem 1.75rem;
-      border-radius: var(--radius);
-      font-weight: 600;
-      font-size: 0.95rem;
-      transition: opacity 0.2s, transform 0.15s;
-      cursor: pointer;
-      text-decoration: none;
-    }
-    .btn:hover { text-decoration: none; opacity: 0.9; transform: translateY(-1px); }
-    .btn-primary { background: var(--accent); color: var(--bg); }
-    .btn-secondary { background: transparent; color: var(--heading); border: 1px solid var(--border); }
-
-    footer { border-top: 1px solid var(--border); padding: 2rem 0; text-align: center; color: var(--text-dim); font-size: 0.825rem; }
-
-    @media (max-width: 768px) {
-      h1 { font-size: 2rem; }
-      .hero { padding: 4rem 0 3rem; }
-      section { padding: 3.5rem 0; }
-      .features-grid { grid-template-columns: 1fr; }
-      .nav-links { gap: 1rem; }
+    @media (max-width: 640px) {
+      .nav-links a:not(.nav-cta) { display: none; }
+      .hero { padding: 3.75rem 0 3rem; }
+      .cmd-box { width: 100%; justify-content: space-between; }
     }
   </style>
 </head>
 <body>
 
   <nav>
-    <div class="container">
-      <div class="nav-brand">ProjectBrain <code>projectbrain-mcp v1.4</code></div>
+    <div class="container nav-inner">
+      <a href="#" class="brand">
+        <span class="brand-dot"></span>
+        <span>ProjectBrain</span>
+        <span class="version-pill mono">v1.4.0</span>
+      </a>
       <div class="nav-links">
-        <a href="#setup">10s Trial</a>
-        <a href="#workflow">Router &amp; Firewall</a>
-        <a href="#benchmarks">Benchmarks</a>
-        <a href="#features">Capabilities</a>
-        <a href="#compare">Stack Fit</a>
-        <a href="https://pypi.org/project/projectbrain-mcp/" target="_blank">PyPI</a>
-        <a href="https://github.com/Johanabhishek/ProjectBrain" target="_blank">GitHub</a>
+        <a href="#receipts">Wild Audit</a>
+        <a href="#quickstart">Quickstart</a>
+        <a href="#capabilities">Rules</a>
+        <a href="#stack">Stack Fit</a>
+        <a href="https://pypi.org/project/projectbrain-mcp/" target="_blank" rel="noopener">PyPI</a>
+        <a class="nav-cta" href="https://github.com/Johanabhishek/ProjectBrain" target="_blank" rel="noopener">GitHub &rarr;</a>
       </div>
     </div>
   </nav>
 
   <header class="hero">
     <div class="container">
-      <h1>Zero-LLM Cross-Stack Firewall &amp; Satellite Router<br />for <span>AI-Generated Code</span></h1>
-      <p class="subtitle">
-        Catch the bugs <code>pyright</code>, <code>tsc</code>, and <code>ruff</code> miss across HTTP boundaries, React lifecycles, Pydantic partial updates, and architectural layers — in <strong>&lt;1.5s locally or in CI</strong> with zero API keys, inline <code># pb:ignore</code> escape hatches, code-native <code>@pb-invariant</code> rules, and an optional Satellite Coordinate Router MCP.
-      </p>
-      <div class="hero-install-group">
-        <div class="hero-install">
-          uvx --from projectbrain-mcp projectbrain audit --profile fullstack<br />
-          uvx --from projectbrain-mcp projectbrain route "how are invoices settled"
-        </div>
+      <div class="eyebrow">
+        <span>Apache-2.0</span>
+        <span>&middot;</span>
+        <span>100% Local &amp; Deterministic</span>
+        <span>&middot;</span>
+        <span>Zero API Keys</span>
       </div>
-      <div class="hero-badges">
-        <span>&#9889; Zero-Write 10s <code>audit</code> Trial</span>
-        <span>&#128752; Satellite Coordinate Router (<code>route</code>)</span>
-        <span>&#129517; <code>PB011</code> HTTP &middot; <code>PB012</code> React &middot; <code>PB013</code> Pydantic</span>
-        <span>&#128737; <code>.projectbrain.toml</code> + <code># pb:ignore</code> + <code>@pb-invariant</code></span>
-        <span>&#128274; PR Merge-Base SARIF v2.1.0 &amp; Tamper Lock</span>
+      <h1>Catch the cross-stack bugs <span class="grad">tsc &amp; pyright miss</span> in &lt;2s.</h1>
+      <p class="hero-sub">
+        Single-language typecheckers stop at the HTTP boundary. Cloud AI PR reviewers are slow and probabilistic.
+        <strong>ProjectBrain</strong> is a local Tree-sitter CST &amp; Python AST contract firewall, PR SARIF gate, and optional MCP coordinate router for FastAPI/Pydantic &harr; React/TS repos.
+      </p>
+
+      <div class="cmd-box">
+        <span class="cmd-prompt mono">$</span>
+        <span class="cmd-text mono" id="hero-cmd">uvx --from projectbrain-mcp projectbrain audit --profile fullstack</span>
+        <button class="copy-btn" data-copy="#hero-cmd">Copy</button>
+      </div>
+
+      <div class="hero-actions">
+        <a class="btn btn-primary" href="#quickstart">10-Second Trial</a>
+        <a class="btn btn-ghost" href="https://github.com/Johanabhishek/ProjectBrain" target="_blank" rel="noopener">View Source on GitHub</a>
+        <a class="btn btn-ghost" href="https://pypi.org/project/projectbrain-mcp/" target="_blank" rel="noopener">PyPI Package</a>
+      </div>
+
+      <div class="hero-meta">
+        <span>Zero dotfiles written on trial</span>
+        <span>&middot;</span>
+        <span>0 PB011 false positives across 43 OSS repos</span>
+        <span>&middot;</span>
+        <span>SARIF v2.1.0 + GitHub Actions ready</span>
+        <span>&middot;</span>
+        <span>Python 3.10+</span>
+      </div>
+
+      <div class="terminal">
+        <div class="term-bar">
+          <div class="term-dots"><span></span><span></span><span></span></div>
+          <span class="mono">mongodb-labs/full-stack-fastapi-mongodb &mdash; real catch in 210 ms</span>
+          <span class="mono t-green">zero-write</span>
+        </div>
+        <div class="term-body mono"><span class="t-dim">$</span> <span class="t-white">uvx --from projectbrain-mcp projectbrain audit --profile fullstack</span>
+<span class="t-dim">Indexed 100 files · 21 HTTP routes · 50 Pydantic schemas · 0 dotfiles written (210 ms)</span>
+
+<span class="t-red">ERROR [PB011] http_payload_casing_mismatch</span> <span class="t-dim">(proven)</span>
+  <span class="t-blue">frontend/app/components/moderation/CreateUser.tsx:29</span> &rarr; <span class="t-blue">backend/app/app/schemas/user.py:22</span>
+  <span class="t-white">POST /users/create</span> sends <span class="t-amber">'fullName'</span>, but <span class="t-white">UserCreate</span> expects <span class="t-green">'full_name'</span>
+
+<span class="t-dim">Why compilers missed it:</span>
+  <span class="t-green">✓ tsc</span>     passed  <span class="t-dim">(IUserProfileCreate declared fullName)</span>
+  <span class="t-green">✓ pyright</span> passed  <span class="t-dim">(UserBase declared full_name: str = "")</span>
+  <span class="t-green">✓ HTTP</span>    200 OK  <span class="t-dim">(Pydantic extra="ignore" silently saved full_name="" into MongoDB)</span></div>
       </div>
     </div>
   </header>
 
-  <section id="setup">
+  <section id="receipts">
     <div class="container">
-      <h2>Try in 10 Seconds — Zero Config, Zero Dotfiles</h2>
-      <p>Verify real cross-stack bugs before writing a single config file to your repo, then opt into CI gates, hooks, or MCP when ready.</p>
+      <div class="sec-head">
+        <div class="sec-kicker">Verified In The Wild</div>
+        <h2>43 Open-Source Python + React/TS Repos Audited</h2>
+        <p class="sec-desc">
+          We ran <code>projectbrain audit --profile fullstack</code> zero-write across 43 active starred repositories (20,604 source files) and manually verified every headline bug.
+        </p>
+      </div>
 
-      <div class="setup-card">
-        <h3><span class="setup-step-badge">Step 1</span> Zero-Write Audit &amp; Satellite Route</h3>
-        <p>Run completely in-memory with <code>uvx</code> — creates zero <code>.projectbrain.db</code> or IDE files on disk:</p>
-        <pre><code><span class="comment"># Pair cleanly with ruff / pyright / tsc / eslint (zero overlapping lint noise):</span>
+      <div class="stats-grid">
+        <div class="stat-card">
+          <div class="stat-val">43</div>
+          <div class="stat-lbl">OSS repos audited</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-val">20,604</div>
+          <div class="stat-lbl">Source files scanned</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-val">5,392</div>
+          <div class="stat-lbl">HTTP routes indexed</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-val green">0 FP</div>
+          <div class="stat-lbl">PB011 cross-stack FPs</div>
+        </div>
+        <div class="stat-card">
+          <div class="stat-val">291</div>
+          <div class="stat-lbl">Automated tests passing</div>
+        </div>
+      </div>
+
+      <div class="receipts-grid">
+        <article class="receipt">
+          <div class="receipt-top">
+            <span class="receipt-repo mono">mongodb-labs/full-stack-fastapi-mongodb</span>
+            <div>
+              <span class="pill pill-pb11 mono">PB011</span>
+              <span class="pill pill-star">Official Template</span>
+            </div>
+          </div>
+          <p>
+            Frontend sends <code>fullName</code> to <code>POST /users/create</code> and <code>PUT /users/</code> while FastAPI's <code>UserBase</code> expects <code>full_name</code>. Returns <code>200 OK</code> and silently persists empty names to MongoDB. Caught in <strong>210 ms</strong>.
+          </p>
+          <div class="receipt-foot">
+            <span class="mono t-dim">CreateUser.tsx &harr; schemas/user.py</span>
+            <a class="pr-link" href="https://github.com/mongodb-labs/full-stack-fastapi-mongodb/pull/77" target="_blank" rel="noopener">PR #77 &rarr;</a>
+          </div>
+        </article>
+
+        <article class="receipt">
+          <div class="receipt-top">
+            <span class="receipt-repo mono">open-webui/open-webui</span>
+            <div>
+              <span class="pill pill-pb11 mono">PB011</span>
+              <span class="pill pill-star">159k ★</span>
+            </div>
+          </div>
+          <p>
+            <code>processWebSearch</code> sends <code>{ query, collection_name }</code> to <code>POST /api/v1/retrieval/process/web/search</code> while backend <code>SearchForm</code> expects <code>queries: list[str]</code> (guaranteed <code>422</code>; drifted client helper still exported &amp; imported).
+          </p>
+          <div class="receipt-foot">
+            <span class="mono t-dim">apis/retrieval/index.ts &harr; routers/retrieval.py</span>
+            <span class="mono t-blue">Verified schema drift</span>
+          </div>
+        </article>
+
+        <article class="receipt">
+          <div class="receipt-top">
+            <span class="receipt-repo mono">khoj-ai/khoj</span>
+            <div>
+              <span class="pill pill-pb12 mono">PB012</span>
+              <span class="pill pill-star">38k ★</span>
+            </div>
+          </div>
+          <p>
+            <code>FilesMenuCommandBox</code> defined inside <code>FilesMenu()</code> remounts <code>&lt;CommandInput&gt;</code> and wipes search text on every file toggle; uncancelled <code>useEffect</code> fetches on <code>[pageNumber]</code> and <code>[selectedFile]</code> overwrite active file previews.
+          </p>
+          <div class="receipt-foot">
+            <span class="mono t-dim">allConversations.tsx · search/page.tsx</span>
+            <a class="pr-link" href="https://github.com/khoj-ai/khoj/pull/1476" target="_blank" rel="noopener">PR #1476 &rarr;</a>
+          </div>
+        </article>
+
+        <article class="receipt">
+          <div class="receipt-top">
+            <span class="receipt-repo mono">aws-samples/bedrock-chat</span>
+            <div>
+              <span class="pill pill-pb12 mono">PB012</span>
+              <span class="pill pill-star">AWS Samples</span>
+            </div>
+          </div>
+          <p>
+            <code>ToolResultDocument</code> defined inside <code>ToolCard()</code> remounts stateful <code>&lt;JSONTree /&gt;</code> and collapses expanded nodes on parent renders; uncancelled <code>getMyBot(botId)</code> overwrites 15+ form fields on rapid navigation.
+          </p>
+          <div class="receipt-foot">
+            <span class="mono t-dim">ToolCard.tsx · BotKbEditPage.tsx</span>
+            <a class="pr-link" href="https://github.com/aws-samples/bedrock-chat/pull/1193" target="_blank" rel="noopener">PR #1193 &rarr;</a>
+          </div>
+        </article>
+      </div>
+    </div>
+  </section>
+
+  <section id="quickstart">
+    <div class="container">
+      <div class="sec-head">
+        <div class="sec-kicker">Zero-Friction Setup</div>
+        <h2>Try in 10 Seconds — Keep What Fits Your Workflow</h2>
+        <p class="sec-desc">
+          Works standalone as a CLI or CI PR gate without writing dotfiles or wiring MCP. Enable hooks or the lean 5-tool MCP server only when you want them.
+        </p>
+      </div>
+
+      <div class="tabs-bar" role="tablist">
+        <button class="tab-btn active" data-tab="t-trial">10s Zero-Write Trial</button>
+        <button class="tab-btn" data-tab="t-ci">GitHub Actions PR Gate</button>
+        <button class="tab-btn" data-tab="t-config">.projectbrain.toml &amp; Invariants</button>
+        <button class="tab-btn" data-tab="t-mcp">Optional Lean MCP</button>
+      </div>
+
+      <div class="tab-panel active" id="t-trial">
+        <div class="code-wrap">
+          <button class="copy-btn" data-copy="#code-trial">Copy</button>
+          <pre><code id="code-trial"># Non-overlapping profile alongside ruff / pyright / tsc / eslint (writes zero dotfiles):
 uvx --from projectbrain-mcp projectbrain audit --profile fullstack
 
-<span class="comment"># Satellite Coordinate Router: get exact file:Lstart-Lend spans, callers, routes &amp; tests:</span>
-uvx --from projectbrain-mcp projectbrain route <span class="string">"how are invoices validated and settled"</span></code></pre>
+# Satellite Coordinate Router: exact file:Lstart-Lend spans + callers + covering tests (~500 tokens):
+uvx --from projectbrain-mcp projectbrain route "how are invoices validated and settled"
+
+# Permanent install via uv or pip:
+uv tool install projectbrain-mcp</code></pre>
+        </div>
       </div>
 
-      <div class="setup-card">
-        <h3><span class="setup-step-badge">Step 2</span> Configure Rules &amp; Code-Native Invariants (Optional)</h3>
-        <p>Tune profiles in <code>.projectbrain.toml</code> (or <code>[tool.projectbrain]</code> in <code>pyproject.toml</code>), suppress intentional exceptions with <code># pb:ignore PBxxx</code>, and annotate critical functions inline:</p>
-        <pre><code><span class="comment"># .projectbrain.toml</span>
-profile = <span class="string">"fullstack"</span>
-exclude = [<span class="string">"generated/*"</span>, <span class="string">"migrations/*"</span>]
-
-<span class="comment"># In Python or TypeScript source code:</span>
-<span class="comment"># @pb-invariant: Must remain idempotent on duplicate invoice_id</span>
-<span class="comment">// pb:ignore PB012 -- intentionally fire-and-forget telemetry</span></code></pre>
+      <div class="tab-panel" id="t-ci">
+        <div class="code-wrap">
+          <button class="copy-btn" data-copy="#code-ci">Copy</button>
+          <pre><code id="code-ci">name: ProjectBrain Cross-Stack &amp; Architecture Gate
+on: [pull_request]
+jobs:
+  guardrail:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v4
+      - name: Cross-stack schema, React lifecycle &amp; architecture check
+        run: uvx --from projectbrain-mcp projectbrain check --profile fullstack --ci --format sarif</code></pre>
+        </div>
       </div>
 
-      <div class="setup-card">
-        <h3><span class="setup-step-badge">Step 3</span> Add Sub-2s PR Gate, Hooks &amp; Optional 5-Tool MCP</h3>
-        <p>Install globally via <code>uv tool install projectbrain-mcp</code>, wire OS-portable hooks/CI via <code>projectbrain init --team</code>, or add 1 CI step:</p>
-        <pre><code><span class="comment"># CI PR merge-base gate (auto-detects GitHub / GitLab / Bitbucket / Azure PR base):</span>
-uvx --from projectbrain-mcp projectbrain check --profile fullstack --ci
-uvx --from projectbrain-mcp projectbrain check --profile fullstack --format sarif &gt; projectbrain.sarif</code></pre>
-      </div>
-    </div>
-  </section>
+      <div class="tab-panel" id="t-config">
+        <div class="code-wrap">
+          <button class="copy-btn" data-copy="#code-cfg">Copy</button>
+          <pre><code id="code-cfg"># .projectbrain.toml (or [tool.projectbrain] in pyproject.toml)
+profile = "fullstack"          # all | fullstack | governance
+ignore  = ["PB010"]
+exclude = ["generated/*", "migrations/*"]
 
-  <section id="workflow">
-    <div class="container">
-      <h2>Offense + Defense Workflow</h2>
-      <p>Use ProjectBrain from your terminal, CI pipeline, or automatically through its 5-tool MCP server and active editor hooks.</p>
+# Code-native business invariants (automatically surfaced &amp; AST-hash locked):
+# @pb-invariant: Must remain idempotent on duplicate invoice_id
+@router.patch("/invoices/{invoice_id}")
+def patch_invoice(invoice_id: str, payload: InvoicePatch):
+    data = payload.model_dump(exclude_unset=True)  # safe partial update
 
-      <div class="demo-block">
-        <div class="demo-label">1. Zero-Config Day-1 Architecture &amp; Co-Change Discovery (<code>learn</code>)</div>
-        <pre><code><span class="comment"># Auto-discover zero-violation --forbid layer rules, git co-change contracts, and high-fan-in hub symbols</span>
-$ projectbrain --path /path/to/repo learn
-$ projectbrain --path /path/to/repo learn --apply</code></pre>
+# Inline escape hatch for intentional exceptions:
+# pb:ignore PB013 -- deliberate full reset</code></pre>
+        </div>
       </div>
 
-      <div class="demo-block">
-        <div class="demo-label">2. Compile a 1-Turn Architecture Dossier &amp; <code>&lt;20ms</code> PDG Slice (<code>dossier</code> / <code>slice --focus</code>)</div>
-        <pre><code><span class="comment"># Prints class-qualified AST slices, 1-2 hop call/state chains, and covering tests directly to stdout</span>
-$ projectbrain --path /path/to/repo dossier <span class="string">"how are exceptions routed to error handlers"</span>
-$ projectbrain --path /path/to/repo slice billing.py:compute_invoice --focus discount_total</code></pre>
-      </div>
-
-      <div class="demo-block">
-        <div class="demo-label">3. Pin Enforceable Boundaries, Co-Change Contracts &amp; AST Invariants (<code>remember</code>)</div>
-        <pre><code><span class="comment"># Protected against silent agent tampering in PRs by the Governance Tamper Lock</span>
-$ projectbrain --path /path/to/repo remember --forbid <span class="string">"routes/* -&gt; db/*"</span> --reason <span class="string">"Routes must call services/*"</span>
-$ projectbrain --path /path/to/repo remember --co-change <span class="string">"schema.sql &lt;-&gt; models/user.py"</span> --reason <span class="string">"Keep ORM synced"</span>
-$ projectbrain --path /path/to/repo remember settle_invoice <span class="string">"Must preserve idempotency on duplicate invoice_id"</span></code></pre>
-      </div>
-
-      <div class="demo-block">
-        <div class="demo-label">4. Whole-Repo Semantic Triage (<code>check --audit</code>), PR Merge-Base Gate, OASIS SARIF v2.1.0 &amp; Scorecard</div>
-        <pre><code>$ projectbrain --path /path/to/repo check --audit
-$ projectbrain --path /path/to/repo check --base main --ci
-$ projectbrain --path /path/to/repo check --base main --format pr-comment
-$ projectbrain --path /path/to/repo check --base main --format sarif &gt; projectbrain.sarif
-$ projectbrain --path /path/to/repo stats --summary
-===============================================================
-  ProjectBrain Guardrail &amp; Code-Graph Scorecard
-===============================================================
-  Indexed Topology            : 142 files | 618 functions | 84 classes
-  Pinned Repo Governance      : 6 AST invariants | 3 boundary rules
----------------------------------------------------------------
-  Guardrail Audits Run        : 28 (24 clean silent edits)
-  Total Regressions Caught    : 4
-    - Syntax Errors Caught    : 1
-    - Contract Breaks Caught  : 1
-    - Layer Boundary Blocks   : 1
-    - Signature Blast Alerts  : 1
-===============================================================</code></pre>
+      <div class="tab-panel" id="t-mcp">
+        <div class="code-wrap">
+          <button class="copy-btn" data-copy="#code-mcp">Copy</button>
+          <pre><code id="code-mcp">{
+  "mcpServers": {
+    "projectbrain": {
+      "command": "uvx",
+      "args": ["--from", "projectbrain-mcp", "projectbrain-mcp", "--lean", "/path/to/your/repo"]
+    }
+  }
+}</code></pre>
+        </div>
       </div>
     </div>
   </section>
 
-  <section id="benchmarks">
+  <section id="capabilities">
     <div class="container">
-      <h2>Verified External &amp; Scale Benchmarks</h2>
-      <p>All benchmarks in <code>projectbrain/eval/</code> are reproducible locally and gated in CI with strict zero-leakage AST checks.</p>
+      <div class="sec-head">
+        <div class="sec-kicker">Deterministic Pillars</div>
+        <h2>What ProjectBrain Verifies Locally (0 LLM Tokens)</h2>
+        <p class="sec-desc">
+          Built on bundled Tree-sitter C grammars (6 languages), Python AST dataflow, and a Salsa early-cutoff SQLite WAL code graph.
+        </p>
+      </div>
 
-      <div style="overflow-x: auto;">
-        <table class="comparison-table">
+      <div class="cards-grid">
+        <div class="card">
+          <span class="card-tag tag-blue mono">PB011</span>
+          <h3>Cross-Stack HTTP Schema Solver</h3>
+          <p>Verifies <code>fetch</code>, <code>axios</code>, and 1–2 hop client wrappers against FastAPI/Pydantic v1/v2, SQLModel, <code>TypedDict</code>, and <code>@dataclass</code> schemas — catching <code>422</code> missing fields, <code>camelCase &harr; snake_case</code> drift, response shape bugs, and HTTP verb mismatches.</p>
+        </div>
+
+        <div class="card">
+          <span class="card-tag tag-amber mono">PB012</span>
+          <h3>React Lifecycle &amp; Async Race Verifier</h3>
+          <p>Uses Tree-sitter CST to prove inline nested component remounts, post-mount loading early-returns unmounting stateful children, and uncancelled <code>useEffect([dep])</code> async <code>setState</code> races.</p>
+        </div>
+
+        <div class="card">
+          <span class="card-tag tag-purple mono">PB013</span>
+          <h3>Pydantic Partial-Update &amp; I/O Guard</h3>
+          <p>Flow-sensitively catches <code>.model_dump()</code> / <code>.dict()</code> without <code>exclude_unset=True</code> clobbering columns in <code>PATCH</code>/update sinks (respecting <code>exclude={...}</code>) and silent <code>except: pass</code> around <code>.commit()</code> or outbound HTTP mutations.</p>
+        </div>
+
+        <div class="card">
+          <span class="card-tag tag-green mono">PB002 · PB007 · PB008</span>
+          <h3>Governance &amp; Tamper Lock</h3>
+          <p>Enforces <code>--forbid</code> architectural boundaries, tracks code-native <code>@pb-invariant:</code> AST hashes, and blocks AI agents from deleting or weakening <code>.projectbrain.toml</code> / governance rules in PRs.</p>
+        </div>
+
+        <div class="card">
+          <span class="card-tag tag-blue mono">ROUTE · SLICE</span>
+          <h3>Satellite Coordinate Router</h3>
+          <p>Returns exact <code>file:Lstart-Lend</code> GPS coordinates, 1-hop callers/callees, HTTP route peers, covering tests, and invariants in ~500 tokens — letting agents use native <code>read_file</code>/<code>edit_file</code> without truncated dumps.</p>
+        </div>
+
+        <div class="card">
+          <span class="card-tag tag-green mono">SARIF · CI</span>
+          <h3>Sub-2s PR Merge-Base Gate</h3>
+          <p>Diffs multi-commit PRs cleanly against <code>git merge-base</code> and outputs text, JSON, GitHub annotations, sticky Mermaid PR impact summaries, or OASIS SARIF v2.1.0 with zero cloud code egress.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="stack">
+    <div class="container">
+      <div class="sec-head">
+        <div class="sec-kicker">Stack Fit &amp; Honest Tradeoffs</div>
+        <h2>Pairs With Your Compilers — Never Replaces Them</h2>
+      </div>
+
+      <div class="table-wrap" style="margin-bottom: 1.5rem;">
+        <table>
           <thead>
             <tr>
-              <th>Benchmark</th>
-              <th>Scope</th>
-              <th>Result</th>
-              <th>Notes</th>
+              <th>Layer</th>
+              <th>What It Catches</th>
+              <th>Blind Spot</th>
+              <th>ProjectBrain's Slot (<code>--profile fullstack</code>)</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td><strong>Synthetic Full-Stack Corpus (<code>PB011</code>&ndash;<code>PB013</code>)</strong></td>
-              <td>FastAPI/Pydantic/SQLModel + React/TSX (31 planted TP bugs + adversarial hard negatives + <code># pb:ignore</code>)</td>
-              <td class="check">100% P / 100% R (31/31, 0 FP)</td>
-              <td>Zero-write scan, strict line-span FP accounting (<code>eval/bench_fullstack.py</code>)</td>
+              <td><code>ruff</code> / <code>pyright</code> / <code>tsc</code> / <code>eslint</code></td>
+              <td>Single-language syntax, static types, lints</td>
+              <td>Blind across Python &harr; TS HTTP boundaries &amp; repo invariants</td>
+              <td>Cross-stack schema solver (<code>PB011</code>), React races (<code>PB012</code>), Pydantic clobbers (<code>PB013</code>)</td>
             </tr>
             <tr>
-              <td><strong><code>fastapi/full-stack-fastapi-template</code></strong></td>
-              <td>123 prod files (23 FastAPI routes, 108 Pydantic/SQLModel schemas, React/TSX)</td>
-              <td class="check">0 FP (SAFE_TO_PROCEED)</td>
-              <td>1.12s fullstack audit (uses generated OpenAPI SDK)</td>
+              <td>Cloud AI PR Reviewers</td>
+              <td>High-level logic &amp; prose review</td>
+              <td>30–90s latency, probabilistic noise, cloud code egress</td>
+              <td>&lt;2s deterministic local/CI SARIF gate, zero API keys, Apache-2.0</td>
             </tr>
             <tr>
-              <td><strong>Backend OSS Audit &amp; Incremental Scale</strong></td>
-              <td><code>flask</code>, <code>requests</code>, <code>click</code>, <code>express</code>, <code>django</code> (3,051 files)</td>
-              <td class="check">0 FP &middot; 515 ms / 894 ms</td>
-              <td>Core Python/JS contract precision + Salsa early-cutoff on SQLite WAL</td>
-            </tr>
-            <tr>
-              <td><strong>Held-Out Dossier Symbol Recall</strong></td>
-              <td><code>psf/requests</code>, <code>pallets/click</code>, <code>expressjs/express</code></td>
-              <td class="check">32 / 32 (100%)</td>
-              <td>3.89 KB/hit; 0 false refutations on dynamic receivers</td>
-            </tr>
-            <tr>
-              <td><strong>Cold Startup &amp; Non-Code Hook Filter</strong></td>
-              <td>CLI / Editor Post-Edit Hook</td>
-              <td class="check">&lt;30 ms in-process / ~150 ms import</td>
-              <td>Lazy Tree-sitter loading (~150&ndash;320 ms cold subprocess on Windows)</td>
+              <td>Coding Agents &amp; Swarms</td>
+              <td>Fast <code>rg</code>, parallel edits, multi-file refactors</td>
+              <td>Break uninspected callers, drift past invariants, tamper with configs</td>
+              <td>Post-edit hooks, tamper-locked rules (<code>PB007</code>), shared ~500-token coordinate routing</td>
             </tr>
           </tbody>
         </table>
       </div>
-    </div>
-  </section>
 
-  <section id="features">
-    <div class="container">
-      <h2>Core Capabilities</h2>
-      <div class="features-grid">
-        <div class="feature">
-          <div class="feature-tag tag-roi">Defense</div>
-          <h3>Active Post-Edit Firewall (<code>hooks.py</code>)</h3>
-          <p>Audits native <code>Edit</code> / <code>Write</code> changes in real time. Emits zero bytes when clean; catches syntax errors, broken caller arity, layer violations, signature blast radius, and mutated invariants.</p>
+      <div class="honest-grid">
+        <div class="honest-card">
+          <h3>Where ProjectBrain Shines</h3>
+          <ul>
+            <li>Monorepos pairing <strong>FastAPI / Pydantic / SQLModel</strong> backends with hand-written <strong>React / TypeScript</strong> <code>fetch</code> or <code>axios</code> clients.</li>
+            <li>Teams reviewing high-volume AI-generated PRs who want deterministic, zero-token CI gates for layer rules and business invariants.</li>
+            <li>Sub-second incremental local checks (<code>~515ms</code> body edits on 3,051-file Django repos via SQLite WAL + Salsa early-cutoff).</li>
+          </ul>
         </div>
-        <div class="feature">
-          <div class="feature-tag tag-core">Offense</div>
-          <h3>1-Turn Engineering Dossier (<code>brain_dossier</code>)</h3>
-          <p>Compiles class-qualified AST slices, 1&ndash;2 hop caller/callee skeletons, HTTP/state flows, and covering tests in one call.</p>
+        <div class="honest-card">
+          <h3>Honest Boundaries Today</h3>
+          <ul>
+            <li><strong>Monorepo required for <code>PB011</code>:</strong> Split frontend/backend repos and generated OpenAPI SDKs (where <code>tsc</code> already checks generated types) don't need <code>PB011</code>.</li>
+            <li><strong>Express routes:</strong> Currently verifies HTTP verbs and path matching, not Zod/Joi request/response body schemas.</li>
+            <li><strong>Dynamic runtime dispatch:</strong> Static analysis cannot prove calls through runtime-resolved adapters; <code>verify</code> honestly returns <code>UNKNOWN</code>.</li>
+          </ul>
         </div>
-        <div class="feature">
-          <div class="feature-tag tag-unique">Slicing</div>
-          <h3><code>&lt;20ms</code> SQLite + PDG Slicer (<code>brain_slice</code>)</h3>
-          <p>Extracts exact symbol bodies or variable-focused intra-function Program Dependence Graph slices (<code>--focus var</code>) without loading full files.</p>
-        </div>
-        <div class="feature">
-          <div class="feature-tag tag-unique">CI / PR Gate</div>
-          <h3>Whole-Repo Semantic Triage, PR Merge-Base &amp; SARIF v2.1.0 (<code>brain_check</code>)</h3>
-          <p>Runs <code>&lt;1.5s</code> whole-repo anomaly triage via <code>check --audit</code>, audits committed PR branches via <code>check --base main</code>, verifies 3-valued claims (<code>SUPPORTED</code> / <code>REFUTED</code> / <code>UNKNOWN</code>), emits OASIS SARIF v2.1.0 (<code>PB001</code>&ndash;<code>PB013</code>, incl. <code>PB011</code> HTTP schemas, <code>PB012</code> React remounts, <code>PB013</code> Pydantic clobbers), and renders sticky PR comments with Mermaid blast-radius graphs.</p>
-        </div>
-        <div class="feature">
-          <div class="feature-tag tag-core">Governance</div>
-          <h3>Tamper-Locked Governance &amp; Day-1 <code>learn</code></h3>
-          <p>Auto-discovers zero-violation <code>--forbid</code> boundaries and git co-change contracts via <code>projectbrain learn</code>, and blocks unauthorized rule deletion or hash tampering in PRs via the Governance Tamper Lock.</p>
-        </div>
-        <div class="feature">
-          <div class="feature-tag tag-core">Graph</div>
-          <h3>Polyglot Route &amp; Import Resolution (<code>brain_explore</code>)</h3>
-          <p>Resolves Python relative/barrel imports, TypeScript <code>@/</code>, <code>~/</code>, <code>#/</code> path aliases, CommonJS prototypes, and FastAPI, Flask, Django, Next.js, Express, and Hono routes.</p>
-        </div>
-      </div>
-    </div>
-  </section>
-
-  <section id="compare">
-    <div class="container">
-      <h2>How ProjectBrain v1.4 Complements Your Stack</h2>
-      <div style="overflow-x: auto;">
-        <table class="comparison-table">
-          <thead>
-            <tr>
-              <th>Capability</th>
-              <th>Ruff / Pyright / tsc</th>
-              <th>Cloud AI PR Reviewers</th>
-              <th>ProjectBrain v1.4 (<code>--profile fullstack</code>)</th>
-            </tr>
-          </thead>
-          <tbody>
-            <tr>
-              <td>Single-language types &amp; lints</td>
-              <td class="check">Best-in-class</td>
-              <td class="partial">Probabilistic</td>
-              <td class="partial">Opt-in (<code>--profile all</code>); defer to compilers</td>
-            </tr>
-            <tr>
-              <td>Cross-stack FastAPI/Pydantic &harr; React schemas (+ Express verb/route checks)</td>
-              <td class="cross">Blind at network boundary</td>
-              <td class="partial">Slow / noisy LLM guesses</td>
-              <td class="check">Deterministic AST solver (<code>PB011</code>) in &lt;1.5s</td>
-            </tr>
-            <tr>
-              <td>React stateful remount &amp; Pydantic <code>.model_dump()</code> clobbers</td>
-              <td class="cross">Not checked</td>
-              <td class="partial">Inconsistent</td>
-              <td class="check">Deterministic (<code>PB012</code>, <code>PB013</code>) + <code># pb:ignore</code></td>
-            </tr>
-            <tr>
-              <td>Layer boundaries (<code>--forbid</code>), <code>@pb-invariant</code> &amp; Tamper Lock</td>
-              <td class="cross">No</td>
-              <td class="partial">Prose rules only</td>
-              <td class="check">AST-hashed + PR Tamper Lock (<code>PB002/007/008</code>)</td>
-            </tr>
-            <tr>
-              <td>Satellite Coordinate Router &amp; Post-Edit Hook Redirect</td>
-              <td class="cross">No</td>
-              <td class="cross">PR-time only</td>
-              <td class="check"><code>route</code> / <code>dossier(coordinates_only=True)</code> + hooks</td>
-            </tr>
-            <tr>
-              <td>Zero API keys, 100% local / air-gapped &amp; SARIF v2.1.0</td>
-              <td class="check">Yes</td>
-              <td class="cross">Cloud code egress + $/seat</td>
-              <td class="check">Yes (&lt;2s deterministic CLI + CI)</td>
-            </tr>
-          </tbody>
-        </table>
-      </div>
-    </div>
-  </section>
-
-  <section class="cta">
-    <div class="container">
-      <h2>Catch Cross-Stack Regressions Before Review</h2>
-      <p>Run a 10-second zero-write audit with <code>uvx --from projectbrain-mcp projectbrain audit --profile fullstack</code> — zero API keys, zero dotfiles written.</p>
-      <div class="cta-buttons">
-        <a href="https://pypi.org/project/projectbrain-mcp/" class="btn btn-primary" target="_blank">View on PyPI</a>
-        <a href="https://github.com/Johanabhishek/ProjectBrain" class="btn btn-secondary" target="_blank">Star on GitHub</a>
       </div>
     </div>
   </section>
 
   <footer>
-    <div class="container">
-      <p>ProjectBrain (<code>projectbrain-mcp</code> v1.4.0) &mdash; Zero-LLM Cross-Stack Contract Firewall, Satellite Coordinate Router &amp; Sub-2s PR Architecture Gate. MIT License.</p>
+    <div class="container footer-inner">
+      <div>
+        <strong style="color: var(--heading);">ProjectBrain</strong> &middot; Apache License 2.0 &middot; Built by Johan Abhishek Dasari
+      </div>
+      <div class="footer-links">
+        <a href="https://github.com/Johanabhishek/ProjectBrain" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://pypi.org/project/projectbrain-mcp/" target="_blank" rel="noopener">PyPI</a>
+        <a href="https://github.com/Johanabhishek/projectbrain-docs" target="_blank" rel="noopener">Docs Repo</a>
+        <a href="https://github.com/Johanabhishek/ProjectBrain/blob/main/LICENSE" target="_blank" rel="noopener">Apache-2.0 License</a>
+      </div>
     </div>
   </footer>
 
+  <script>
+    // Interactive setup tabs
+    document.querySelectorAll('.tab-btn').forEach(btn => {
+      btn.addEventListener('click', () => {
+        document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+        document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+        btn.classList.add('active');
+        const panel = document.getElementById(btn.dataset.tab);
+        if (panel) panel.classList.add('active');
+      });
+    });
+
+    // One-click copy buttons
+    document.querySelectorAll('.copy-btn').forEach(btn => {
+      btn.addEventListener('click', async () => {
+        const target = document.querySelector(btn.dataset.copy);
+        if (!target) return;
+        try {
+          await navigator.clipboard.writeText(target.textContent.trim());
+          const orig = btn.textContent;
+          btn.textContent = 'Copied ✓';
+          btn.classList.add('copied');
+          setTimeout(() => {
+            btn.textContent = orig;
+            btn.classList.remove('copied');
+          }, 1600);
+        } catch (_) {}
+      });
+    });
+  </script>
 </body>
 </html>

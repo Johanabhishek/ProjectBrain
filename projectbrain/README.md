@@ -1,8 +1,9 @@
 # ProjectBrain (`projectbrain-mcp` v1.4.0)
 
 [![PyPI](https://img.shields.io/pypi/v/projectbrain-mcp.svg)](https://pypi.org/project/projectbrain-mcp/)
-[![License: MIT](https://img.shields.io/badge/License: MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Docs](https://img.shields.io/badge/docs-live-3fb950.svg)](https://johanabhishek.github.io/projectbrain-docs/)
 
 **Zero-LLM Cross-Stack Contract Firewall, Satellite Coordinate Router & Sub-2s PR Architecture Gate for AI-Generated Code (CLI, CI SARIF & Bundled MCP Server).**
 
@@ -213,11 +214,23 @@ python projectbrain/eval/bench_scale.py
 # 4. External OSS backend indexing, dossier recall & scale suite (flask, django, requests, click, express)
 python projectbrain/eval/bench_external.py --suite all
 
-# 5. Full unit, guardrail, suppression, anti-leakage & regression test suite (290 tests)
+# 5. Full unit, guardrail, suppression, anti-leakage & regression test suite (291 tests)
 pytest projectbrain/tests -q
 ```
 
-### 1. Synthetic Full-Stack Corpus & External OSS Audit (`python projectbrain/eval/bench_fullstack.py`)
+### 1. Real-World Open-Source Wild Audit (`43` Repos · `20,604` Files · `5,392` Routes · `16,084` Schemas)
+
+Running `projectbrain audit --profile fullstack --json` in zero-write mode across **43 starred open-source Python + React/TS repositories** (median audit time **`2.0s`**, `210ms–899ms` on repos `<350` files) produced **`0` `PB011` false positives** (`3/3` true positives) and uncovered real bugs missed by `tsc`, `pyright`, and `eslint`:
+
+| Repository | Stars | Rule | Verified Real Bug Caught | Status / PR |
+| :--- | :---: | :---: | :--- | :--- |
+| **`mongodb-labs/full-stack-fastapi-mongodb`** | 819 | `PB011` | Frontend sends `fullName` to `POST /users/create` & `PUT /users/`; Pydantic `UserBase` expects `full_name` (`200 OK`, silent data loss — saves `full_name=""` to MongoDB, caught in `210ms`) | [PR #77](https://github.com/mongodb-labs/full-stack-fastapi-mongodb/pull/77) |
+| **`open-webui/open-webui`** | 159k | `PB011` | `processWebSearch` (`src/lib/apis/retrieval/index.ts:433`) sends `{ query, collection_name }` to `POST /api/v1/retrieval/process/web/search`; backend `SearchForm` expects `queries: list[str]` (guaranteed `422` on invocation; currently drifted/uncalled helper) | Verified |
+| **`khoj-ai/khoj`** | 38k | `PB012` | `FilesMenuCommandBox` defined inside `FilesMenu()` remounts `<CommandInput>` and wipes search input on every toggle; uncancelled async fetches on `[pageNumber]` / `[selectedFile]` overwrite newer previews | [PR #1476](https://github.com/khoj-ai/khoj/pull/1476) |
+| **`aws-samples/bedrock-chat`** | 1.3k | `PB012` | `ToolResultDocument` defined inside `ToolCard()` remounts `<JSONTree />` and resets expanded nodes on re-render; uncancelled `getMyBot(botId)` overwrites form state on stale responses | [PR #1193](https://github.com/aws-samples/bedrock-chat/pull/1193) |
+| **`assafelovic/gpt-researcher`** | 30.8k | `PB012` | Streaming `useEffect([answer])` runs `markdownToHtml(answer).then(setHtmlContent)` without cancellation guard (`899ms` audit) | Verified |
+
+### 2. Synthetic Full-Stack Corpus (`python projectbrain/eval/bench_fullstack.py`)
 
 > **Transparency note:** The `PB011`–`PB013` precision/recall numbers below are measured on our **synthetic planted-bug corpus** (`eval/bench_fullstack.py`, strictly scored by function line-range spans where *any* unexpected hotspot anywhere counts as a FP). External real-world OSS validation is reported separately in the final row.
 
@@ -228,7 +241,7 @@ pytest projectbrain/tests -q
 | **Synthetic Corpus (`PB013` Pydantic/IO)** | 6 planted TP bugs (incl. `model_copy(update=...)`, `send_webhook`, `httpx.Client() as c`) + hard negatives (`exclude_unset=True`, `if v is not None`, filtered dict reassignment, multi-line decorator `# pb:ignore`) | **`100%` (`6/6`, `0` FP)** | **`100%`** | included | Strict function line-span FP verification |
 | **`fastapi/full-stack-fastapi-template` (External OSS)** | 123 prod files (`23` FastAPI routes, `108` Pydantic/SQLModel schemas, React/TSX) | **`0` FP (`SAFE_TO_PROCEED`)** | — | **`1.12s`** | Note: frontend uses generated OpenAPI SDK (`0` raw `fetch`/`axios` callsites) |
 
-### 2. Indexing Scale, Incremental Latency & Graph Retrieval (`bench_external.py` & `run_eval.py`)
+### 3. Indexing Scale, Incremental Latency & Graph Retrieval (`bench_external.py` & `run_eval.py`)
 
 | Benchmark | Scope | Result |
 | :--- | :--- | :---: |
