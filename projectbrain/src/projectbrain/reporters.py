@@ -593,6 +593,25 @@ def build_mermaid_blast_diagram(res: dict, *, max_nodes: int = 16, max_edges: in
     return "\n".join(lines)
 
 
+def _format_covering_tests(tests: list[str], limit: int = 10) -> tuple[str, bool]:
+    """Return `(formatted_command_or_list, is_shell_command)` matching the language of `tests`."""
+    subset = tests[:limit]
+    if not subset:
+        return "", False
+    if all(t.endswith(".py") for t in subset):
+        return f"pytest {' '.join(subset)}", True
+    if all(t.endswith((".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")) for t in subset):
+        return f"npx vitest run {' '.join(subset)}", True
+    if all(t.endswith(".go") for t in subset):
+        return f"go test {' '.join(subset)}", True
+    return " ".join(subset), False
+
+
+def _strip_md_diag_prefix(msg: str) -> str:
+    """Strip leading markdown bullet/emoji noise for clean plain-text terminal diagnostics."""
+    return re.sub(r"^-\s*(?:⚠️|\?\?)\s*", "", (msg or "").strip())
+
+
 def format_pr_comment_report(res: dict) -> str:
     """Format `brain.check()` as Zero-Noise Sticky PR Markdown with Mermaid blast-radius graph."""
     verdict = res.get("verdict", "SAFE_TO_PROCEED")
@@ -608,10 +627,11 @@ def format_pr_comment_report(res: dict) -> str:
     co_warnings: list[dict] = res.get("co_change_warnings", [])
     git_diff: dict = res.get("git_diff", {})
     base_info: dict = res.get("base_ref_info", {})
+    cov: dict = res.get("audit_coverage") or {}
 
     deleted_files: list[str] = git_diff.get("deleted_files", [])
     renamed_files: dict[str, str] = git_diff.get("renamed_files", {})
-    files_audited = imp.get("files_analyzed", len(details)) + len(deleted_files)
+    files_audited = (imp.get("files_analyzed", len(details)) + len(deleted_files)) or int(cov.get("files_scanned") or 0)
     impact_zone = imp.get("total_impact_zone", 0)
     has_external_impact = any(
         _dedup_caller_entries(d.get("called_by", []), exclude_file=d.get("rel_path", ""))
@@ -619,9 +639,31 @@ def format_pr_comment_report(res: dict) -> str:
         for d in details
     )
 
+    # Collect semantic & hotspot warnings (PB012 async races, PB013 swallowed IO, etc.)
+    adv_warnings: list[tuple[str, str, int, str]] = []  # (rule_id, uri, line, text)
+    seen_adv: set[tuple[str, int]] = set()
+    for hs in res.get("ranked_hotspots") or []:
+        if hs.get("severity") == "warning":
+            u_h = _clean_uri(hs.get("rel_path", ""), fallback="")
+            ln_h = int(hs.get("line") or 1)
+            if (u_h, ln_h) not in seen_adv:
+                seen_adv.add((u_h, ln_h))
+                adv_warnings.append((
+                    str(hs.get("rule_id") or "PB012"),
+                    u_h,
+                    ln_h,
+                    f"**[{hs.get('rule_id')}]** `{u_h}:L{ln_h}` — {hs.get('summary', '')}",
+                ))
+    for sw in res.get("semantic_warnings") or []:
+        u_s, ln_s, _ = _extract_location(sw, fallback_uri="")
+        if (u_s, ln_s) not in seen_adv:
+            seen_adv.add((u_s, ln_s))
+            rid_s = _classify_diag_rule_id(sw)
+            adv_warnings.append((rid_s, u_s, ln_s, _strip_md_diag_prefix(sw)))
+
     # Zero-Noise Sticky PR Guarantee: when clean with no external blast radius, signature changes,
-    # stale invariants, governance changes, deleted/renamed files, or co-change drift, emit a
-    # single-line green pass status under the sticky marker.
+    # stale invariants, semantic advisories, governance changes, deleted/renamed files, or co-change drift,
+    # emit a single-line green pass status under the sticky marker.
     if (
         all_valid
         and not diags
@@ -629,6 +671,7 @@ def format_pr_comment_report(res: dict) -> str:
         and not stale_memories
         and not sig_blast
         and not co_warnings
+        and not adv_warnings
         and not deleted_files
         and not renamed_files
         and not has_external_impact
@@ -656,7 +699,7 @@ def format_pr_comment_report(res: dict) -> str:
     lines.append(f"| **Files Audited** | `{files_audited}` (`{impact_zone}` downstream consumer file(s)) |")
     lines.append(f"| **Blocking Violations** | `{len(diags)}` |")
     lines.append(
-        f"| **Advisories** | `{len(stale_memories) + len(co_warnings) + len(sig_blast)}` |"
+        f"| **Advisories** | `{len(stale_memories) + len(co_warnings) + len(sig_blast) + len(adv_warnings)}` |"
     )
 
     if deleted_files or renamed_files:
@@ -726,17 +769,25 @@ def format_pr_comment_report(res: dict) -> str:
         for cw in co_warnings[:8]:
             lines.append(f"- ⚠️ {cw.get('message')}")
 
+    if adv_warnings:
+        lines.append("\n### ⚠️ Semantic Hazards & Async Race Advisories")
+        for _, _, _, w_txt in adv_warnings[:15]:
+            lines.append(f"- ⚠️ {w_txt}")
+
     tests = sorted({t for d in details for t in d.get("test_consumers", [])})
     if tests:
+        cmd_txt, is_cmd = _format_covering_tests(tests, limit=12)
         lines.extend([
             "",
             f"<details><summary>🧪 <b>Covering Test Suite ({len(tests)} file(s))</b></summary>",
             "",
-            "```bash",
-            f"pytest {' '.join(tests[:12])}",
-            "```",
-            "</details>",
         ])
+        if is_cmd:
+            lines.extend(["```bash", cmd_txt, "```"])
+        else:
+            for tf in tests[:12]:
+                lines.append(f"- `{tf}`")
+        lines.append("</details>")
 
     return "\n".join(lines)
 
@@ -801,19 +852,48 @@ def format_check_report(res: dict, fmt: str = "text") -> str:
             lines.append(
                 f"::warning{loc_part}title=Co-Change Drift::{cw.get('message')}"
             )
+        seen_gh_warn: set[tuple[str, int]] = set()
+        gh_warn_count = 0
+        for hs in res.get("ranked_hotspots") or []:
+            if hs.get("severity") == "warning":
+                u_h = _clean_uri(hs.get("rel_path", ""), fallback="")
+                ln_h = int(hs.get("line") or 1)
+                if (u_h, ln_h) in seen_gh_warn:
+                    continue
+                seen_gh_warn.add((u_h, ln_h))
+                gh_warn_count += 1
+                rid_h = hs.get("rule_id") or "PB012"
+                loc_part = f" file={u_h},line={ln_h}," if u_h else " "
+                lines.append(
+                    f"::warning{loc_part}title=ProjectBrain {rid_h} Advisory::{hs.get('summary', '')}"
+                )
+        for sw in res.get("semantic_warnings") or []:
+            u_s, ln_s, _ = _extract_location(sw, fallback_uri="")
+            if (u_s, ln_s) in seen_gh_warn:
+                continue
+            seen_gh_warn.add((u_s, ln_s))
+            gh_warn_count += 1
+            rid_s = _classify_diag_rule_id(sw)
+            loc_part = f" file={u_s},line={ln_s}," if u_s else " "
+            lines.append(
+                f"::warning{loc_part}title=ProjectBrain {rid_s} Advisory::{_strip_md_diag_prefix(sw)}"
+            )
         status_txt = "PASS" if all_valid else "FAILED"
         lines.append(
-            f"ProjectBrain CI Gate: {status_txt} (verdict={verdict}, diagnostics={len(diags)}, stale_invariants={len(stale_memories)})"
+            f"ProjectBrain CI Gate: {status_txt} (verdict={verdict}, diagnostics={len(diags)}, "
+            f"warnings={gh_warn_count}, stale_invariants={len(stale_memories)})"
         )
         return "\n".join(lines)
 
     if fmt == "markdown":
         badge = "PASS" if all_valid else "ACTION REQUIRED"
+        cov_md = res.get("audit_coverage") or {}
+        md_files_analyzed = imp.get("files_analyzed", len(details)) or int(cov_md.get("files_scanned") or 0)
         md: list[str] = [
             f"## ProjectBrain Blast-Radius & Contract Report — `{badge}`",
             "",
             f"- **Verdict:** `{verdict}`",
-            f"- **Files Analyzed:** `{imp.get('files_analyzed', len(details))}` | **Impact Zone:** `{imp.get('total_impact_zone', 0)}` file(s)",
+            f"- **Files Analyzed:** `{md_files_analyzed}` | **Impact Zone:** `{imp.get('total_impact_zone', 0)}` file(s)",
         ]
         if diags:
             md.append("\n### Contract, Syntax & Boundary Violations")
@@ -875,40 +955,71 @@ def format_check_report(res: dict, fmt: str = "text") -> str:
                 )
         tests = sorted({t for d in details for t in d.get("test_consumers", [])})
         if tests:
-            md.append(f"\n### Affected Tests\n```bash\npytest {' '.join(tests[:10])}\n```")
+            cmd_txt, is_cmd = _format_covering_tests(tests, limit=10)
+            if is_cmd:
+                md.append(f"\n### Affected Tests\n```bash\n{cmd_txt}\n```")
+            else:
+                md.append("\n### Affected Tests\n" + "\n".join(f"- `{tf}`" for tf in tests[:10]))
         return "\n".join(md)
 
     # Default `text` (Ruff-style scannable terminal output)
     out: list[str] = []
     status_lbl = "PASS" if all_valid else "VIOLATION"
     cov = res.get("audit_coverage") or {}
+    meta_bits: list[str] = []
+    if res.get("active_profile"):
+        meta_bits.append(f"profile={res['active_profile']}")
+    if res.get("suppressed_count"):
+        meta_bits.append(f"{res['suppressed_count']} suppressed")
+    if cov.get("deadline_exceeded"):
+        meta_bits.append("PARTIAL — time budget exceeded")
+    meta_sfx = f" ({', '.join(meta_bits)})" if meta_bits else ""
     if cov:
         out.append(
-            f"ProjectBrain Audit [{status_lbl}] — Verdict: {verdict} · "
+            f"ProjectBrain Audit [{status_lbl}] — Verdict: {verdict}{meta_sfx} · "
             f"{cov.get('files_scanned', 0)} files scanned ({cov.get('clean_files_verified', 0)} clean, "
             f"{cov.get('flagged_files_count', 0)} flagged) in {cov.get('elapsed_ms', 0)}ms"
         )
     elif details or diags or co_warnings or sig_blast:
-        out.append(f"ProjectBrain Check [{status_lbl}] — Verdict: {verdict}")
+        out.append(f"ProjectBrain Check [{status_lbl}] — Verdict: {verdict}{meta_sfx}")
     elif health:
         out.append(
-            f"ProjectBrain Check [{status_lbl}] — {health.get('files_indexed', 0)} files indexed "
+            f"ProjectBrain Check [{status_lbl}]{meta_sfx} — {health.get('files_indexed', 0)} files indexed "
             f"({health.get('graph_nodes', 0)} nodes, {health.get('graph_edges', 0)} edges, "
             f"{health.get('memories_count', 0)} invariants)"
         )
     else:
-        out.append(f"ProjectBrain Check [{status_lbl}]")
+        out.append(f"ProjectBrain Check [{status_lbl}]{meta_sfx}")
 
-    for d in diags:
-        out.append(f"  error: {d}")
-    for sw in res.get("semantic_warnings", [])[:10]:
-        out.append(f"  warning: {sw}")
-    if cov and res.get("ranked_hotspots"):
-        for hs in res["ranked_hotspots"][:15]:
+    if cov.get("deadline_exceeded"):
+        out.append(
+            "  warning: [PARTIAL AUDIT] Cross-file contract pass hit its time budget; "
+            "re-run with --scope <glob> for complete coverage."
+        )
+
+    ranked_hotspots = res.get("ranked_hotspots") or []
+    if cov and ranked_hotspots:
+        covered_locs = {
+            (_clean_uri(hs.get("rel_path", "")), int(hs.get("line") or 1))
+            for hs in ranked_hotspots
+        }
+        # Surface any blocking non-hotspot errors (e.g., PB001/PB002/PB007) without duplicating hotspots
+        for d in diags:
+            uri_d, ln_d, _ = _extract_location(d, fallback_uri="")
+            if uri_d and (uri_d, ln_d) in covered_locs:
+                continue
+            out.append(f"  error: {_strip_md_diag_prefix(d)}")
+        for hs in ranked_hotspots[:25]:
+            exact_loc = f"{hs.get('rel_path', '')}:L{hs.get('line', 1)}"
             out.append(
                 f"  hotspot #{hs.get('rank')} [{hs.get('rule_id')}/{hs.get('severity')}] "
-                f"{hs.get('recommended_read')} :: {hs.get('summary')}"
+                f"{exact_loc} (span {hs.get('recommended_read')}) :: {hs.get('summary')}"
             )
+    else:
+        for d in diags:
+            out.append(f"  error: {_strip_md_diag_prefix(d)}")
+        for sw in res.get("semantic_warnings", [])[:10]:
+            out.append(f"  warning: {_strip_md_diag_prefix(sw)}")
 
     for sb in sig_blast:
         for mut in sb.get("mutations", [])[:4]:
@@ -948,7 +1059,8 @@ def format_check_report(res: dict, fmt: str = "text") -> str:
 
     tests = sorted({t for d in details for t in d.get("test_consumers", [])})
     if tests:
-        out.append(f"  tests: pytest {' '.join(tests[:8])}")
+        cmd_txt, _ = _format_covering_tests(tests, limit=8)
+        out.append(f"  tests: {cmd_txt}")
 
     if health and health.get("partial_files"):
         out.append(f"  partial-parse: {', '.join(health['partial_files'][:5])}")

@@ -1117,6 +1117,9 @@ def load_neighborhood_for_check(brain: "ProjectBrain", candidate_files: list[str
             if any(
                 tok in src
                 for tok in ("fetch(", "axios", "/api/", "router.", "@app.", "BaseModel", "SQLModel", "TypedDict")
+            ) or (
+                p.suffix.lower() in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+                and bool(inf.get("imports"))
             ):
                 need_http_routes = True
         else:
@@ -1127,6 +1130,10 @@ def load_neighborhood_for_check(brain: "ProjectBrain", candidate_files: list[str
                 or any(fn.get("http_wrapper_spec") for fn in pre_inf.get("functions", []))
                 or any(c.get("schema_spec") for c in pre_inf.get("classes", []))
                 or any(c.get("http_calls") for c in pre_inf.get("cells_4d", []))
+                or (
+                    p.suffix.lower() in (".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs")
+                    and bool(pre_inf.get("imports"))
+                )
             ):
                 need_http_routes = True
 
@@ -1299,8 +1306,17 @@ def run_check(
     allow_governance_change: bool = False,
     audit: bool = False,
     scope_glob: str | None = None,
+    profile: str | None = None,
+    select_rules: list[str] | str | None = None,
+    ignore_rules: list[str] | str | None = None,
+    zero_write: bool = False,
 ) -> dict:
-    """Unified verification gate supporting working-tree edits AND committed PR merge-base diffs."""
+    """Unified verification gate supporting working-tree edits, whole-repo audits, AND committed PR merge-base diffs."""
+    from .config import (
+        apply_rule_and_suppression_filters,
+        load_repo_config,
+        resolve_active_rules,
+    )
     from .git_diff import (
         check_governance_tamper,
         compute_git_diff,
@@ -1311,7 +1327,16 @@ def run_check(
         verify_deleted_or_renamed_file_consumers,
     )
     from .hooks import _file_diag_lines, _is_auditable_code_path, compute_interface_diff
-    from .memory import extract_note_rel_path
+    from .memory import extract_inline_invariant_notes, extract_note_rel_path
+
+    repo_cfg = load_repo_config(brain.root)
+    active_rules, eff_profile, has_custom_filter = resolve_active_rules(
+        repo_cfg,
+        profile=profile,
+        select_rules=select_rules,
+        ignore_rules=ignore_rules,
+    )
+    exclude_globs: list[str] = list(repo_cfg.get("exclude") or [])
 
     brain._memory._ensure_fresh()
     should_resolve_base = (base_ref is not None) or (not files_modified and not claims and not plan_files)
@@ -1429,7 +1454,15 @@ def run_check(
             and not claims
             and not plan_files
         )
-        if fast_check_scope:
+        if zero_write:
+            if not brain._index:
+                if brain._db_store.db_path.exists():
+                    brain.load()
+                if not brain._index or brain.is_stale():
+                    brain.index(persist=False)
+            elif brain.is_stale():
+                brain.index(persist=False)
+        elif fast_check_scope:
             if not brain._index:
                 if not brain._load_neighborhood_for_check(effective_modified):
                     brain.load()
@@ -1633,6 +1666,13 @@ def run_check(
                 deleted_rels=del_set,
                 indexed_files=all_indexed_set,
             )
+            inline_memories = extract_inline_invariant_notes(
+                brain._index,
+                rel_paths=valid_focus,
+                existing_notes=matched_memories,
+            )
+            if inline_memories:
+                matched_memories = [*matched_memories, *inline_memories]
             stale_memories = [m for m in matched_memories if m.get("stale")]
 
             all_changed_for_cochange = {
@@ -1715,7 +1755,7 @@ def run_check(
             if not audit and 0 < len(brain._index) <= 160:
                 from .semantic_contracts import run_semantic_repo_audit
 
-                audit_auto = run_semantic_repo_audit(brain)
+                audit_auto = run_semantic_repo_audit(brain, exclude_globs=exclude_globs)
                 if audit_auto["combined_diagnostics"]:
                     out["static_audit_findings"] = audit_auto["combined_diagnostics"][:25]
                 if audit_auto["ranked_hotspots"]:
@@ -1724,7 +1764,11 @@ def run_check(
         if audit:
             from .semantic_contracts import run_semantic_repo_audit
 
-            audit_res = run_semantic_repo_audit(brain, scope_glob=scope_glob)
+            audit_res = run_semantic_repo_audit(
+                brain,
+                scope_glob=scope_glob,
+                exclude_globs=exclude_globs,
+            )
             out["audit_coverage"] = audit_res["audit_coverage"]
             out["ranked_hotspots"] = audit_res["ranked_hotspots"]
             if audit_res["combined_diagnostics"]:
@@ -1744,7 +1788,11 @@ def run_check(
         should_check_governance = (
             bool(merge_base)
             or (not files_modified and not claims and not plan_files)
-            or any(Path(str(f)).name == ".projectbrain_memory.json" for f in (files_modified or ()))
+            or bool(repo_cfg.get("has_config"))
+            or any(
+                Path(str(f)).name in (".projectbrain_memory.json", ".projectbrain.toml", "pyproject.toml")
+                for f in (files_modified or ())
+            )
         )
         if should_check_governance and find_git_context(brain.root)[0] is not None:
             gov_ref = merge_base or "HEAD"
@@ -1770,6 +1818,16 @@ def run_check(
         if not files_modified and not claims and not plan_files:
             out["health"] = brain.health(_already_fresh=True)
 
+        out = apply_rule_and_suppression_filters(
+            out,
+            brain.root,
+            active_rules=active_rules,
+            exclude_globs=exclude_globs,
+            profile_name=eff_profile,
+            has_custom_filter=has_custom_filter,
+            allow_inline_boundary_ignore=bool(repo_cfg.get("allow_inline_boundary_ignore", False)),
+            file_text_getter=brain._get_file_text,
+        )
         return out
     finally:
         if saved_pre_edit is not None:

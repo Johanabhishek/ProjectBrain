@@ -710,13 +710,13 @@ def _extract_py_schema_spec(
             fname = _text(left)
             rhs_txt = _collapse_ws(_text(right)) if right else ""
             if fname == "model_config":
-                if re.search(r"\bpopulate_by_name\s*=\s*True\b", rhs_txt):
+                if re.search(r"(?:\bpopulate_by_name\s*=|['\"]populate_by_name['\"]\s*:)\s*True\b", rhs_txt):
                     populate_by_name = True
                 if "alias_generator" in rhs_txt:
                     has_alias_generator = True
-                if re.search(r"\bextra\s*=\s*['\"]allow['\"]", rhs_txt):
+                if re.search(r"(?:\bextra\s*=|['\"]extra['\"]\s*:)\s*['\"]allow['\"]", rhs_txt):
                     extra_policy = "allow"
-                elif re.search(r"\bextra\s*=\s*['\"]forbid['\"]", rhs_txt):
+                elif re.search(r"(?:\bextra\s*=|['\"]extra['\"]\s*:)\s*['\"]forbid['\"]", rhs_txt):
                     extra_policy = "forbid"
                 continue
             if fname.startswith("_") or not typ:
@@ -911,6 +911,20 @@ def _extract_py_route_contract(
         is_query_explicit = "Query(" in p_def or "Query(" in ann_extra
         is_body_explicit = "Body(" in p_def or "Body(" in ann_extra
         if is_query_explicit or (not is_body_explicit and (bare_t in _PY_SCALAR_QUERY_TYPES or bare_t == "Literal")):
+            # FastAPI >= 0.115 supports `Annotated[PydanticModel, Query()]`, which unpacks the
+            # model's fields as top-level query params rather than requiring a literal param named `p_name`.
+            if (
+                is_query_explicit
+                and bare_t
+                and bare_t[:1].isupper()
+                and bare_t not in _PY_SCALAR_QUERY_TYPES
+                and bare_t not in (
+                    "Literal", "Optional", "Union", "List", "Sequence", "Set", "FrozenSet",
+                    "Tuple", "Any", "Enum", "IntEnum", "StrEnum",
+                )
+                and not bare_t.endswith("Enum")
+            ):
+                continue
             if not _is_optional_py_type(unwrapped_t):
                 q_rhs = p_def or (ann_extra if is_query_explicit else "")
                 is_q_opt = False
@@ -932,7 +946,14 @@ def _extract_py_route_contract(
             continue
 
         if verb in ("POST", "PUT", "PATCH", "DELETE"):
-            if not unwrapped_t or bare_t in ("dict", "Dict", "Any", "list", "List"):
+            if not unwrapped_t:
+                # An unannotated parameter with a non-Body default (e.g. `row=None`, `limit=10`)
+                # is treated as an optional query/helper param in FastAPI, not a dynamic JSON body.
+                if p_def and "Body(" not in p_def:
+                    continue
+                body_dynamic = True
+                continue
+            if bare_t in ("dict", "Dict", "Any", "list", "List"):
                 body_dynamic = True
                 continue
             if re.search(r"\bembed\s*=\s*True\b", combined_meta):
@@ -991,48 +1012,86 @@ def _py_direct_methods(body_node) -> list:
     return methods
 
 
-def _py_extract_imports_and_bindings(root) -> tuple[list[str], dict[str, dict]]:
-    """Extract both backward-compatible `imports` list AND symbol-level `import_bindings`."""
+def _is_py_type_checking_if(node) -> bool:
+    """Return True if `node` is `if TYPE_CHECKING:` or `if typing.TYPE_CHECKING:`."""
+    if node is None or node.type != "if_statement":
+        return False
+    cond = node.child_by_field_name("condition")
+    if cond is None:
+        return False
+    cond_txt = _collapse_ws(_text(cond))
+    return cond_txt == "TYPE_CHECKING" or cond_txt.endswith(".TYPE_CHECKING")
+
+
+def _in_py_type_checking_block(node) -> bool:
+    cur = getattr(node, "parent", None)
+    while cur is not None:
+        if cur.type == "if_statement" and _is_py_type_checking_if(cur):
+            return True
+        cur = getattr(cur, "parent", None)
+    return False
+
+
+def _py_extract_imports_and_bindings(root) -> tuple[list[str], dict[str, dict], list[str]]:
+    """Extract runtime `imports`, symbol-level `import_bindings`, and `type_only_imports`."""
     caps = _captures(_PY, _PY_IMPORT, root)
     imports_set: set[str] = set()
+    type_only_set: set[str] = set()
     bindings: dict[str, dict] = {}
 
     for n in caps.get("mod", []):
         mod_text = _text(n)
+        is_tc = _in_py_type_checking_block(n)
+        target_set = type_only_set if is_tc else imports_set
         if mod_text.replace(".", "") == "":
             parent = n.parent
             if parent and parent.type == "import_from_statement":
+                p_line = _line(parent)
                 for child in parent.children:
                     if child.type == "dotted_name" and child != n:
                         sym = _text(child)
-                        imports_set.add(mod_text + sym)
-                        bindings[sym] = {"module": mod_text + sym, "symbol": sym}
+                        target_set.add(mod_text + sym)
+                        b_entry = {"module": mod_text + sym, "symbol": sym, "line": p_line}
+                        if is_tc:
+                            b_entry["type_only"] = True
+                        bindings[sym] = b_entry
                     elif child.type == "aliased_import":
                         name_node = child.child_by_field_name("name")
                         alias_node = child.child_by_field_name("alias")
                         if name_node:
                             sym = _text(name_node)
                             local = _text(alias_node) if alias_node else sym
-                            imports_set.add(mod_text + sym)
-                            bindings[local] = {"module": mod_text + sym, "symbol": sym}
+                            target_set.add(mod_text + sym)
+                            b_entry = {"module": mod_text + sym, "symbol": sym, "line": p_line}
+                            if is_tc:
+                                b_entry["type_only"] = True
+                            bindings[local] = b_entry
         else:
-            imports_set.add(mod_text)
+            target_set.add(mod_text)
 
-    def _walk_imports(node):
+    def _walk_imports(node, in_type_checking: bool = False):
         for child in node.children:
             if child.type == "import_statement":
+                imp_line = _line(child)
                 for sub in child.children:
                     if sub.type == "dotted_name":
                         mod_name = _text(sub)
-                        bindings[mod_name.split(".")[0]] = {"module": mod_name, "symbol": "*"}
+                        b_e = {"module": mod_name, "symbol": "*", "line": imp_line}
+                        if in_type_checking:
+                            b_e["type_only"] = True
+                        bindings[mod_name.split(".")[0]] = b_e
                     elif sub.type == "aliased_import":
                         name_node = sub.child_by_field_name("name")
                         alias_node = sub.child_by_field_name("alias")
                         if name_node and alias_node:
-                            bindings[_text(alias_node)] = {
+                            b_e = {
                                 "module": _text(name_node),
                                 "symbol": "*",
+                                "line": imp_line,
                             }
+                            if in_type_checking:
+                                b_e["type_only"] = True
+                            bindings[_text(alias_node)] = b_e
             elif child.type == "import_from_statement":
                 mod_node = child.child_by_field_name("module_name")
                 mod_name = _text(mod_node) if mod_node else ""
@@ -1043,7 +1102,10 @@ def _py_extract_imports_and_bindings(root) -> tuple[list[str], dict[str, dict]]:
                     if sub.type == "dotted_name":
                         sym = _text(sub)
                         full_mod = f"{mod_name}.{sym}" if mod_name and not mod_name.endswith(".") else f"{mod_name}{sym}"
-                        bindings[sym] = {"module": mod_name or ".", "symbol": sym, "qualified_module": full_mod, "line": imp_line}
+                        b_e = {"module": mod_name or ".", "symbol": sym, "qualified_module": full_mod, "line": imp_line}
+                        if in_type_checking:
+                            b_e["type_only"] = True
+                        bindings[sym] = b_e
                     elif sub.type == "aliased_import":
                         name_node = sub.child_by_field_name("name")
                         alias_node = sub.child_by_field_name("alias")
@@ -1051,19 +1113,28 @@ def _py_extract_imports_and_bindings(root) -> tuple[list[str], dict[str, dict]]:
                             sym = _text(name_node)
                             local = _text(alias_node) if alias_node else sym
                             full_mod = f"{mod_name}.{sym}" if mod_name and not mod_name.endswith(".") else f"{mod_name}{sym}"
-                            bindings[local] = {"module": mod_name or ".", "symbol": sym, "qualified_module": full_mod, "line": imp_line}
+                            b_e = {"module": mod_name or ".", "symbol": sym, "qualified_module": full_mod, "line": imp_line}
+                            if in_type_checking:
+                                b_e["type_only"] = True
+                            bindings[local] = b_e
                     elif sub.type == "wildcard_import":
-                        bindings[f"__star__{mod_name or '.'}"] = {
+                        b_e = {
                             "module": mod_name or ".",
                             "symbol": "*",
                             "is_reexport": True,
                             "line": imp_line,
                         }
-            elif child.type in ("block", "if_statement", "try_statement", "function_definition"):
-                _walk_imports(child)
+                        if in_type_checking:
+                            b_e["type_only"] = True
+                        bindings[f"__star__{mod_name or '.'}"] = b_e
+            elif child.type == "if_statement":
+                child_tc = in_type_checking or _is_py_type_checking_if(child)
+                _walk_imports(child, in_type_checking=child_tc)
+            elif child.type in ("block", "try_statement", "function_definition"):
+                _walk_imports(child, in_type_checking=in_type_checking)
 
     _walk_imports(root)
-    return list(imports_set), bindings
+    return list(imports_set), bindings, sorted(type_only_set - imports_set)
 
 
 _BODY_NOISE = {
@@ -1439,7 +1510,7 @@ def _parse_python(root) -> dict:
             entry["is_nested"] = True
         functions.append(entry)
 
-    imports, import_bindings = _py_extract_imports_and_bindings(root)
+    imports, import_bindings, type_only_imports = _py_extract_imports_and_bindings(root)
     raw_root_text = _text(root)
     def _resolve_py_prefix_const(cname: str | None) -> str:
         if not cname:
@@ -1548,6 +1619,8 @@ def _parse_python(root) -> dict:
         "routes": routes,
         "const_aliases": _extract_const_aliases(py_consts),
     }
+    if type_only_imports:
+        py_out["type_only_imports"] = type_only_imports
     if router_mounts:
         py_out["router_mounts"] = router_mounts
     return py_out
@@ -1829,6 +1902,32 @@ def _js_named_exports(root, lang: Language) -> list[str]:
     return exports
 
 
+def _is_ts_type_only_import(node) -> bool:
+    """Return True if a JS/TS `import_statement` or `export_statement` is strictly type-only (`import type ...`)."""
+    if node is None:
+        return False
+    for ch in node.children:
+        if ch.type == "type":
+            return True
+    raw = _text(node).lstrip()
+    if re.match(r"^(?:import|export)\s+type(?:\s|\{)", raw):
+        return True
+    # Check `import { type Foo, type Bar } from './mod'` where every specifier is type-only
+    has_named = False
+    for ch in node.children:
+        if ch.type == "import_clause":
+            if any(sub.type in ("identifier", "namespace_import") for sub in ch.children):
+                return False
+            for sub in ch.children:
+                if sub.type == "named_imports":
+                    specs = [sp for sp in sub.children if sp.type == "import_specifier"]
+                    if specs:
+                        has_named = True
+                        if all(any(sc.type == "type" for sc in sp.children) for sp in specs):
+                            return True
+    return False if not has_named else False
+
+
 def _js_import_bindings(root) -> dict[str, dict]:
     """Extract JS/TS symbol-level import bindings (`import { a } from './mod'` and CommonJS `require('./mod')`)."""
     bindings: dict[str, dict] = {}
@@ -1839,31 +1938,48 @@ def _js_import_bindings(root) -> dict[str, dict]:
                 continue
             mod = _text(src_node).strip("'\"")
             imp_line = _line(node)
+            stmt_type_only = _is_ts_type_only_import(node)
             for child in node.children:
                 if child.type == "import_clause":
                     for sub in child.children:
                         if sub.type == "identifier":
-                            bindings[_text(sub)] = {"module": mod, "symbol": "default", "line": imp_line}
+                            b_e = {"module": mod, "symbol": "default", "line": imp_line}
+                            if stmt_type_only:
+                                b_e["type_only"] = True
+                            bindings[_text(sub)] = b_e
                         elif sub.type == "named_imports":
                             for spec in sub.children:
                                 if spec.type == "import_specifier":
+                                    spec_type_only = stmt_type_only or any(sc.type == "type" for sc in spec.children)
                                     name_n = spec.child_by_field_name("name")
                                     alias_n = spec.child_by_field_name("alias")
                                     if name_n:
                                         orig = _text(name_n)
                                         local = _text(alias_n) if alias_n else orig
-                                        bindings[local] = {"module": mod, "symbol": orig, "line": _line(spec)}
+                                        b_e = {"module": mod, "symbol": orig, "line": _line(spec)}
+                                        if spec_type_only:
+                                            b_e["type_only"] = True
+                                        bindings[local] = b_e
                                     else:
                                         ids = [c for c in spec.children if c.type == "identifier"]
                                         if len(ids) == 1:
                                             sym = _text(ids[0])
-                                            bindings[sym] = {"module": mod, "symbol": sym, "line": _line(spec)}
+                                            b_e = {"module": mod, "symbol": sym, "line": _line(spec)}
+                                            if spec_type_only:
+                                                b_e["type_only"] = True
+                                            bindings[sym] = b_e
                                         elif len(ids) >= 2:
-                                            bindings[_text(ids[-1])] = {"module": mod, "symbol": _text(ids[0]), "line": _line(spec)}
+                                            b_e = {"module": mod, "symbol": _text(ids[0]), "line": _line(spec)}
+                                            if spec_type_only:
+                                                b_e["type_only"] = True
+                                            bindings[_text(ids[-1])] = b_e
                         elif sub.type == "namespace_import":
                             for ns_c in sub.children:
                                 if ns_c.type == "identifier":
-                                    bindings[_text(ns_c)] = {"module": mod, "symbol": "*", "line": imp_line}
+                                    b_e = {"module": mod, "symbol": "*", "line": imp_line}
+                                    if stmt_type_only:
+                                        b_e["type_only"] = True
+                                    bindings[_text(ns_c)] = b_e
         elif node.type == "export_statement":
             src_node = node.child_by_field_name("source")
             if not src_node:
@@ -2016,17 +2132,19 @@ def _walk_js_ast(
                         if nc and nc[0].type in ("arrow_function", "function_expression"):
                             func_nodes.append(nd)
         elif nt == "import_statement":
-            src_n = nd.child_by_field_name("source")
-            if src_n is not None and src_n.type == "string":
-                for sc in src_n.children:
-                    if sc.type == "string_fragment":
-                        import_mods.add(_text(sc))
+            if not _is_ts_type_only_import(nd):
+                src_n = nd.child_by_field_name("source")
+                if src_n is not None and src_n.type == "string":
+                    for sc in src_n.children:
+                        if sc.type == "string_fragment":
+                            import_mods.add(_text(sc))
         elif nt == "export_statement":
-            src_n = nd.child_by_field_name("source")
-            if src_n is not None and src_n.type == "string":
-                for sc in src_n.children:
-                    if sc.type == "string_fragment":
-                        import_mods.add(_text(sc))
+            if not _is_ts_type_only_import(nd):
+                src_n = nd.child_by_field_name("source")
+                if src_n is not None and src_n.type == "string":
+                    for sc in src_n.children:
+                        if sc.type == "string_fragment":
+                            import_mods.add(_text(sc))
             decl = nd.child_by_field_name("declaration")
             if decl is not None:
                 dt = decl.type
@@ -2357,13 +2475,44 @@ def _parse_js(root, lang: Language) -> dict:
     exports.extend(assigned_exports)
     exports = list(set(exports))
 
+    raw_js_root = _text(root)
+    js_router_mounts: list[dict] = []
+    local_router_prefixes: dict[str, str] = {}
+    local_express_routers: set[str] = set()
+    if "Router(" in raw_js_root or "express(" in raw_js_root:
+        for m_rt in re.finditer(
+            r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*(?:express\s*\.\s*Router|Router|express)\s*\(",
+            raw_js_root,
+        ):
+            local_express_routers.add(m_rt.group(1))
+    if ".use(" in raw_js_root or ".route(" in raw_js_root:
+        for m_use in re.finditer(
+            r"\b[A-Za-z_$][\w$]*\.use\s*\(\s*['\"](/[A-Za-z0-9_/\-:]+)['\"]\s*,([^);\n]+)\)",
+            raw_js_root,
+        ):
+            u_pref = m_use.group(1).rstrip("/") or "/"
+            arg_parts = [p.strip() for p in m_use.group(2).split(",") if p.strip()]
+            # Express `app.use("/api/v2", authMiddleware, usersRouter)` mounts the last router argument
+            u_tgt = arg_parts[-1] if arg_parts else ""
+            if (
+                u_tgt
+                and re.match(r"^[A-Za-z_$][\w$.]*$", u_tgt)
+                and u_tgt not in ("express", "cors", "json", "urlencoded", "helmet")
+            ):
+                js_router_mounts.append({"target": u_tgt, "prefix": u_pref})
+                local_router_prefixes[u_tgt] = u_pref
+                local_express_routers.add(u_tgt)
+
     for m_node, p_node, o_node, args_node, rc_node in route_matches:
         method = _text(m_node)
         if method not in _HTTP:
             continue
         path = _text(p_node)
         receiver = _text(o_node) if o_node else ""
-        if not _is_express_route(receiver, path):
+        if not (
+            _is_express_route(receiver, path)
+            or (path.startswith("/") and receiver in local_express_routers)
+        ):
             continue
 
         handler_name = None
@@ -2406,20 +2555,13 @@ def _parse_js(root, lang: Language) -> dict:
             "line": _line(m_node),
             "framework": "express",
         }
+        loc_pref = local_router_prefixes.get(receiver, "")
+        if loc_pref and loc_pref != "/":
+            p_join = "/" + path.lstrip("/") if path and path != "/" else ""
+            route_dict["full_path"] = f"{loc_pref.rstrip('/')}{p_join}" or "/"
         if handler_name:
             route_dict["handler"] = handler_name
         routes.append(route_dict)
-
-    js_router_mounts: list[dict] = []
-    raw_js_root = _text(root)
-    if ".use(" in raw_js_root or ".route(" in raw_js_root:
-        for m_use in re.finditer(
-            r"\b[A-Za-z_$][\w$]*\.use\s*\(\s*['\"](/[A-Za-z0-9_/\-:]+)['\"]\s*,\s*([A-Za-z_$][\w$.]*)",
-            raw_js_root,
-        ):
-            u_pref, u_tgt = m_use.group(1).rstrip("/") or "/", m_use.group(2).strip()
-            if u_tgt and u_tgt not in ("express", "cors", "json", "urlencoded", "helmet"):
-                js_router_mounts.append({"target": u_tgt, "prefix": u_pref})
 
     if fn_raw_pairs:
         _annotate_js_state_and_http_wrappers(fn_raw_pairs)
@@ -2517,6 +2659,7 @@ def _annotate_js_state_and_http_wrappers(fn_pairs: list[tuple[dict, str]]) -> No
                     fixed_verb = m_fm.group(1).upper()
         body_idx: int | None = None
         opts_idx: int | None = None
+        method_idx: int | None = None
         for idx_p in range(1, len(p_names)):
             pn = p_names[idx_p]
             if not pn:
@@ -2525,6 +2668,8 @@ def _annotate_js_state_and_http_wrappers(fn_pairs: list[tuple[dict, str]]) -> No
                 rf"\.(?:post|put|patch)\s*\([^,]+,\s*{re.escape(pn)}\s*[,)]", raw_b
             ):
                 body_idx = idx_p
+            elif pn.lower() == "method":
+                method_idx = idx_p
             elif pn.lower() in ("options", "opts", "init", "config") or re.search(
                 rf"\bfetch\s*\([^,]+,\s*(?:\{{\s*\.\.\.{re.escape(pn)}|{re.escape(pn)}\s*\))", raw_b
             ):
@@ -2534,6 +2679,7 @@ def _annotate_js_state_and_http_wrappers(fn_pairs: list[tuple[dict, str]]) -> No
             "fixed_method": fixed_verb,
             "body_param_idx": body_idx,
             "opts_param_idx": opts_idx,
+            "method_param_idx": method_idx,
             "returns_json": returns_json,
         }
         transport_helpers[fn_nm] = t_spec
@@ -2594,12 +2740,34 @@ def _annotate_js_state_and_http_wrappers(fn_pairs: list[tuple[dict, str]]) -> No
                         m_bs2 = re.search(r"\bbody\s*:\s*(?:JSON\.stringify\s*\(\s*)?([A-Za-z_$][\w$]*)", rest)
                         if m_bs2 and m_bs2.group(1) in p_names:
                             b_idx = p_names.index(m_bs2.group(1))
+                    elif not vb and h_spec.get("method_param_idx") is not None:
+                        rest_parts = [part.strip() for part in rest.split(",")]
+                        m_pos = int(h_spec["method_param_idx"]) - 1
+                        if 0 <= m_pos < len(rest_parts):
+                            m_lit_v = re.match(r"^['\"](GET|POST|PUT|PATCH|DELETE)['\"]$", rest_parts[m_pos], re.IGNORECASE)
+                            if m_lit_v:
+                                vb = m_lit_v.group(1).upper()
+                        if not vb:
+                            continue
+                        hb_idx = h_spec.get("body_param_idx")
+                        if hb_idx is not None:
+                            b_pos = int(hb_idx) - 1
+                            if 0 <= b_pos < len(rest_parts) and rest_parts[b_pos] in p_names:
+                                b_idx = p_names.index(rest_parts[b_pos])
                     else:
+                        if not vb and rest:
+                            # Positional verb literal even if method param wasn't named `method`
+                            first_tok = rest.split(",", 1)[0].strip()
+                            m_lit_v = re.match(r"^['\"](GET|POST|PUT|PATCH|DELETE)['\"]$", first_tok, re.IGNORECASE)
+                            if m_lit_v:
+                                vb = m_lit_v.group(1).upper()
                         vb = vb or "GET"
-                        if h_spec["body_param_idx"] == 1:
-                            first_rest = rest.split(",", 1)[0].strip()
-                            if first_rest in p_names:
-                                b_idx = p_names.index(first_rest)
+                        hb_idx = h_spec.get("body_param_idx")
+                        if hb_idx is not None:
+                            rest_parts = [part.strip() for part in rest.split(",")]
+                            b_pos = int(hb_idx) - 1
+                            if 0 <= b_pos < len(rest_parts) and rest_parts[b_pos] in p_names:
+                                b_idx = p_names.index(rest_parts[b_pos])
                     hits.append((vb, u_raw, b_idx, h_spec["returns_json"]))
 
         if len(hits) == 1:
@@ -3653,6 +3821,93 @@ def _has_structural_error(node, ext_l: str) -> bool:
     return False
 
 
+_INLINE_INVARIANT_RE = re.compile(
+    r"(?:#|//|/\*|\*)\s*@(?:pb-invariant|projectbrain-invariant)\s*:\s*(.+?)(?:\*/)?\s*$",
+    re.IGNORECASE,
+)
+
+
+def _attach_inline_invariants(source: str, result: dict) -> None:
+    """Attach `# @pb-invariant: ...` / `// @pb-invariant: ...` annotations preceding functions/classes."""
+    if "@pb-invariant" not in source.lower() and "@projectbrain-invariant" not in source.lower():
+        return
+    lines = source.splitlines()
+    n = len(lines)
+    if not n:
+        return
+
+    def _scan_leading_invariants(start_line: int) -> list[str]:
+        idx = max(0, int(start_line or 1) - 1)
+        found: list[str] = []
+        # Check inline comment on declaration line itself first
+        if 0 <= idx < n:
+            m_same = _INLINE_INVARIANT_RE.search(lines[idx])
+            if m_same and m_same.group(1).strip():
+                found.append(m_same.group(1).strip())
+        # Scan upward across contiguous comments and single/multi-line decorators (up to 40 lines)
+        up_found: list[str] = []
+        cur = idx - 1
+        steps = 0
+        rev_dec_depth = 0
+        while cur >= 0 and steps < 40:
+            s = lines[cur].strip()
+            steps += 1
+            if not s:
+                if rev_dec_depth > 0:
+                    cur -= 1
+                    continue
+                break
+            m = _INLINE_INVARIANT_RE.search(s)
+            if m and m.group(1).strip():
+                up_found.append(m.group(1).strip())
+                cur -= 1
+                continue
+            code_part = s.split("#", 1)[0].strip()
+            if rev_dec_depth > 0:
+                rev_dec_depth += code_part.count(")") + code_part.count("]") - code_part.count("(") - code_part.count("[")
+                if rev_dec_depth < 0:
+                    rev_dec_depth = 0
+                cur -= 1
+                continue
+            if s.startswith(("#", "//", "/*", "*", "@", "///", "#[")):
+                cur -= 1
+                continue
+            # Closing line of a multi-line decorator like `@router.patch(\n...\n)` or `#[attr(\n...\n)]`
+            if code_part.endswith((")", "]")):
+                opens = code_part.count("(") + code_part.count("[")
+                closes = code_part.count(")") + code_part.count("]")
+                if closes > opens:
+                    # Verify an `@` or `#[` decorator actually opens above within 25 lines
+                    probe = cur - 1
+                    bal = closes - opens
+                    found_dec_head = False
+                    while probe >= max(0, cur - 25):
+                        ps = lines[probe].strip()
+                        pc = ps.split("#", 1)[0]
+                        bal += pc.count(")") + pc.count("]") - pc.count("(") - pc.count("[")
+                        if bal <= 0:
+                            found_dec_head = ps.startswith(("@", "#["))
+                            break
+                        probe -= 1
+                    if found_dec_head:
+                        rev_dec_depth = closes - opens
+                        cur -= 1
+                        continue
+            break
+        up_found.reverse()
+        out = [*up_found, *found]
+        return list(dict.fromkeys(out))
+
+    for group_key in ("functions", "classes"):
+        for item in result.get(group_key) or ():
+            l_start = item.get("line_start")
+            if not l_start:
+                continue
+            invs = _scan_leading_invariants(l_start)
+            if invs:
+                item["inline_invariants"] = invs
+
+
 def parse_with_tree(source: str, ext: str) -> tuple[dict, object | None]:
     """Parse source by file extension and return `(result_dict, tree_sitter_tree)` for single-pass reuse."""
     ext_l = ext.lower()
@@ -3662,7 +3917,9 @@ def parse_with_tree(source: str, ext: str) -> tuple[dict, object | None]:
         script_src, script_ext = _extract_sfc_script_preserving_lines(source)
         return parse_with_tree(script_src, script_ext)
     if ext_l in _STRUCTURAL_POLYGLOT_EXTS and get_language(ext_l) is None:
-        return _parse_polyglot_structural(source, ext_l), None
+        res_poly = _parse_polyglot_structural(source, ext_l)
+        _attach_inline_invariants(source, res_poly)
+        return res_poly, None
     parser = get_parser(ext_l)
     lang = get_language(ext_l)
     if parser is None or lang is None:
@@ -3698,6 +3955,7 @@ def parse_with_tree(source: str, ext: str) -> tuple[dict, object | None]:
                 for sc_k, sc_obj in (result.get("sql_schemas") or {}).items():
                     if sc_k.lower() == tbl_k.lower():
                         apply_sql_alters_to_schema(sc_obj, ops)
+    _attach_inline_invariants(source, result)
     result["parse_status"] = "partial" if _has_structural_error(root, ext_l) else "ok"
     result["interface_hash"] = compute_file_interface_hash(result)
     return result, tree

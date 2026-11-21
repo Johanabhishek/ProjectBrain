@@ -3,8 +3,8 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ProjectBrain v1.3 (projectbrain-mcp) — Zero-LSP Code Graph, Deep Semantic Triage &amp; Sub-2s Contract Guardrail for AI Agents</title>
-  <meta name="description" content="Zero-LSP SQLite Code Graph, Real-Time Post-Edit &amp; PR Merge-Base Contract Guardrail, Governance Tamper Lock, SARIF v2.1.0, and Surgical PDG Context Compiler for AI Coding Agents." />
+  <title>ProjectBrain v1.4 (projectbrain-mcp) — Zero-LLM Cross-Stack Contract Firewall &amp; Satellite Coordinate Router</title>
+  <meta name="description" content="Zero-LLM Cross-Stack Contract Firewall, Satellite Coordinate Router, PR Merge-Base SARIF Gate, Code-Native @pb-invariant Rules &amp; Bundled MCP Server for AI-Generated Code." />
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
 
@@ -226,13 +226,13 @@
 
   <nav>
     <div class="container">
-      <div class="nav-brand">ProjectBrain <code>projectbrain-mcp v1.3</code></div>
+      <div class="nav-brand">ProjectBrain <code>projectbrain-mcp v1.4</code></div>
       <div class="nav-links">
-        <a href="#setup">Setup</a>
-        <a href="#workflow">Guardrails &amp; CLI</a>
+        <a href="#setup">10s Trial</a>
+        <a href="#workflow">Router &amp; Firewall</a>
         <a href="#benchmarks">Benchmarks</a>
         <a href="#features">Capabilities</a>
-        <a href="#compare">Comparison</a>
+        <a href="#compare">Stack Fit</a>
         <a href="https://pypi.org/project/projectbrain-mcp/" target="_blank">PyPI</a>
         <a href="https://github.com/Johanabhishek/ProjectBrain" target="_blank">GitHub</a>
       </div>
@@ -241,65 +241,59 @@
 
   <header class="hero">
     <div class="container">
-      <h1>Zero-LSP Code Graph &amp; PR Blast-Radius Firewall<br />for <span>AI Coding Agents &amp; Teams</span></h1>
+      <h1>Zero-LLM Cross-Stack Firewall &amp; Satellite Router<br />for <span>AI-Generated Code</span></h1>
       <p class="subtitle">
-        Give Claude Code, Cursor, Antigravity, and CI pipelines 1-turn PDG/AST architecture context <strong>(Offense)</strong>
-        plus silent-when-clean post-edit hooks, PR merge-base contract verification, Governance Tamper Lock, OASIS SARIF v2.1.0, and Day-1 architecture learning <strong>(Defense)</strong> —
-        powered by local SQLite WAL + lazy Tree-sitter.
+        Catch the bugs <code>pyright</code>, <code>tsc</code>, and <code>ruff</code> miss across HTTP boundaries, React lifecycles, Pydantic partial updates, and architectural layers — in <strong>&lt;1.5s locally or in CI</strong> with zero API keys, inline <code># pb:ignore</code> escape hatches, code-native <code>@pb-invariant</code> rules, and an optional Satellite Coordinate Router MCP.
       </p>
       <div class="hero-install-group">
         <div class="hero-install">
-          uv tool install projectbrain-mcp<br />
-          projectbrain --path /path/to/your/repo init --team --learn
+          uvx --from projectbrain-mcp projectbrain audit --profile fullstack<br />
+          uvx --from projectbrain-mcp projectbrain route "how are invoices settled"
         </div>
       </div>
       <div class="hero-badges">
-        <span>&#9889; &lt;1.5s <code>check --audit</code> Repo Triage</span>
-        <span>&#128737; PR Merge-Base &amp; Governance Tamper Lock</span>
-        <span>&#129517; Cross-Stack HTTP + React + Pydantic Verifiers</span>
-        <span>&#128274; OASIS SARIF v2.1.0 (<code>PB001</code>&ndash;<code>PB013</code>)</span>
-        <span>&#9989; &lt;8KB Zero-Spillover MCP Inline Cap</span>
+        <span>&#9889; Zero-Write 10s <code>audit</code> Trial</span>
+        <span>&#128752; Satellite Coordinate Router (<code>route</code>)</span>
+        <span>&#129517; <code>PB011</code> HTTP &middot; <code>PB012</code> React &middot; <code>PB013</code> Pydantic</span>
+        <span>&#128737; <code>.projectbrain.toml</code> + <code># pb:ignore</code> + <code>@pb-invariant</code></span>
+        <span>&#128274; PR Merge-Base SARIF v2.1.0 &amp; Tamper Lock</span>
       </div>
     </div>
   </header>
 
   <section id="setup">
     <div class="container">
-      <h2>Setup in 60 Seconds</h2>
-      <p>Let agents edit natively with <code>Edit</code> / <code>edit_file</code> while ProjectBrain handles deep graph discovery and real-time regression interception automatically.</p>
+      <h2>Try in 10 Seconds — Zero Config, Zero Dotfiles</h2>
+      <p>Verify real cross-stack bugs before writing a single config file to your repo, then opt into CI gates, hooks, or MCP when ready.</p>
 
       <div class="setup-card">
-        <h3><span class="setup-step-badge">Step 1</span> Install via <code>uv</code> (or <code>pipx</code>)</h3>
-        <p>Install isolated <code>projectbrain</code> and <code>projectbrain-mcp</code> binaries with zero PEP 668 system-Python friction:</p>
-        <pre><code>uv tool install projectbrain-mcp
-<span class="comment"># Or: pipx install projectbrain-mcp</span>
-<span class="comment"># Or inside a virtualenv: pip install projectbrain-mcp</span></code></pre>
+        <h3><span class="setup-step-badge">Step 1</span> Zero-Write Audit &amp; Satellite Route</h3>
+        <p>Run completely in-memory with <code>uvx</code> — creates zero <code>.projectbrain.db</code> or IDE files on disk:</p>
+        <pre><code><span class="comment"># Pair cleanly with ruff / pyright / tsc / eslint (zero overlapping lint noise):</span>
+uvx --from projectbrain-mcp projectbrain audit --profile fullstack
+
+<span class="comment"># Satellite Coordinate Router: get exact file:Lstart-Lend spans, callers, routes &amp; tests:</span>
+uvx --from projectbrain-mcp projectbrain route <span class="string">"how are invoices validated and settled"</span></code></pre>
       </div>
 
       <div class="setup-card">
-        <h3><span class="setup-step-badge">Step 2</span> Initialize Your Repository (Personal or Team + CI Mode)</h3>
-        <p>Index the codebase into <code>.projectbrain.db</code>, wire MCP + editor hooks, and optionally bootstrap OS-portable team configs, GitHub Actions, and Day-1 governance:</p>
-        <pre><code><span class="comment"># Personal workstation (ENOENT-proof absolute IDE paths):</span>
-projectbrain --path /path/to/your/repo init --git-hook
+        <h3><span class="setup-step-badge">Step 2</span> Configure Rules &amp; Code-Native Invariants (Optional)</h3>
+        <p>Tune profiles in <code>.projectbrain.toml</code> (or <code>[tool.projectbrain]</code> in <code>pyproject.toml</code>), suppress intentional exceptions with <code># pb:ignore PBxxx</code>, and annotate critical functions inline:</p>
+        <pre><code><span class="comment"># .projectbrain.toml</span>
+profile = <span class="string">"fullstack"</span>
+exclude = [<span class="string">"generated/*"</span>, <span class="string">"migrations/*"</span>]
 
-<span class="comment"># Team + CI setup (OS-portable hooks, GitHub Action workflow, &amp; zero-violation rule discovery):</span>
-projectbrain --path /path/to/your/repo init --team --learn</code></pre>
-        <p style="margin-top: 0.75rem; margin-bottom: 0;">
-          <strong>What <code>init --team --learn</code> configures non-destructively:</strong><br />
-          1. Builds <code>.projectbrain.db</code> (SQLite WAL + FTS5) honoring <code>.gitignore</code>.<br />
-          2. Writes OS-portable <code>.claude/settings.json</code>, <code>.cursor/hooks.json</code>, <code>.mcp.json</code>, and <code>.github/workflows/projectbrain.yml</code> with zero local machine paths.<br />
-          3. Runs <code>projectbrain learn</code> to auto-discover zero-violation <code>--forbid</code> layer boundaries and git co-change contracts on Day 1.<br />
-          4. Leaves <code>.projectbrain_memory.json</code> git-trackable and protected by the <strong>Governance Tamper Lock</strong> across every PR.
-        </p>
+<span class="comment"># In Python or TypeScript source code:</span>
+<span class="comment"># @pb-invariant: Must remain idempotent on duplicate invoice_id</span>
+<span class="comment">// pb:ignore PB012 -- intentionally fire-and-forget telemetry</span></code></pre>
       </div>
 
       <div class="setup-card">
-        <h3><span class="setup-step-badge">Step 3</span> Automated PR Merge-Base Gate, SARIF v2.1.0 &amp; Sticky Mermaid Comments</h3>
-        <p>Generated automatically by <code>projectbrain init --team</code> in <code>.github/workflows/projectbrain.yml</code> — audits multi-commit PRs against <code>git merge-base</code>, uploads OASIS SARIF v2.1.0 to GitHub Code Scanning, and upserts a zero-noise sticky PR comment (<code>&lt;!-- projectbrain-pr-guardrail --&gt;</code>) with Mermaid blast-radius graphs:</p>
-        <pre><code><span class="comment"># CLI equivalents run in CI (auto-detects GITHUB_BASE_REF / GitLab MR / Bitbucket / Azure PR envs):</span>
-projectbrain check --base main --format sarif &gt; projectbrain.sarif
-projectbrain check --base main --format pr-comment &gt; projectbrain-pr-comment.md
-projectbrain check --base main --ci</code></pre>
+        <h3><span class="setup-step-badge">Step 3</span> Add Sub-2s PR Gate, Hooks &amp; Optional 5-Tool MCP</h3>
+        <p>Install globally via <code>uv tool install projectbrain-mcp</code>, wire OS-portable hooks/CI via <code>projectbrain init --team</code>, or add 1 CI step:</p>
+        <pre><code><span class="comment"># CI PR merge-base gate (auto-detects GitHub / GitLab / Bitbucket / Azure PR base):</span>
+uvx --from projectbrain-mcp projectbrain check --profile fullstack --ci
+uvx --from projectbrain-mcp projectbrain check --profile fullstack --format sarif &gt; projectbrain.sarif</code></pre>
       </div>
     </div>
   </section>
@@ -372,40 +366,34 @@ $ projectbrain --path /path/to/repo stats --summary
           </thead>
           <tbody>
             <tr>
-              <td><strong>Held-Out External Repos</strong></td>
+              <td><strong>Synthetic Full-Stack Corpus (<code>PB011</code>&ndash;<code>PB013</code>)</strong></td>
+              <td>FastAPI/Pydantic/SQLModel + React/TSX (31 planted TP bugs + adversarial hard negatives + <code># pb:ignore</code>)</td>
+              <td class="check">100% P / 100% R (31/31, 0 FP)</td>
+              <td>Zero-write scan, strict line-span FP accounting (<code>eval/bench_fullstack.py</code>)</td>
+            </tr>
+            <tr>
+              <td><strong><code>fastapi/full-stack-fastapi-template</code></strong></td>
+              <td>123 prod files (23 FastAPI routes, 108 Pydantic/SQLModel schemas, React/TSX)</td>
+              <td class="check">0 FP (SAFE_TO_PROCEED)</td>
+              <td>1.12s fullstack audit (uses generated OpenAPI SDK)</td>
+            </tr>
+            <tr>
+              <td><strong>Backend OSS Audit &amp; Incremental Scale</strong></td>
+              <td><code>flask</code>, <code>requests</code>, <code>click</code>, <code>express</code>, <code>django</code> (3,051 files)</td>
+              <td class="check">0 FP &middot; 515 ms / 894 ms</td>
+              <td>Core Python/JS contract precision + Salsa early-cutoff on SQLite WAL</td>
+            </tr>
+            <tr>
+              <td><strong>Held-Out Dossier Symbol Recall</strong></td>
               <td><code>psf/requests</code>, <code>pallets/click</code>, <code>expressjs/express</code></td>
               <td class="check">32 / 32 (100%)</td>
-              <td>3.89 KB cost per hit; <code>0</code> false refutations on dynamic receivers</td>
+              <td>3.89 KB/hit; 0 false refutations on dynamic receivers</td>
             </tr>
             <tr>
-              <td><strong><code>pallets/flask</code> Dossiers</strong></td>
-              <td>6 multi-hop architectural tasks</td>
-              <td class="check">20 / 21 (95.2%)</td>
-              <td>2.96 KB cost per hit</td>
-            </tr>
-            <tr>
-              <td><strong>Whole-Repo Semantic Audit (<code>check --audit</code>)</strong></td>
-              <td><code>flask</code>, <code>requests</code>, <code>click</code>, <code>express</code>, <code>django</code> (1,077 prod files)</td>
-              <td class="check">0 false positives (100% clean)</td>
-              <td>26 ms &ndash; 1.03 s whole-repo triage</td>
-            </tr>
-            <tr>
-              <td><strong><code>django/django</code> Incremental</strong></td>
-              <td>3,051 Python files</td>
-              <td class="check">515 ms (body) / 894 ms (sig)</td>
-              <td>Salsa interface-hash early-cutoff on SQLite WAL</td>
-            </tr>
-            <tr>
-              <td><strong>Cold Startup &amp; Hook Filter</strong></td>
+              <td><strong>Cold Startup &amp; Non-Code Hook Filter</strong></td>
               <td>CLI / Editor Post-Edit Hook</td>
-              <td class="check">&lt;30 ms non-code / ~150 ms import</td>
-              <td>Lazy on-demand Tree-sitter C wheel loading</td>
-            </tr>
-            <tr>
-              <td><strong>Adversarial Zero-Identifier</strong></td>
-              <td>Prompts naming zero identifiers</td>
-              <td class="check">87.5% vs 50.0% grep</td>
-              <td>22 / 22 (100%) exact verdict accuracy on epistemic claims</td>
+              <td class="check">&lt;30 ms in-process / ~150 ms import</td>
+              <td>Lazy Tree-sitter loading (~150&ndash;320 ms cold subprocess on Windows)</td>
             </tr>
           </tbody>
         </table>
@@ -445,7 +433,7 @@ $ projectbrain --path /path/to/repo stats --summary
         <div class="feature">
           <div class="feature-tag tag-core">Graph</div>
           <h3>Polyglot Route &amp; Import Resolution (<code>brain_explore</code>)</h3>
-          <p>Resolves Python relative/barrel imports, TypeScript <code>tsconfig</code> aliases, CommonJS prototypes, and FastAPI, Flask, Django, Next.js, Express, and Hono routes.</p>
+          <p>Resolves Python relative/barrel imports, TypeScript <code>@/</code>, <code>~/</code>, <code>#/</code> path aliases, CommonJS prototypes, and FastAPI, Flask, Django, Next.js, Express, and Hono routes.</p>
         </div>
       </div>
     </div>
@@ -453,60 +441,53 @@ $ projectbrain --path /path/to/repo stats --summary
 
   <section id="compare">
     <div class="container">
-      <h2>How ProjectBrain v1.3 Compares</h2>
+      <h2>How ProjectBrain v1.4 Complements Your Stack</h2>
       <div style="overflow-x: auto;">
         <table class="comparison-table">
           <thead>
             <tr>
               <th>Capability</th>
-              <th>Aider Repo-Map</th>
-              <th>Serena (LSP)</th>
-              <th>Generic Graph MCPs</th>
-              <th>ProjectBrain v1.3</th>
+              <th>Ruff / Pyright / tsc</th>
+              <th>Cloud AI PR Reviewers</th>
+              <th>ProjectBrain v1.4 (<code>--profile fullstack</code>)</th>
             </tr>
           </thead>
           <tbody>
             <tr>
-              <td>Zero-LSP cold startup</td>
-              <td class="check">Fast (Tree-sitter)</td>
-              <td class="cross">Heavy LSP servers</td>
-              <td class="partial">Varies / Docker</td>
-              <td class="check">~150ms lazy Tree-sitter + SQLite WAL</td>
+              <td>Single-language types &amp; lints</td>
+              <td class="check">Best-in-class</td>
+              <td class="partial">Probabilistic</td>
+              <td class="partial">Opt-in (<code>--profile all</code>); defer to compilers</td>
             </tr>
             <tr>
-              <td>Active Post-Edit Guardrail Hooks</td>
-              <td class="cross">No</td>
-              <td class="cross">No</td>
-              <td class="cross">No</td>
-              <td class="check">Yes (Claude PostToolUse, Cursor, pre-commit)</td>
+              <td>Cross-stack FastAPI/Pydantic &harr; React schemas (+ Express verb/route checks)</td>
+              <td class="cross">Blind at network boundary</td>
+              <td class="partial">Slow / noisy LLM guesses</td>
+              <td class="check">Deterministic AST solver (<code>PB011</code>) in &lt;1.5s</td>
             </tr>
             <tr>
-              <td>4-Pillar Cross-File Contract Check</td>
-              <td class="cross">No</td>
-              <td class="partial">Type-checker dependent</td>
-              <td class="cross">No</td>
-              <td class="check">Arity + Dict Shape + Types + SQL DDL</td>
+              <td>React stateful remount &amp; Pydantic <code>.model_dump()</code> clobbers</td>
+              <td class="cross">Not checked</td>
+              <td class="partial">Inconsistent</td>
+              <td class="check">Deterministic (<code>PB012</code>, <code>PB013</code>) + <code># pb:ignore</code></td>
             </tr>
             <tr>
-              <td>Intra-Function PDG <code>--focus</code> Slicing</td>
-              <td class="cross">Signatures only</td>
-              <td class="cross">Whole symbol body</td>
-              <td class="cross">Whole symbol body</td>
-              <td class="check">Backward defs + forward uses + guards</td>
+              <td>Layer boundaries (<code>--forbid</code>), <code>@pb-invariant</code> &amp; Tamper Lock</td>
+              <td class="cross">No</td>
+              <td class="partial">Prose rules only</td>
+              <td class="check">AST-hashed + PR Tamper Lock (<code>PB002/007/008</code>)</td>
             </tr>
             <tr>
-              <td>Day-1 Rule Discovery &amp; Governance Tamper Lock</td>
+              <td>Satellite Coordinate Router &amp; Post-Edit Hook Redirect</td>
               <td class="cross">No</td>
-              <td class="partial">Unchecked prose</td>
-              <td class="cross">No</td>
-              <td class="check"><code>learn</code> + <code>--forbid</code> + PR Tamper Lock</td>
+              <td class="cross">PR-time only</td>
+              <td class="check"><code>route</code> / <code>dossier(coordinates_only=True)</code> + hooks</td>
             </tr>
             <tr>
-              <td>PR Merge-Base Gate, SARIF v2.1.0 &amp; Sticky Mermaid PRs</td>
-              <td class="cross">No</td>
-              <td class="cross">No</td>
-              <td class="cross">No</td>
-              <td class="check"><code>check --base main</code> + SARIF + <code>pr-comment</code></td>
+              <td>Zero API keys, 100% local / air-gapped &amp; SARIF v2.1.0</td>
+              <td class="check">Yes</td>
+              <td class="cross">Cloud code egress + $/seat</td>
+              <td class="check">Yes (&lt;2s deterministic CLI + CI)</td>
             </tr>
           </tbody>
         </table>
@@ -516,8 +497,8 @@ $ projectbrain --path /path/to/repo stats --summary
 
   <section class="cta">
     <div class="container">
-      <h2>Ship Faster Without Cross-File Regressions</h2>
-      <p>Install via <code>uv</code>, run <code>projectbrain init --team --learn</code>, and equip your AI coding agents and CI pipeline with instant code-graph intelligence and active blast-radius guardrails.</p>
+      <h2>Catch Cross-Stack Regressions Before Review</h2>
+      <p>Run a 10-second zero-write audit with <code>uvx --from projectbrain-mcp projectbrain audit --profile fullstack</code> — zero API keys, zero dotfiles written.</p>
       <div class="cta-buttons">
         <a href="https://pypi.org/project/projectbrain-mcp/" class="btn btn-primary" target="_blank">View on PyPI</a>
         <a href="https://github.com/Johanabhishek/ProjectBrain" class="btn btn-secondary" target="_blank">Star on GitHub</a>
@@ -527,7 +508,7 @@ $ projectbrain --path /path/to/repo stats --summary
 
   <footer>
     <div class="container">
-      <p>ProjectBrain (<code>projectbrain-mcp</code> v1.3.0) &mdash; Zero-LSP SQLite Code Graph, Deep Semantic Triage, &lt;8KB Inline MCP &amp; Sub-2s Contract Guardrail for AI Coding Agents. MIT License.</p>
+      <p>ProjectBrain (<code>projectbrain-mcp</code> v1.4.0) &mdash; Zero-LLM Cross-Stack Contract Firewall, Satellite Coordinate Router &amp; Sub-2s PR Architecture Gate. MIT License.</p>
     </div>
   </footer>
 

@@ -2188,3 +2188,321 @@ def compile_engineering_dossier(
         "closed_world_verified": closed_world_verified,
         "markdown": full_md,
     }
+
+
+_ROUTE_URL_RE = re.compile(r"(?:^|[\s`'\"(])((?:GET|POST|PUT|PATCH|DELETE)\s+/[A-Za-z0-9_/\-{}:.$]+|/[A-Za-z0-9_\-]+/[A-Za-z0-9_/\-{}:.$]+)")
+
+
+def compile_route_coordinates(
+    brain: "ProjectBrain",
+    tasks: list[str] | str,
+    *,
+    top_n: int = 8,
+    zero_write: bool = False,
+) -> dict:
+    """Satellite Coordinate Router: convert a task signal into exact `file:Lstart-Lend` coordinates without dumping code.
+
+    Designed for the signal -> Brain -> redirect loop: returns ranked symbol spans, 1-hop
+    callers/callees, matched HTTP route endpoints, covering tests, and pinned/inline invariants
+    in ~500 tokens so coding agents can read & edit exact lines natively with `read_file`/`edit_file`.
+    """
+    from .brain import _extract_keywords
+    from .memory import extract_inline_invariant_notes
+    from .reporters import _is_test_file_path
+
+    if zero_write:
+        if not brain._index:
+            if brain._db_store.db_path.exists():
+                brain.load()
+            if not brain._index or brain.is_stale():
+                brain.index(persist=False)
+        elif brain.is_stale():
+            brain.index(persist=False)
+    else:
+        brain._ensure_fresh()
+    brain._ensure_blobs()
+
+    task_list = [tasks] if isinstance(tasks, str) else [t for t in tasks if str(t).strip()]
+    joined_task = " ; ".join(task_list).strip()
+    if not joined_task or not brain._index:
+        return {
+            "mode": "satellite_coordinates",
+            "task": joined_task,
+            "coordinates": [],
+            "route_flows": [],
+            "related_tests": [],
+            "invariants": [],
+        }
+
+    keywords = brain._expand_keywords_with_aliases(_extract_keywords(joined_task))
+    ranked_files = brain.query(joined_task, top_n=max(6, top_n))
+
+    # Also prioritize any file path explicitly named in the task prompt
+    explicit_rels: list[str] = []
+    for m_p in _TASK_PATH_RE.finditer(joined_task):
+        raw_p = m_p.group(1).replace("\\", "/").lstrip("./")
+        for rel in brain._index:
+            if rel == raw_p or rel.endswith("/" + raw_p):
+                if rel not in explicit_rels:
+                    explicit_rels.append(rel)
+
+    ordered_files: list[tuple[str, float, str]] = []
+    seen_f: set[str] = set()
+    for er in explicit_rels:
+        ordered_files.append((er, 99.0, "explicit path in signal"))
+        seen_f.add(er)
+    for item in ranked_files:
+        rp = item.get("rel_path", "")
+        if rp and rp not in seen_f:
+            ordered_files.append((rp, float(item.get("score", 1.0)), str(item.get("reason", "lexical+graph match"))))
+            seen_f.add(rp)
+
+    def _hop_labels(nid: str, *, incoming: bool, limit: int = 4) -> list[str]:
+        if not brain._graph or nid not in brain._graph.nodes:
+            return []
+        edge_indices = brain._graph._radj.get(nid, ()) if incoming else brain._graph._adj.get(nid, ())
+        out: list[str] = []
+        seen_lbl: set[str] = set()
+        for ei in edge_indices:
+            e = brain._graph.edges[ei]
+            if e.get("type") not in ("calls", "handles", "inherits"):
+                continue
+            if e.get("confidence") not in ("exact", "qualified", "import_resolved"):
+                continue
+            peer_id = e["src"] if incoming else e["dst"]
+            peer_nd = brain._graph.nodes.get(peer_id)
+            if not peer_nd:
+                continue
+            p_rel = peer_nd.get("rel_path", "")
+            p_nm = peer_nd.get("name") or peer_nd.get("path") or peer_id
+            p_cls = peer_nd.get("parent_class")
+            q_nm = f"{p_cls}.{p_nm}" if p_cls and not str(p_nm).startswith(f"{p_cls}.") else str(p_nm)
+            ln = e.get("line") or peer_nd.get("line_start") or 1
+            lbl = f"{p_rel}:L{ln} ({q_nm})" if p_rel else q_nm
+            if lbl not in seen_lbl:
+                seen_lbl.add(lbl)
+                out.append(lbl)
+                if len(out) >= limit:
+                    break
+        return out
+
+    candidates: list[tuple[float, dict]] = []
+    seen_nids: set[str] = set()
+    matched_rels: set[str] = set()
+
+    for rel, f_score, f_reason in ordered_files[: max(6, top_n)]:
+        info = brain._index.get(rel)
+        if not isinstance(info, dict):
+            continue
+        behaviors = brain._get_file_behaviors(rel)
+        routes = info.get("routes", [])
+        cells_4d = info.get("cells_4d")
+
+        file_scored: list[tuple[float, str, dict]] = []
+        for fn in info.get("functions", []):
+            sc = score_symbol_for_query(brain, fn, keywords, behaviors, routes, cells_4d=cells_4d)
+            if sc > 0 or rel in explicit_rels:
+                file_scored.append((sc + (f_score * 0.25), "function", fn))
+        for cls in info.get("classes", []):
+            sc = score_class_for_query(brain, cls, keywords)
+            if sc > 0 or rel in explicit_rels:
+                file_scored.append((sc + (f_score * 0.25), "class", cls))
+        file_scored.sort(key=lambda x: x[0], reverse=True)
+
+        if not file_scored:
+            # File-level fallback coordinate (e.g., SQL/config/script with no parsed functions)
+            f_nid = file_id(rel)
+            if f_nid not in seen_nids:
+                seen_nids.add(f_nid)
+                matched_rels.add(rel)
+                candidates.append((
+                    f_score,
+                    {
+                        "rel_path": rel,
+                        "symbol": Path(rel).name,
+                        "kind": "file",
+                        "node_id": f_nid,
+                        "line_start": 1,
+                        "line_end": 80,
+                        "recommended_read": f"{rel}:1-80",
+                        "signature": rel,
+                        "reason": f_reason,
+                        "callers": [],
+                        "callees": [],
+                    },
+                ))
+            continue
+
+        for sc, kind, sym in file_scored[:2]:
+            p_cls = sym.get("parent_class") if kind == "function" else None
+            q_sym = f"{p_cls}.{sym['name']}" if p_cls else sym["name"]
+            nid = fn_id(rel, sym["name"], p_cls) if kind == "function" else cls_id(rel, sym["name"])
+            if nid in seen_nids:
+                continue
+            seen_nids.add(nid)
+            matched_rels.add(rel)
+            l_s = int(sym.get("line_start") or 1)
+            l_e = int(sym.get("line_end") or l_s)
+            candidates.append((
+                sc,
+                {
+                    "rel_path": rel,
+                    "symbol": q_sym,
+                    "kind": kind,
+                    "node_id": nid,
+                    "line_start": l_s,
+                    "line_end": l_e,
+                    "recommended_read": f"{rel}:{l_s}-{l_e}",
+                    "signature": str(sym.get("signature") or q_sym)[:140],
+                    "reason": f_reason,
+                    "callers": _hop_labels(nid, incoming=True, limit=4),
+                    "callees": _hop_labels(nid, incoming=False, limit=4),
+                },
+            ))
+
+    candidates.sort(key=lambda x: (-x[0], x[1]["rel_path"], x[1]["line_start"]))
+    coords: list[dict] = []
+    final_nids: set[str] = set()
+    final_rels: set[str] = set()
+    for idx, (_, rec) in enumerate(candidates[: max(1, top_n)], 1):
+        rec_out = {"rank": idx, **{k: v for k, v in rec.items() if k != "node_id"}}
+        coords.append(rec_out)
+        final_nids.add(rec["node_id"])
+        final_rels.add(rec["rel_path"])
+
+    # Trace any HTTP route paths explicitly referenced in the signal
+    route_flows: list[dict] = []
+    seen_urls: set[str] = set()
+    for m_u in _ROUTE_URL_RE.finditer(joined_task):
+        raw_u = m_u.group(1).strip()
+        if raw_u in seen_urls or raw_u.endswith((".py", ".ts", ".tsx", ".js", ".jsx", ".go", ".rs", ".java")):
+            continue
+        seen_urls.add(raw_u)
+        flow = brain.trace_flow(raw_u)
+        if flow and (flow.get("steps") or flow.get("handlers") or flow.get("frontend_callers")):
+            steps_list = (flow.get("steps") or [])[:8]
+            route_flows.append({
+                "query": raw_u,
+                "steps": steps_list,
+            })
+            # Promote route flow participants into coordinates if not already listed
+            existing_coord_keys = {(c["rel_path"], c["symbol"]) for c in coords}
+            for st in steps_list:
+                s_rel = st.get("rel_path") or ""
+                s_fn = st.get("function") or st.get("handler") or ""
+                if not s_rel or s_rel not in brain._index:
+                    continue
+                if s_fn and (s_rel, s_fn) in existing_coord_keys:
+                    continue
+                if len(coords) >= max(1, top_n):
+                    break
+                s_ln = int(st.get("line") or 1)
+                fn_rec = next(
+                    (f for f in brain._index[s_rel].get("functions", []) if s_fn and f["name"] == s_fn),
+                    None,
+                )
+                l_s = int(fn_rec.get("line_start") or s_ln) if fn_rec else s_ln
+                l_e = int(fn_rec.get("line_end") or (l_s + 10)) if fn_rec else (l_s + 10)
+                sym_lbl = s_fn or Path(s_rel).stem
+                existing_coord_keys.add((s_rel, sym_lbl))
+                final_rels.add(s_rel)
+                nid_r = fn_id(s_rel, fn_rec["name"], fn_rec.get("parent_class")) if fn_rec else ""
+                if nid_r:
+                    final_nids.add(nid_r)
+                coords.append({
+                    "rank": len(coords) + 1,
+                    "rel_path": s_rel,
+                    "symbol": sym_lbl,
+                    "kind": "fn" if fn_rec else st.get("type", "route"),
+                    "line_start": l_s,
+                    "line_end": l_e,
+                    "recommended_read": f"{s_rel}:{l_s}-{l_e}",
+                    "signature": str((fn_rec or {}).get("signature") or sym_lbl)[:140],
+                    "reason": f"route flow match for {raw_u}",
+                    "callers": _hop_labels(nid_r, incoming=True, limit=4) if nid_r else [],
+                    "callees": _hop_labels(nid_r, incoming=False, limit=4) if nid_r else [],
+                })
+
+    # Covering tests for the matched files
+    related_tests: list[str] = []
+    for rel in sorted(final_rels):
+        for imp_f in brain._imported_by.get(rel, []):
+            if _is_test_file_path(imp_f) and imp_f not in related_tests:
+                related_tests.append(imp_f)
+
+    # Pinned + inline `@pb-invariant:` rules touching these coordinates
+    pinned_mems = brain._memory.get_notes_for(
+        final_rels,
+        final_nids,
+        brain._ast_hashes,
+        indexed_files=set(brain._index.keys()),
+    )
+    inline_mems = extract_inline_invariant_notes(
+        brain._index,
+        rel_paths=final_rels,
+        existing_notes=pinned_mems,
+    )
+    invariants = [
+        {
+            "target_id": m.get("target_id"),
+            "rel_path": m.get("rel_path"),
+            "note": m.get("note"),
+            "stale": bool(m.get("stale")),
+            "source": m.get("source", "memory"),
+        }
+        for m in [*pinned_mems, *inline_mems][:10]
+    ]
+
+    return {
+        "mode": "satellite_coordinates",
+        "task": joined_task,
+        "coordinates": coords,
+        "route_flows": route_flows,
+        "related_tests": related_tests[:8],
+        "invariants": invariants,
+        "next_action": "Read exact spans directly with native `read_file` (or `brain_slice`), edit natively, then run `brain_check`.",
+    }
+
+
+def format_route_coordinates(res: dict) -> str:
+    """Render `compile_route_coordinates()` output as a concise GPS coordinate card for CLI stdout."""
+    coords = res.get("coordinates") or []
+    lines: list[str] = [
+        f"ProjectBrain Satellite Route — {len(coords)} coordinate(s) for: {res.get('task', '')}"
+    ]
+    if not coords and not res.get("route_flows"):
+        lines.append("  (No matching coordinates found — try adding a domain term or file/route name)")
+        return "\n".join(lines)
+    for c in coords:
+        lines.append(
+            f"  #{c['rank']} {c['recommended_read']}  [{c['kind']}] {c['symbol']}"
+        )
+        if c.get("signature") and c["signature"] != c["symbol"]:
+            lines.append(f"       sig: {c['signature']}")
+        if c.get("callers"):
+            lines.append(f"       callers: {', '.join(c['callers'][:3])}")
+        if c.get("callees"):
+            lines.append(f"       callees: {', '.join(c['callees'][:3])}")
+    if res.get("route_flows"):
+        lines.append("  Route Flows:")
+        for rf in res["route_flows"][:4]:
+            steps = rf.get("steps") or []
+            step_parts: list[str] = []
+            for st in steps[:5]:
+                rp = st.get("rel_path") or ""
+                fn = st.get("function") or st.get("handler") or ""
+                ln = st.get("line")
+                loc = f"{rp}:L{ln}" if (rp and ln) else rp
+                lbl = f"{loc} ({fn})" if (loc and fn) else (loc or fn or st.get("detail", ""))
+                if lbl:
+                    step_parts.append(lbl)
+            chain = " -> ".join(step_parts)
+            lines.append(f"    {rf['query']}: {chain or f'{len(steps)} step(s)'}")
+    if res.get("invariants"):
+        lines.append("  Invariants:")
+        for inv in res["invariants"][:6]:
+            tag = "[STALE]" if inv.get("stale") else f"[{inv.get('source', 'pinned')}]"
+            lines.append(f"    * {tag} {inv.get('target_id')}: {inv.get('note')}")
+    if res.get("related_tests"):
+        lines.append(f"  Tests: {' '.join(res['related_tests'][:6])}")
+    return "\n".join(lines)

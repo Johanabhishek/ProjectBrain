@@ -459,6 +459,52 @@ class RepoMemory:
 
         violations: list[dict] = []
         seen_keys: set[tuple[str, str, str, str]] = set()
+        lazy_resolve_ctx: list | None = None
+
+        def _find_import_line(s_rel: str, d_rel: str) -> int:
+            nonlocal lazy_resolve_ctx
+            info = index.get(s_rel) or {}
+            bindings = info.get("import_bindings") or {}
+            if bindings:
+                if lazy_resolve_ctx is None:
+                    from . import resolve as _resolve
+
+                    fset = set(index.keys())
+                    lazy_resolve_ctx = [_resolve, fset, _resolve.build_python_module_index(fset)]
+                _resolve, fset, py_idx = lazy_resolve_ctx
+                for bind in bindings.values():
+                    if not isinstance(bind, dict) or bind.get("type_only"):
+                        continue
+                    b_ln = int(bind.get("line") or 0)
+                    if b_ln <= 0:
+                        continue
+                    q_mod = bind.get("qualified_module") or ""
+                    mod = bind.get("module") or ""
+                    if q_mod and s_rel.endswith(".py"):
+                        if _resolve.resolve_python_import(s_rel, q_mod, fset, py_idx) == d_rel:
+                            return b_ln
+                    if mod and _resolve.resolve_import(s_rel, mod, fset, py_idx) == d_rel:
+                        return b_ln
+            # Fallback: scan import statements in source text for the target stem/path
+            try:
+                src_lines = (self.root / s_rel).read_text(encoding="utf-8", errors="ignore").splitlines()
+            except OSError:
+                return 1
+            dst_stem = Path(d_rel).stem
+            dst_no_ext = d_rel.rsplit(".", 1)[0]
+            dst_dotted = dst_no_ext.replace("/", ".")
+            for idx_ln, raw_ln in enumerate(src_lines, 1):
+                st = raw_ln.strip()
+                if not st or st.startswith(("#", "//", "/*")):
+                    continue
+                if any(kw in st for kw in ("import ", "from ", "require(", "use ")):
+                    if (
+                        dst_no_ext in st
+                        or dst_dotted in st
+                        or re.search(rf"(?<![A-Za-z0-9_]){re.escape(dst_stem)}(?![A-Za-z0-9_])", st)
+                    ):
+                        return idx_ln
+            return 1
 
         # 1. File-level resolved imports
         for src_rel, dst_list in sorted(import_targets.items()):
@@ -478,6 +524,7 @@ class RepoMemory:
                         if vkey in seen_keys:
                             continue
                         seen_keys.add(vkey)
+                        imp_line = _find_import_line(src_rel, dst_rel)
                         reason = rule.get("reason", "")
                         reason_sfx = f" ({reason})" if reason else ""
                         rule_lbl = rule.get("rule", f"{rule['src_glob']} -> {rule['dst_glob']}")
@@ -487,11 +534,11 @@ class RepoMemory:
                             "src_file": src_rel,
                             "dst_file": dst_rel,
                             "edge_type": "imports",
-                            "line": 1,
+                            "line": imp_line,
                             "symbol": None,
                             "reason": reason,
                             "message": (
-                                f"[BOUNDARY VIOLATION] {src_rel} imports {dst_rel}, "
+                                f"[BOUNDARY VIOLATION] {src_rel}:L{imp_line} imports {dst_rel}, "
                                 f"violating forbidden boundary `{rule_lbl}`{reason_sfx}."
                             ),
                         })
@@ -628,3 +675,148 @@ class RepoMemory:
         all_paths = {p for n in self._notes for p in (extract_note_rel_path(n),) if p}
         all_ids = {n.get("target_id", "") for n in self._notes}
         return self.get_notes_for(all_paths, all_ids, current_hashes, indexed_files=indexed_files)
+
+
+def extract_inline_invariant_notes(
+    index: dict,
+    rel_paths: set[str] | None = None,
+    existing_notes: list[dict] | None = None,
+) -> list[dict]:
+    """Collect inline `# @pb-invariant:` / `// @pb-invariant:` comments from indexed functions/classes."""
+    from .graph import cls_id, fn_id
+
+    existing_keys = {
+        (str(n.get("target_id") or ""), str(n.get("note") or "").strip())
+        for n in (existing_notes or ())
+    }
+    target_rels = sorted(rel_paths) if rel_paths is not None else sorted(index.keys())
+    found: list[dict] = []
+
+    for rel in target_rels:
+        info = index.get(rel)
+        if not isinstance(info, dict):
+            continue
+        for fn in info.get("functions") or ():
+            invs = fn.get("inline_invariants") or ()
+            if not invs:
+                continue
+            tid = fn_id(rel, fn["name"], fn.get("parent_class"))
+            for idx_i, note_txt in enumerate(invs, 1):
+                note_clean = str(note_txt).strip()
+                if not note_clean or (tid, note_clean) in existing_keys:
+                    continue
+                existing_keys.add((tid, note_clean))
+                found.append({
+                    "id": f"inline:{tid}:{idx_i}",
+                    "target_id": tid,
+                    "rel_path": rel,
+                    "line": int(fn.get("line_start") or 1),
+                    "note": note_clean,
+                    "ast_hash": fn.get("ast_hash", ""),
+                    "source": "inline_annotation",
+                    "stale": False,
+                    "tags": ["inline-invariant"],
+                })
+        for cls in info.get("classes") or ():
+            invs = cls.get("inline_invariants") or ()
+            if not invs:
+                continue
+            tid = cls_id(rel, cls["name"])
+            for idx_i, note_txt in enumerate(invs, 1):
+                note_clean = str(note_txt).strip()
+                if not note_clean or (tid, note_clean) in existing_keys:
+                    continue
+                existing_keys.add((tid, note_clean))
+                found.append({
+                    "id": f"inline:{tid}:{idx_i}",
+                    "target_id": tid,
+                    "rel_path": rel,
+                    "line": int(cls.get("line_start") or 1),
+                    "note": note_clean,
+                    "ast_hash": cls.get("ast_hash", ""),
+                    "source": "inline_annotation",
+                    "stale": False,
+                    "tags": ["inline-invariant"],
+                })
+    return found
+
+
+def sync_inline_invariants(
+    memory: RepoMemory,
+    index: dict,
+    ast_hashes: dict[str, str],
+) -> dict:
+    """Idempotently reconcile inline `@pb-invariant:` annotations into `.projectbrain_memory.json` with AST hashes."""
+    memory._ensure_fresh()
+    inline_notes = extract_inline_invariant_notes(index, rel_paths=None, existing_notes=None)
+    live_keys = {
+        (item["target_id"], str(item["note"]).strip())
+        for item in inline_notes
+    }
+
+    existing_inline_entries: dict[tuple[str, str], dict] = {}
+    kept_notes: list[dict] = []
+    removed_count = 0
+    for entry in memory._notes:
+        tags = entry.get("tags") or []
+        is_synced_inline = ("inline-invariant" in tags) or (entry.get("source") == "inline_annotation")
+        key = (str(entry.get("target_id") or ""), str(entry.get("note") or "").strip())
+        if is_synced_inline:
+            if key in live_keys:
+                existing_inline_entries[key] = entry
+                kept_notes.append(entry)
+            else:
+                removed_count += 1
+        else:
+            kept_notes.append(entry)
+
+    if removed_count:
+        memory._notes = kept_notes
+        memory.save()
+
+    synced: list[dict] = []
+    stale_preserved: list[dict] = []
+    added_count = 0
+    for item in inline_notes:
+        tid = item["target_id"]
+        note_clean = str(item["note"]).strip()
+        key = (tid, note_clean)
+        curr_hash = ast_hashes.get(tid) or item.get("ast_hash", "")
+        prev_entry = existing_inline_entries.get(key)
+        if prev_entry is not None:
+            saved_hash = str(prev_entry.get("ast_hash") or "").strip()
+            # Never silently overwrite an existing anchored ast_hash when the target symbol mutated;
+            # preserve staleness (`PB008`) until explicitly verified via `memories --refresh`.
+            if saved_hash and curr_hash and saved_hash != curr_hash:
+                stale_preserved.append({
+                    "target_id": tid,
+                    "rel_path": item["rel_path"],
+                    "note": note_clean,
+                    "anchored_hash": saved_hash,
+                    "current_hash": curr_hash,
+                })
+                synced.append(prev_entry)
+                continue
+            synced.append(prev_entry)
+            continue
+
+        added_count += 1
+        saved = memory.remember(
+            tid,
+            note_clean,
+            rel_path=item["rel_path"],
+            ast_hash=curr_hash,
+            tags=["inline-invariant"],
+        )
+        synced.append(saved)
+
+    return {
+        "status": "synced_inline_invariants",
+        "discovered_count": len(inline_notes),
+        "added_count": added_count,
+        "removed_count": removed_count,
+        "stale_preserved_count": len(stale_preserved),
+        "stale_preserved": stale_preserved,
+        "total_invariants": len(memory._notes),
+        "invariants": synced,
+    }

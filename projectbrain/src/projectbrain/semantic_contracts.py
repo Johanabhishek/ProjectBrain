@@ -3,7 +3,7 @@
 Implements three deterministic, zero-LLM static analysis pillars:
   1. PB011 — Cross-Stack HTTP Request & Response Schema Solver:
              Verifies JS/TS `fetch`, `axios`, transport helpers, and 1-hop API client wrappers
-             against mounted FastAPI/Pydantic/SQLModel/TypedDict/dataclass & Express route schemas.
+             against mounted FastAPI/Pydantic/SQLModel/TypedDict/dataclass schemas and FastAPI/Express HTTP verb & route mounts.
   2. PB012 — React Stateful Lifecycle, Remount & Async Race Verifier:
              Proves post-mount early-return/ternary unmounts of stateful child components,
              inline nested component definitions, and uncancelled `useEffect([deps])` async races.
@@ -48,9 +48,22 @@ _HTTP_VERBS = frozenset({"GET", "POST", "PUT", "PATCH", "DELETE"})
 _URL_DYN_SEG_RE = re.compile(r"\{[^}]+\}|\$\{[^}]+\}|:[A-Za-z_]\w*|\[[^\]]+\]")
 _URL_LEADING_HOST_RE = re.compile(r"^(?:\$\{[^}]+\}|https?://[^/]+)+")
 _PY_SIDE_EFFECT_CALLS = frozenset({
-    "commit", "send_email", "send_mail", "sendmail", "send_message",
+    "commit",
+    "send_email",
+    "send_mail",
+    "sendmail",
+    "send_message",
+    "send_notification",
+    "send_webhook",
+    "dispatch_webhook",
+    "publish_event",
+    "charge",
+    "create_payment_intent",
+    "refund",
 })
-_PY_HTTP_MUTATION_RE = re.compile(r"^(?:requests|httpx|aiohttp)\.(?:post|put|patch|delete)$")
+_PY_HTTP_MUTATION_RE = re.compile(
+    r"^(?:self\.)?(?:requests|httpx|aiohttp|client|session|http|http_client|api_client)\.(?:post|put|patch|delete)$"
+)
 _GENERIC_SCHEMA_TOKENS = frozenset({
     "id", "ids", "data", "item", "items", "val", "value", "type", "key", "keys", "obj", "info", "req", "res",
 })
@@ -245,13 +258,16 @@ def build_resolved_schema_registry(brain: "ProjectBrain") -> dict[tuple[str, str
         valid_res: set[str] = set(comp_fields)
         for f in req_fields:
             als = set(aliases.get(f, ()))
-            wg = {f} | als
-            req_groups.append((f, wg))
-            valid_req.update(wg)
-            valid_res.update(wg)
+            # In Pydantic v2, when `Field(alias=...)` is declared without `populate_by_name=True`,
+            # ONLY the alias is accepted on the request wire (sending the Python field name causes 422!).
+            wg_req = ({f} | als) if (not als or pop_by_name) else als
+            req_groups.append((f, wg_req))
+            valid_req.update(wg_req)
+            valid_res.update({f} | als)
         for f in opt_fields:
             als = set(aliases.get(f, ()))
-            valid_req.update({f} | als)
+            wg_opt = ({f} | als) if (not als or pop_by_name) else als
+            valid_req.update(wg_opt)
             valid_res.update({f} | als)
 
         is_req_closed = bool(
@@ -366,31 +382,45 @@ def _extract_js_object_literal_info(obj_node) -> tuple[list[str], bool] | None:
     return keys, is_closed
 
 
-def _extract_js_url_and_query(url_node, const_urls: dict[str, str]) -> tuple[str | None, set[str], bool]:
-    """Extract `(clean_path, query_keys, query_is_closed)` from a JS string, template_string, or binary `+`."""
+_GENERIC_URL_PREFIX_TOKENS = frozenset({
+    "api", "base", "url", "uri", "host", "origin", "server", "backend", "endpoint",
+    "http", "https", "public", "next", "vite", "react", "app", "env", "process",
+    "import", "meta", "config", "core", "client", "web", "root", "prefix", "path",
+    "window", "location", "const", "var", "let", "service", "gateway",
+})
+
+
+def _extract_js_url_and_query(url_node, const_urls: dict[str, str]) -> tuple[str | None, set[str], bool, str]:
+    """Extract `(clean_path, query_keys, query_is_closed, leading_prefix_expr)` from a JS URL node."""
     if url_node is None:
-        return None, set(), False
+        return None, set(), False, ""
     nt = url_node.type
     raw = ""
+    leading_prefix = ""
     if nt == "identifier":
         ident = _t_text(url_node).strip()
         if ident not in const_urls:
-            return None, set(), False
+            return None, set(), False, ""
         raw = const_urls[ident]
     elif nt in ("string", "template_string"):
         raw = _t_text(url_node).strip("'\"`")
     elif nt == "binary_expression":
         txt = _t_text(url_node)
-        m_q = re.search(r"[`'\"](\/[A-Za-z0-9_/\-${}:.?=&]+)[`'\"]", txt)
+        m_q = re.search(r"[`'\"](\/[A-Za-z0-9_/\-${}:.?=&]*)[`'\"]", txt)
         if not m_q:
-            return None, set(), False
+            return None, set(), False, ""
         raw = m_q.group(1)
+        leading_prefix = txt[: m_q.start()].strip().rstrip("+").strip()
     else:
-        return None, set(), False
+        return None, set(), False, ""
 
-    stripped = _URL_LEADING_HOST_RE.sub("", raw.strip())
+    raw_s = raw.strip()
+    m_lead = _URL_LEADING_HOST_RE.match(raw_s)
+    stripped = _URL_LEADING_HOST_RE.sub("", raw_s)
+    if m_lead and m_lead.group(0).startswith("${"):
+        leading_prefix = m_lead.group(0)
     if not stripped.startswith("/"):
-        return None, set(), False
+        return None, set(), False, ""
 
     q_keys: set[str] = set()
     q_closed = True
@@ -405,7 +435,10 @@ def _extract_js_url_and_query(url_node, const_urls: dict[str, str]) -> tuple[str
                     q_keys.add(qk)
     else:
         path_part = stripped
-    return path_part, q_keys, q_closed
+    # Never treat `${BASE_URL}/` (zero concrete path segments after an unresolved prefix) as backend root `/`
+    if leading_prefix and (path_part.rstrip("/") or "/") == "/":
+        return None, set(), False, ""
+    return path_part, q_keys, q_closed, leading_prefix
 
 
 def _collect_js_http_callsites(
@@ -460,6 +493,51 @@ def _collect_js_http_callsites(
     callsites: list[dict] = []
     src_lines = src_text.splitlines()
 
+    # Detect custom axios instances (`const backendApi = axios.create(...)` or imported from a file using `axios.create`)
+    custom_axios_receivers: set[str] = set(_AXIOS_LIKE_RECEIVERS)
+    for m_axc in re.finditer(r"\b(?:const|let|var)\s+([A-Za-z_$][\w$]*)\s*=\s*axios\s*\.\s*create\s*\(", src_text):
+        custom_axios_receivers.add(m_axc.group(1))
+    for loc_nm, imp_r in sym_map.items():
+        if imp_r and loc_nm not in custom_axios_receivers:
+            imp_src = brain._get_file_text(imp_r) or ""
+            if "axios.create" in imp_src:
+                custom_axios_receivers.add(loc_nm)
+
+    transport_helper_names: set[str] = {
+        fn["name"] for fn in info.get("functions", []) if fn.get("http_transport_spec")
+    }
+    _DYNAMIC_SUBPATH_PARAMS = frozenset({"path", "endpoint", "route", "url", "uri", "subpath", "suffix"})
+
+    def _scope_param_names(sc_nd) -> set[str]:
+        p_out: set[str] = set()
+        params_nd = sc_nd.child_by_field_name("parameters")
+        if params_nd is None:
+            p0 = sc_nd.child_by_field_name("parameter")
+            if p0 is not None and p0.type == "identifier":
+                p_out.add(_t_text(p0).strip())
+            return p_out
+        for ch in params_nd.named_children:
+            if ch.type == "identifier":
+                p_out.add(_t_text(ch).strip())
+            elif ch.type in ("required_parameter", "optional_parameter"):
+                pat = ch.child_by_field_name("pattern")
+                if pat is not None and pat.type == "identifier":
+                    p_out.add(_t_text(pat).strip())
+            elif ch.type == "assignment_pattern":
+                lft = ch.child_by_field_name("left")
+                if lft is not None and lft.type == "identifier":
+                    p_out.add(_t_text(lft).strip())
+        return p_out
+
+    def _has_dynamic_subpath_param(u_path: str, sc_params: set[str]) -> bool:
+        dyn_params = sc_params & _DYNAMIC_SUBPATH_PARAMS
+        if not dyn_params or "${" not in u_path:
+            return False
+        for expr in re.findall(r"\$\{([^}]+)\}", u_path):
+            if expr.strip() in dyn_params:
+                return True
+        return False
+
     def _scan_scope(scope_node, scope_name: str, parent_const_urls: dict[str, str] | None = None) -> None:
         local_objs: dict[str, tuple[list[str], bool]] = {}
         mutated_vars: set[str] = set()
@@ -512,6 +590,7 @@ def _collect_js_http_callsites(
 
         scope_txt = _t_text(scope_node)
         scope_start_ln = _t_line(scope_node)
+        scope_params = _scope_param_names(scope_node)
 
         def _resolve_obj_arg(arg_nd) -> tuple[list[str], bool] | None:
             if arg_nd is None:
@@ -528,7 +607,14 @@ def _collect_js_http_callsites(
         def _bound_lhs_var(c_nd) -> tuple[str | None, list[str]]:
             """If `const x = await <c_nd>` or `const { a, b } = await <c_nd>`, return `(var_name, destructured_keys)`."""
             cur = c_nd.parent
-            while cur is not None and cur.type in ("await_expression", "parenthesized_expression"):
+            while cur is not None and cur.type in (
+                "await_expression",
+                "parenthesized_expression",
+                "as_expression",
+                "satisfies_expression",
+                "type_assertion",
+                "non_null_expression",
+            ):
                 cur = cur.parent
             if cur is not None and cur.type == "variable_declarator":
                 nn = cur.child_by_field_name("name")
@@ -550,10 +636,99 @@ def _collect_js_http_callsites(
                         return (None, [] if has_rest else d_keys)
             return None, []
 
-        def _collect_var_prop_reads(var_nm: str, after_line: int, unwrap_axios_data: bool = False) -> list[str]:
+        def _extract_cb_prop_reads(cb_nd) -> tuple[list[str], list[str]]:
+            """CST-exact property-read extraction for callback `(item) => ...` or `({ a, b }) => ...`."""
+            if cb_nd is None or cb_nd.type not in ("arrow_function", "function_expression"):
+                return [], []
+            p0 = cb_nd.child_by_field_name("parameter")
+            if p0 is None:
+                params_nd = cb_nd.child_by_field_name("parameters")
+                if params_nd is not None and params_nd.named_children:
+                    p0 = params_nd.named_children[0]
+            if p0 is None:
+                return [], []
+            if p0.type in ("required_parameter", "optional_parameter"):
+                pat = p0.child_by_field_name("pattern")
+                if pat is not None:
+                    p0 = pat
+
+            body_nd = cb_nd.child_by_field_name("body")
+            direct_reads: list[str] = []
+            nested_item_reads: list[str] = []
+
+            if p0.type == "object_pattern":
+                for pc in p0.children:
+                    if pc.type == "shorthand_property_identifier_pattern":
+                        pk = _t_text(pc).strip()
+                        if pk and pk not in _JS_ARRAY_AND_RES_BUILTINS and pk not in direct_reads:
+                            direct_reads.append(pk)
+                    elif pc.type == "pair_pattern":
+                        kn = pc.child_by_field_name("key")
+                        if kn:
+                            pk = _t_text(kn).strip("'\"`")
+                            if pk and pk not in _JS_ARRAY_AND_RES_BUILTINS and pk not in direct_reads:
+                                direct_reads.append(pk)
+                return direct_reads[:10], nested_item_reads[:10]
+
+            if p0.type != "identifier" or body_nd is None:
+                return [], []
+            it_var = _t_text(p0).strip()
+            if not it_var:
+                return [], []
+
+            st_walk = [body_nd]
+            while st_walk:
+                cur = st_walk.pop()
+                ct = cur.type
+                if ct == "member_expression":
+                    obj_n = cur.child_by_field_name("object")
+                    prop_n = cur.child_by_field_name("property")
+                    if obj_n is not None and prop_n is not None and obj_n.type == "identifier" and _t_text(obj_n) == it_var:
+                        raw_mem = _t_text(cur)
+                        pk = _t_text(prop_n)
+                        if "?." not in raw_mem and pk not in _JS_ARRAY_AND_RES_BUILTINS:
+                            ln_idx = max(0, _t_line(cur) - 1)
+                            ln_full = src_lines[ln_idx] if ln_idx < len(src_lines) else ""
+                            col_pos = int(cur.start_point[1])
+                            if (
+                                "||" not in ln_full
+                                and "??" not in ln_full
+                                and not re.search(rf"\bin\s+{re.escape(it_var)}\b", ln_full)
+                                and "?" not in ln_full[: col_pos + len(it_var) + 2]
+                            ):
+                                if pk not in direct_reads:
+                                    direct_reads.append(pk)
+                elif ct == "call_expression":
+                    fn_sub = cur.child_by_field_name("function")
+                    args_sub = cur.child_by_field_name("arguments")
+                    if fn_sub is not None and fn_sub.type == "member_expression" and args_sub is not None:
+                        o_s = fn_sub.child_by_field_name("object")
+                        p_s = fn_sub.child_by_field_name("property")
+                        if (
+                            o_s is not None
+                            and p_s is not None
+                            and o_s.type == "identifier"
+                            and _t_text(o_s) == it_var
+                            and _t_text(p_s) in ("map", "forEach", "filter", "find", "some", "every", "flatMap")
+                            and args_sub.named_children
+                        ):
+                            sub_r, _ = _extract_cb_prop_reads(args_sub.named_children[0])
+                            for sr in sub_r:
+                                if sr not in nested_item_reads:
+                                    nested_item_reads.append(sr)
+                if cur.named_child_count:
+                    st_walk.extend(reversed(cur.named_children))
+            return direct_reads[:10], nested_item_reads[:10]
+
+        def _collect_var_prop_reads(
+            var_nm: str,
+            after_line: int,
+            unwrap_axios_data: bool = False,
+        ) -> tuple[list[str], list[str]]:
             if not var_nm:
-                return []
-            reads: list[str] = []
+                return [], []
+            root_reads: list[str] = []
+            item_reads: list[str] = []
             rel_start = max(0, after_line - scope_start_ln)
             sub_lines = src_lines[scope_start_ln - 1 + rel_start : _t_line(scope_node) + scope_txt.count("\n")]
             sub_txt = "\n".join(sub_lines)
@@ -568,31 +743,66 @@ def _collect_js_http_callsites(
                 ln_s = sub_txt.rfind("\n", 0, m_p.start()) + 1
                 ln_e = sub_txt.find("\n", m_p.end())
                 ln_full = sub_txt[ln_s : (ln_e if ln_e != -1 else len(sub_txt))]
-                if "||" in ln_full or "??" in ln_full or "in " in ln_full or "?" in ln_full[: m_p.start() - ln_s + len(var_nm) + 2]:
+                if (
+                    "||" in ln_full
+                    or "??" in ln_full
+                    or bool(re.search(rf"\bin\s+{re.escape(var_nm)}\b", ln_full))
+                    or "?" in ln_full[: m_p.start() - ln_s + len(var_nm) + 2]
+                ):
                     continue
-                if pk not in reads:
-                    reads.append(pk)
-            base_expr = rf"{re.escape(var_nm)}\.data" if unwrap_axios_data else re.escape(var_nm)
-            for m_cb in re.finditer(
-                rf"\b{base_expr}\.(?:map|forEach|filter|find|some|every|flatMap)\s*\(\s*(?:\(\s*([A-Za-z_$][\w$]*)\s*(?:,[^)]*)?\)|([A-Za-z_$][\w$]*))\s*=>([\s\S]{{1,260}}?)\)",
-                sub_txt,
-            ):
-                it_var = m_cb.group(1) or m_cb.group(2)
-                cb_body = m_cb.group(3)
-                if not it_var:
+                if pk not in root_reads:
+                    root_reads.append(pk)
+
+            # CST-exact callback extraction for `.map()` / `.filter()` / `.forEach()` etc.
+            # (handles nested calls like `fmt(t.id)`, multi-line bodies, TS types, and destructured params)
+            target_recv = f"{var_nm}.data" if unwrap_axios_data else var_nm
+            _ARRAY_ITER_METHODS = frozenset({"map", "forEach", "filter", "find", "some", "every", "flatMap"})
+            for cn in call_nodes:
+                if _t_line(cn) < after_line:
                     continue
-                for m_ip in re.finditer(rf"\b{re.escape(it_var)}\.([A-Za-z_]\w*)\b", cb_body):
-                    pk = m_ip.group(1)
-                    if pk in _JS_ARRAY_AND_RES_BUILTINS:
-                        continue
-                    ln_s = cb_body.rfind("\n", 0, m_ip.start()) + 1
-                    ln_e = cb_body.find("\n", m_ip.end())
-                    ln_full = cb_body[ln_s : (ln_e if ln_e != -1 else len(cb_body))]
-                    if "||" in ln_full or "??" in ln_full or "in " in ln_full or "?" in ln_full[: m_ip.start() - ln_s + len(it_var) + 2]:
-                        continue
-                    if pk not in reads:
-                        reads.append(pk)
-            return reads[:10]
+                f_n = cn.child_by_field_name("function")
+                a_n = cn.child_by_field_name("arguments")
+                if f_n is None or f_n.type != "member_expression" or a_n is None or not a_n.named_children:
+                    continue
+                obj_n = f_n.child_by_field_name("object")
+                prop_n = f_n.child_by_field_name("property")
+                if obj_n is None or prop_n is None:
+                    continue
+                if _t_text(prop_n) not in _ARRAY_ITER_METHODS:
+                    continue
+                if re.sub(r"\s+", "", _t_text(obj_n)) != target_recv:
+                    continue
+                cb_reads, _ = _extract_cb_prop_reads(a_n.named_children[0])
+                for pk in cb_reads:
+                    if pk not in item_reads:
+                        item_reads.append(pk)
+            return root_reads[:10], item_reads[:10]
+
+        def _extract_promise_chain_json_reads(fetch_call_nd) -> tuple[list[str], list[str]]:
+            """Walk chained `fetch(...).then(r => r.json()).then(d => d.prop)` CST nodes."""
+            saw_json = False
+            cur = fetch_call_nd
+            for _ in range(6):
+                p = cur.parent
+                while p is not None and p.type == "parenthesized_expression":
+                    p = p.parent
+                if p is None or p.type != "member_expression":
+                    break
+                prop_n = p.child_by_field_name("property")
+                gp = p.parent
+                if prop_n is None or gp is None or gp.type != "call_expression":
+                    break
+                m_name = _t_text(prop_n)
+                args_n = gp.child_by_field_name("arguments")
+                if m_name == "then" and args_n is not None and args_n.named_children:
+                    cb0 = args_n.named_children[0]
+                    if not saw_json:
+                        if ".json(" in _t_text(cb0):
+                            saw_json = True
+                    else:
+                        return _extract_cb_prop_reads(cb0)
+                cur = gp
+            return [], []
 
         for c_nd in call_nodes:
             fn_c = c_nd.child_by_field_name("function")
@@ -605,8 +815,8 @@ def _collect_js_http_callsites(
 
             # 1. Direct `fetch(url, opts)`
             if callee_txt in ("fetch", "window.fetch", "globalThis.fetch") and n_args:
-                u_path, q_keys, q_closed = _extract_js_url_and_query(n_args[0], const_urls)
-                if not u_path:
+                u_path, q_keys, q_closed, u_prefix = _extract_js_url_and_query(n_args[0], const_urls)
+                if not u_path or _has_dynamic_subpath_param(u_path, scope_params):
                     continue
                 verb = "GET"
                 verb_dynamic = False
@@ -615,9 +825,13 @@ def _collect_js_http_callsites(
                 if len(n_args) >= 2:
                     opts_nd = n_args[1]
                     if opts_nd.type == "object":
+                        has_spread = False
+                        explicit_method = False
                         for ch in opts_nd.children:
                             if ch.type == "spread_element":
-                                verb_dynamic = True
+                                has_spread = True
+                                if explicit_method:
+                                    verb_dynamic = True
                             elif ch.type == "pair":
                                 kn = ch.child_by_field_name("key")
                                 vn = ch.child_by_field_name("value")
@@ -627,6 +841,7 @@ def _collect_js_http_callsites(
                                 if k_s == "method":
                                     if vn.type in ("string", "template_string") and "${" not in _t_text(vn):
                                         verb = _t_text(vn).strip("'\"`").upper()
+                                        explicit_method = True
                                     else:
                                         verb_dynamic = True
                                 elif k_s == "body":
@@ -637,6 +852,8 @@ def _collect_js_http_callsites(
                                             oi = _resolve_obj_arg(bargs.named_children[0])
                                             if oi is not None:
                                                 req_keys, req_closed = oi
+                        if has_spread and not explicit_method:
+                            verb_dynamic = True
                     else:
                         verb_dynamic = True
                 if verb_dynamic:
@@ -644,19 +861,25 @@ def _collect_js_http_callsites(
 
                 res_var, _ = _bound_lhs_var(c_nd)
                 res_reads: list[str] = []
+                res_item_reads: list[str] = []
                 if res_var:
                     m_jv = re.search(
-                        rf"\b(?:const|let|var)\s+(?:(\w+)|\{{\s*([^}}]+)\s*\}})\s*=\s*await\s+{re.escape(res_var)}\.json\s*\(\s*\)",
+                        rf"\b(?:const|let|var)\s+(?:(\w+)(?:\s*:\s*[^=\n]+)?|\{{\s*([^}}]+)\s*\}}(?:\s*:\s*[^=\n]+)?)\s*="
+                        rf"\s*(?:\(\s*)?await\s+{re.escape(res_var)}\.json\s*\(\s*\)(?:\s*\))?(?:\s+as\s+[^;\n]+)?",
                         scope_txt,
                     )
                     if m_jv:
                         if m_jv.group(1):
-                            res_reads = _collect_var_prop_reads(m_jv.group(1), c_line, unwrap_axios_data=False)
+                            res_reads, res_item_reads = _collect_var_prop_reads(
+                                m_jv.group(1), c_line, unwrap_axios_data=False
+                            )
                         elif m_jv.group(2) and "..." not in m_jv.group(2):
                             for tok in m_jv.group(2).split(","):
                                 k_d = tok.split(":", 1)[0].split("=", 1)[0].strip()
                                 if k_d.isidentifier() and k_d not in _JS_ARRAY_AND_RES_BUILTINS:
                                     res_reads.append(k_d)
+                else:
+                    res_reads, res_item_reads = _extract_promise_chain_json_reads(c_nd)
 
                 callsites.append({
                     "rel_path": rel_path,
@@ -665,21 +888,23 @@ def _collect_js_http_callsites(
                     "method": verb,
                     "url": u_path,
                     "norm_url": _norm_http_path(u_path),
+                    "url_prefix_expr": u_prefix,
                     "req_keys": req_keys,
                     "req_closed": req_closed,
                     "query_keys": q_keys,
                     "query_closed": q_closed,
                     "res_keys": res_reads,
+                    "res_item_keys": res_item_reads,
                     "via_wrapper": None,
                 })
                 continue
 
-            # 2. Direct `axios.<verb>(url, bodyOrCfg, cfg)` / `api.<verb>(...)`
+            # 2. Direct `axios.<verb>(url, bodyOrCfg, cfg)` / `api.<verb>(...)` / custom `axios.create()` instances
             m_ax = re.match(r"^([A-Za-z_$][\w$]*)\.(get|post|put|patch|delete)$", callee_txt, re.IGNORECASE)
-            if m_ax and m_ax.group(1) in _AXIOS_LIKE_RECEIVERS and n_args:
+            if m_ax and m_ax.group(1) in custom_axios_receivers and n_args:
                 verb = m_ax.group(2).upper()
-                u_path, q_keys, q_closed = _extract_js_url_and_query(n_args[0], const_urls)
-                if not u_path:
+                u_path, q_keys, q_closed, u_prefix = _extract_js_url_and_query(n_args[0], const_urls)
+                if not u_path or _has_dynamic_subpath_param(u_path, scope_params):
                     continue
                 req_keys = None
                 req_closed = False
@@ -694,25 +919,39 @@ def _collect_js_http_callsites(
                 elif len(n_args) >= 2:
                     cfg_nd = n_args[1]
 
-                if cfg_nd is not None and cfg_nd.type == "object":
-                    for ch in cfg_nd.children:
-                        if ch.type == "pair":
-                            kn = ch.child_by_field_name("key")
-                            vn = ch.child_by_field_name("value")
-                            if kn and vn and _t_text(kn).strip("'\"`") == "params":
-                                pi = _resolve_obj_arg(vn)
-                                if pi is not None:
-                                    q_keys.update(pi[0])
-                                    q_closed = q_closed and pi[1]
+                if cfg_nd is not None:
+                    if cfg_nd.type == "object":
+                        for ch in cfg_nd.children:
+                            if ch.type == "spread_element":
+                                q_closed = False
+                            elif ch.type == "shorthand_property_identifier" and _t_text(ch).strip() == "params":
+                                if "params" in local_objs:
+                                    p_keys, p_cl = local_objs["params"]
+                                    q_keys.update(p_keys)
+                                    q_closed = q_closed and p_cl and ("params" not in mutated_vars)
                                 else:
                                     q_closed = False
+                            elif ch.type == "pair":
+                                kn = ch.child_by_field_name("key")
+                                vn = ch.child_by_field_name("value")
+                                if kn and vn and _t_text(kn).strip("'\"`") == "params":
+                                    pi = _resolve_obj_arg(vn)
+                                    if pi is not None:
+                                        q_keys.update(pi[0])
+                                        q_closed = q_closed and pi[1]
+                                    else:
+                                        q_closed = False
+                    else:
+                        # Non-object 2nd/3rd arg (e.g. `http.Get(url, params)` or `axios.get(url, config)`)
+                        q_closed = False
 
                 res_var, destr = _bound_lhs_var(c_nd)
                 res_reads = []
+                res_item_reads = []
                 if res_var:
-                    res_reads = _collect_var_prop_reads(res_var, c_line, unwrap_axios_data=True)
+                    res_reads, res_item_reads = _collect_var_prop_reads(res_var, c_line, unwrap_axios_data=True)
                 elif "data" in destr:
-                    res_reads = _collect_var_prop_reads("data", c_line, unwrap_axios_data=False)
+                    res_reads, res_item_reads = _collect_var_prop_reads("data", c_line, unwrap_axios_data=False)
 
                 callsites.append({
                     "rel_path": rel_path,
@@ -721,11 +960,13 @@ def _collect_js_http_callsites(
                     "method": verb,
                     "url": u_path,
                     "norm_url": _norm_http_path(u_path),
+                    "url_prefix_expr": u_prefix,
                     "req_keys": req_keys,
                     "req_closed": req_closed,
                     "query_keys": q_keys,
                     "query_closed": q_closed,
                     "res_keys": res_reads,
+                    "res_item_keys": res_item_reads,
                     "via_wrapper": None,
                 })
                 continue
@@ -746,14 +987,15 @@ def _collect_js_http_callsites(
                         req_keys, req_closed = oi
 
                 res_reads = []
+                res_item_reads = []
                 if w_spec.get("returns_json"):
                     res_var, destr = _bound_lhs_var(c_nd)
                     if res_var:
-                        res_reads = _collect_var_prop_reads(res_var, c_line, unwrap_axios_data=False)
+                        res_reads, res_item_reads = _collect_var_prop_reads(res_var, c_line, unwrap_axios_data=False)
                     elif destr:
                         res_reads = [k for k in destr if k not in _JS_ARRAY_AND_RES_BUILTINS]
 
-                if req_keys is not None or res_reads:
+                if req_keys is not None or res_reads or res_item_reads:
                     callsites.append({
                         "rel_path": rel_path,
                         "scope": scope_name,
@@ -766,6 +1008,7 @@ def _collect_js_http_callsites(
                         "query_keys": set(),
                         "query_closed": False,
                         "res_keys": res_reads,
+                        "res_item_keys": res_item_reads,
                         "via_wrapper": f"{w_spec['fn_name']} ({w_spec['rel_path']})",
                     })
 
@@ -783,19 +1026,24 @@ def verify_cross_stack_http_schemas(
     schema_registry = build_resolved_schema_registry(brain)
 
     # 1. Index backend routes by `(method, norm_url)` and unambiguous 2-segment suffix
-    routes_exact: dict[tuple[str, str], dict] = {}
+    routes_exact_all: dict[tuple[str, str], list[dict]] = {}
     routes_by_tail: dict[tuple[str, str], list[dict]] = {}
+    routes_by_last_seg: dict[tuple[str, str], int] = {}
     verbs_by_norm: dict[str, set[str]] = {}
+    partial_route_norms: set[str] = set()
 
     for r_rel, r_info in brain._index.items():
         if _is_test_file_path(r_rel):
             continue
+        is_partial_file = (r_info.get("parse_status") == "partial")
         fn_by_nm = {fn["name"]: fn for fn in r_info.get("functions", []) if not fn.get("parent_class")}
         for r in r_info.get("routes", []):
             verb = (r.get("method") or "GET").upper()
             full_p = r.get("full_path") or r.get("path") or "/"
             norm_p = _norm_http_path(full_p)
             verbs_by_norm.setdefault(norm_p, set()).add(verb)
+            if is_partial_file:
+                partial_route_norms.add(norm_p)
 
             b_schema = (
                 resolve_schema_for_file(brain, schema_registry, r_rel, r["body_schema"])
@@ -826,12 +1074,31 @@ def verify_cross_stack_http_schemas(
                 "closed_return_keys": closed_ret_keys,
                 "required_query_params": list(r.get("required_query_params") or ()),
             }
-            routes_exact[(verb, norm_p)] = rc
+            bucket = routes_exact_all.setdefault((verb, norm_p), [])
+            if not any(x["rel_path"] == rc["rel_path"] and x["line"] == rc["line"] for x in bucket):
+                bucket.append(rc)
+                n_segs = [s for s in norm_p.split("/") if s]
+                if n_segs and n_segs[-1] != "{*}":
+                    l_key = (verb, "/" + n_segs[-1].lower())
+                    routes_by_last_seg[l_key] = routes_by_last_seg.get(l_key, 0) + 1
             tail = _path_tail_key(norm_p)
             if tail:
                 routes_by_tail.setdefault((verb, tail), []).append(rc)
 
-    if not routes_exact:
+    # Keep only unambiguous `(verb, norm_path)` entries in `routes_exact`; multiple colliding
+    # routers sharing the same unmounted path (e.g. `mfa.py`, `openai.py`, `ollama.py` all declaring `/verify`)
+    # must never silently overwrite each other.
+    routes_exact: dict[tuple[str, str], dict] = {}
+    ambiguous_exact: set[tuple[str, str]] = set()
+    ambiguous_norms: set[str] = set()
+    for ek, cands in routes_exact_all.items():
+        if len(cands) == 1:
+            routes_exact[ek] = cands[0]
+        else:
+            ambiguous_exact.add(ek)
+            ambiguous_norms.add(ek[1])
+
+    if not routes_exact and not ambiguous_exact:
         return [], [], {"http_routes_indexed": 0, "http_callsites_verified": 0, "schemas_indexed": len(schema_registry)}
 
     # 2. Index 1-hop JS/TS wrapper functions
@@ -873,20 +1140,72 @@ def verify_cross_stack_http_schemas(
     seen_keys: set[tuple] = set()
     callsites_checked = 0
 
-    def _match_route(verb: str, fe_norm: str) -> dict | None:
+    def _url_template_matches(pattern_norm: str, fe_norm: str) -> bool:
+        if "{*}" not in pattern_norm:
+            return False
+        p_segs = [s for s in pattern_norm.split("/") if s]
+        f_segs = [s for s in fe_norm.split("/") if s]
+        if len(p_segs) < 2 or len(p_segs) != len(f_segs):
+            return False
+        static_hits = 0
+        for ps, fs in zip(p_segs, f_segs):
+            if ps == "{*}":
+                continue
+            if ps.lower() != fs.lower():
+                return False
+            static_hits += 1
+        return static_hits >= 1
+
+    def _resolve_verbs_and_pattern(fe_norm: str) -> tuple[set[str] | None, str]:
+        direct = verbs_by_norm.get(fe_norm)
+        if direct:
+            return direct, fe_norm
+        param_hits = [np for np in verbs_by_norm if _url_template_matches(np, fe_norm)]
+        if len(param_hits) == 1:
+            return verbs_by_norm[param_hits[0]], param_hits[0]
+        return None, fe_norm
+
+    def _is_unresolved_prefix_collision(url_prefix_expr: str, fe_norm: str, rc: dict, verb: str) -> bool:
+        if not url_prefix_expr:
+            return False
+        fe_segs = [s for s in fe_norm.split("/") if s]
+        if len(fe_segs) <= 1 and routes_by_last_seg.get((verb, fe_norm.lower()), 0) > 1:
+            return True
+        if len(fe_segs) <= 2:
+            pref_toks = _split_ident_tokens(url_prefix_expr) - _GENERIC_URL_PREFIX_TOKENS
+            if pref_toks:
+                target_hay = f"{rc.get('full_path', '')} {rc.get('rel_path', '')} {rc.get('handler', '')}".lower()
+                if not any(tok in target_hay for tok in pref_toks):
+                    return True
+        return False
+
+    def _match_route(verb: str, fe_norm: str, url_prefix_expr: str = "") -> dict | None:
+        if (verb, fe_norm) in ambiguous_exact or ("ANY", fe_norm) in ambiguous_exact:
+            return None
+        cand: dict | None = None
         if (verb, fe_norm) in routes_exact:
-            return routes_exact[(verb, fe_norm)]
-        if ("ANY", fe_norm) in routes_exact:
-            return routes_exact[("ANY", fe_norm)]
-        tail = _path_tail_key(fe_norm)
-        if tail:
-            cands = routes_by_tail.get((verb, tail), [])
-            if len(cands) == 1 and (
-                cands[0]["norm_path"].endswith(fe_norm.lower())
-                or fe_norm.lower().endswith(cands[0]["norm_path"].lower())
-            ):
-                return cands[0]
-        return None
+            cand = routes_exact[(verb, fe_norm)]
+        elif ("ANY", fe_norm) in routes_exact:
+            cand = routes_exact[("ANY", fe_norm)]
+        else:
+            param_cands = [
+                rc for (v0, np0), rc in routes_exact.items()
+                if v0 in (verb, "ANY") and _url_template_matches(np0, fe_norm)
+            ]
+            if len(param_cands) == 1:
+                cand = param_cands[0]
+            else:
+                tail = _path_tail_key(fe_norm)
+                if tail:
+                    cands = routes_by_tail.get((verb, tail), [])
+                    if len(cands) == 1 and (
+                        cands[0]["norm_path"].endswith(fe_norm.lower())
+                        or fe_norm.lower().endswith(cands[0]["norm_path"].lower())
+                    ):
+                        cand = cands[0]
+        if cand is not None and _is_unresolved_prefix_collision(url_prefix_expr, fe_norm, cand, verb):
+            return None
+        return cand
 
     def _emit_http(
         key: tuple,
@@ -934,20 +1253,26 @@ def verify_cross_stack_http_schemas(
             scope = cs["scope"]
             via_str = f" (via `{cs['via_wrapper']}`)" if cs.get("via_wrapper") else ""
 
-            # Check exact-URL verb mismatch first
-            allowed_v = verbs_by_norm.get(fe_norm)
+            url_prefix_expr = cs.get("url_prefix_expr") or ""
+
+            # Check exact or parametric-URL verb mismatch first
+            allowed_v, matched_norm = _resolve_verbs_and_pattern(fe_norm)
             if (
                 allowed_v
+                and matched_norm not in partial_route_norms
+                and matched_norm not in ambiguous_norms
                 and verb in _HTTP_VERBS
                 and "ANY" not in allowed_v
                 and "ALL" not in allowed_v
                 and verb not in allowed_v
             ):
+                peer_rc = next(
+                    (rc for (v0, np0), rc in routes_exact.items() if np0 == matched_norm),
+                    None,
+                )
+                if peer_rc is not None and _is_unresolved_prefix_collision(url_prefix_expr, fe_norm, peer_rc, next(iter(allowed_v))):
+                    continue
                 if focus_rels is None or fe_rel in focus_rels or backend_touched:
-                    peer_rc = next(
-                        (rc for (v0, np0), rc in routes_exact.items() if np0 == fe_norm),
-                        None,
-                    )
                     peer_loc = f"{peer_rc['rel_path']}:L{peer_rc['line']}" if peer_rc else ""
                     _emit_http(
                         ("verb", fe_rel, c_ln, verb, fe_norm),
@@ -964,7 +1289,7 @@ def verify_cross_stack_http_schemas(
                     )
                 continue
 
-            rc = _match_route(verb, fe_norm)
+            rc = _match_route(verb, fe_norm, url_prefix_expr)
             if rc is None:
                 continue
             if focus_rels is not None and fe_rel not in focus_rels and rc["rel_path"] not in focus_rels:
@@ -989,12 +1314,16 @@ def verify_cross_stack_http_schemas(
                     norm_be_map: dict[str, str] = {
                         normalize_ident_key(vk): vk for vk in b_schema["valid_req_keys"] if normalize_ident_key(vk)
                     }
+                    req_wire_keys: set[str] = {
+                        k for _, wg in b_schema["required_wire_groups"] for k in wg
+                    } | {cf for cf, _ in b_schema["required_wire_groups"]}
                     unpopulated_be = [vk for vk in b_schema["valid_req_keys"] if vk not in sent_set]
                     for sk in sent_keys:
                         if sk in b_schema["valid_req_keys"]:
                             continue
                         nk = normalize_ident_key(sk)
                         matched_be = norm_be_map.get(nk) if nk else None
+                        matched_by_fuzzy = False
                         if matched_be is None and unpopulated_be:
                             sk_toks = _split_ident_tokens(sk) - _GENERIC_SCHEMA_TOKENS
                             best_uf: str | None = None
@@ -1009,8 +1338,14 @@ def verify_cross_stack_http_schemas(
                                     best_uf = uf
                             if best_uf is not None:
                                 matched_be = best_uf
+                                matched_by_fuzzy = True
 
                         if matched_be:
+                            is_soft_optional_fuzzy = (
+                                matched_by_fuzzy
+                                and b_schema["extra_policy"] != "forbid"
+                                and matched_be not in req_wire_keys
+                            )
                             renamed_be_fields.add(matched_be)
                             _emit_http(
                                 ("req_case", fe_rel, c_ln, sk, matched_be),
@@ -1024,6 +1359,8 @@ def verify_cross_stack_http_schemas(
                                 line=c_ln,
                                 peer=sc_loc,
                                 summary=f"{verb} {rc['full_path']} sends '{sk}', but {sc_nm} expects '{matched_be}'",
+                                severity="warning" if is_soft_optional_fuzzy else "error",
+                                confidence="high" if is_soft_optional_fuzzy else "proven",
                             )
                         elif b_schema["extra_policy"] == "forbid" or (
                             b_schema["valid_req_keys"] and not (sent_set & b_schema["valid_req_keys"])
@@ -1043,13 +1380,19 @@ def verify_cross_stack_http_schemas(
                                 severity="error",
                                 confidence="proven",
                             )
-                        elif unpopulated_be and len(b_schema["valid_req_keys"]) <= 20:
+                        elif (
+                            b_schema["extra_policy"] == "ignore"
+                            and any(not (wg & sent_set) for _, wg in b_schema["required_wire_groups"])
+                            and len(b_schema["valid_req_keys"]) <= 20
+                        ):
+                            # Under default Pydantic extra='ignore', silently allow unrelated client keys
+                            # whenever all required fields are satisfied; only warn when required fields are missing.
                             _emit_http(
                                 ("req_unk", fe_rel, c_ln, sk, sc_nm),
                                 (
                                     f"- ⚠️ **[Cross-Stack HTTP Unknown Payload Key]** `{fe_rel}:L{c_ln}` (`{scope}`) → "
                                     f"Sends undeclared field `'{sk}'` to `{verb} {rc['full_path']}`{via_str}; "
-                                    f"`{sc_nm}` (`{sc_loc}`) ignores it while `{sorted(unpopulated_be)[:6]}` remain omitted."
+                                    f"`{sc_nm}` (`{sc_loc}`) ignores it while required field(s) remain omitted."
                                 ),
                                 category="http_unknown_payload_field",
                                 rel=fe_rel,
@@ -1112,25 +1455,48 @@ def verify_cross_stack_http_schemas(
 
             # C. Response Key Verification (Pydantic `response_schema` or closed handler `return_keys`)
             res_reads = cs.get("res_keys") or []
-            if res_reads:
+            res_item_reads = cs.get("res_item_keys") or []
+            if res_reads or res_item_reads:
                 res_sc = rc.get("response_schema")
                 if rc.get("response_is_list") and res_sc is not None:
-                    bad_rk = res_reads[0]
                     sc_loc = f"{res_sc['rel_path']}:L{res_sc['line']}"
-                    _emit_http(
-                        ("res_list", fe_rel, c_ln, bad_rk),
-                        (
-                            f"- ⚠️ **[6D Cross-Stack HTTP Shape Violation]** `{fe_rel}:L{c_ln}` (`{scope}`) → "
-                            f"Reads `.{bad_rk}` on `{verb} {rc['full_path']}`{via_str}, "
-                            f"but backend returns a JSON array `list[{res_sc['name']}]` (`{peer_route_loc}`), not an object."
-                        ),
-                        category="http_response_key_mismatch",
-                        rel=fe_rel,
-                        line=c_ln,
-                        peer=peer_route_loc,
-                        summary=f"Reads .{bad_rk} on {verb} {rc['full_path']}, which returns list[{res_sc['name']}]",
-                    )
-                elif res_sc is not None and res_sc["is_res_closed"]:
+                    if res_reads:
+                        bad_rk = res_reads[0]
+                        _emit_http(
+                            ("res_list", fe_rel, c_ln, bad_rk),
+                            (
+                                f"- ⚠️ **[6D Cross-Stack HTTP Shape Violation]** `{fe_rel}:L{c_ln}` (`{scope}`) → "
+                                f"Reads `.{bad_rk}` on `{verb} {rc['full_path']}`{via_str}, "
+                                f"but backend returns a JSON array `list[{res_sc['name']}]` (`{peer_route_loc}`), not an object."
+                            ),
+                            category="http_response_key_mismatch",
+                            rel=fe_rel,
+                            line=c_ln,
+                            peer=peer_route_loc,
+                            summary=f"Reads .{bad_rk} on {verb} {rc['full_path']}, which returns list[{res_sc['name']}]",
+                        )
+                    elif res_item_reads and res_sc["is_res_closed"]:
+                        valid_rk = res_sc["valid_res_keys"]
+                        miss_item_rk = [rk for rk in res_item_reads if rk not in valid_rk]
+                        if miss_item_rk:
+                            _emit_http(
+                                ("res_list_item", fe_rel, c_ln, miss_item_rk[0]),
+                                (
+                                    f"- ⚠️ **[6D Cross-Stack HTTP Shape Violation]** `{fe_rel}:L{c_ln}` (`{scope}`) → "
+                                    f"Reads item field `.{miss_item_rk[0]}` from `list[{res_sc['name']}]` returned by "
+                                    f"`{verb} {rc['full_path']}`{via_str}, which is absent from `{res_sc['name']}` "
+                                    f"(`{sc_loc}`, fields: `{sorted(valid_rk)[:10]}`)."
+                                ),
+                                category="http_response_key_mismatch",
+                                rel=fe_rel,
+                                line=c_ln,
+                                peer=sc_loc,
+                                summary=(
+                                    f"Reads item .{miss_item_rk[0]} from {verb} {rc['full_path']} "
+                                    f"(list[{res_sc['name']}]), absent from {res_sc['name']}"
+                                ),
+                            )
+                elif res_reads and res_sc is not None and res_sc["is_res_closed"]:
                     valid_rk = res_sc["valid_res_keys"]
                     miss_rk = [rk for rk in res_reads if rk not in valid_rk]
                     if miss_rk:
@@ -1148,7 +1514,7 @@ def verify_cross_stack_http_schemas(
                             peer=sc_loc,
                             summary=f"Reads .{miss_rk[0]} from {verb} {rc['full_path']}, absent from {res_sc['name']}",
                         )
-                elif res_sc is None and rc.get("closed_return_keys"):
+                elif res_reads and res_sc is None and rc.get("closed_return_keys"):
                     be_keys = rc["closed_return_keys"]
                     miss_rk = [rk for rk in res_reads if rk not in be_keys]
                     if miss_rk:
@@ -1292,6 +1658,22 @@ def analyze_react_lifecycle_and_race_contracts(
         jsx_tags_in_comp: dict[str, list[tuple[int, str]]] = {}  # TagName -> [(line, raw_el_txt)]
         effect_calls: list = []
         nested_helper_fns: dict[str, tuple[int, int, str]] = {}
+        inline_handler_fns: list[tuple[int, int, str]] = []
+        ternary_nodes: list = []
+        logical_and_nodes: list = []
+        jsx_tags_in_map: set[tuple[str, int]] = set()
+
+        def _inside_map_cb(nd_chk) -> bool:
+            anc = nd_chk.parent
+            while anc is not None and anc is not comp_nd:
+                if anc.type == "call_expression":
+                    fn_a = anc.child_by_field_name("function")
+                    if fn_a is not None and fn_a.type == "member_expression":
+                        p_a = fn_a.child_by_field_name("property")
+                        if p_a is not None and _t_text(p_a) == "map":
+                            return True
+                anc = anc.parent
+            return False
 
         stack = [comp_nd]
         while stack:
@@ -1325,18 +1707,49 @@ def analyze_react_lifecycle_and_race_contracts(
                                     sv, st_nm = _t_text(ids[0]), _t_text(ids[1])
                                     state_setters[sv] = (st_nm, _t_line(nd))
                                     setter_to_var[st_nm] = sv
+                elif nt in ("arrow_function", "function_expression"):
+                    # Capture inline JSX/event handlers like `onClick={async () => { setSaving(true); ... setSaving(false); }}`
+                    p_nd = nd.parent
+                    if p_nd is not None and p_nd.type != "variable_declarator":
+                        inline_handler_fns.append((_t_line(nd), int(nd.end_point[0]) + 1, _t_text(nd)))
+                elif nt == "ternary_expression":
+                    ternary_nodes.append(nd)
+                elif nt == "binary_expression":
+                    op_n = nd.child_by_field_name("operator")
+                    if op_n is not None and _t_text(op_n) == "&&":
+                        logical_and_nodes.append(nd)
                 elif nt in ("jsx_opening_element", "jsx_self_closing_element"):
                     tn = nd.child_by_field_name("name")
                     if tn and tn.type == "identifier":
                         t_str = _t_text(tn)
                         if t_str[:1].isupper():
-                            jsx_tags_in_comp.setdefault(t_str, []).append((_t_line(nd), _t_text(nd)))
+                            t_ln = _t_line(nd)
+                            jsx_tags_in_comp.setdefault(t_str, []).append((t_ln, _t_text(nd)))
+                            if _inside_map_cb(nd):
+                                jsx_tags_in_map.add((t_str, t_ln))
                 elif nt == "call_expression":
                     fn_c = nd.child_by_field_name("function")
                     if fn_c and _t_text(fn_c).rsplit(".", 1)[-1] == "useEffect":
                         effect_calls.append(nd)
             if nd.named_child_count:
                 stack.extend(reversed(nd.named_children))
+
+        def _subtree_jsx_tags(sub_nd) -> dict[str, list[tuple[int, str]]]:
+            found_tags: dict[str, list[tuple[int, str]]] = {}
+            if sub_nd is None:
+                return found_tags
+            st_j = [sub_nd]
+            while st_j:
+                cur_j = st_j.pop()
+                if cur_j.type in ("jsx_opening_element", "jsx_self_closing_element"):
+                    tn_j = cur_j.child_by_field_name("name")
+                    if tn_j and tn_j.type == "identifier":
+                        t_s = _t_text(tn_j)
+                        if t_s[:1].isupper():
+                            found_tags.setdefault(t_s, []).append((_t_line(cur_j), _t_text(cur_j)))
+                if cur_j.named_child_count:
+                    st_j.extend(reversed(cur_j.named_children))
+            return found_tags
 
         # Law 7b: Nested Component Definition Rendered as `<InnerComp />`
         for inner_nm, def_ln in nested_upper_defs.items():
@@ -1388,17 +1801,22 @@ def analyze_react_lifecycle_and_race_contracts(
                     mount_only_bodies.append(cb_txt)
                 else:
                     for sv, (st_nm, _) in state_setters.items():
-                        if re.search(rf"\b{re.escape(st_nm)}\s*\(\s*(?:true\b|!\s*{re.escape(sv)}\b|\(\s*\w+\s*\)\s*=>\s*!)", cb_txt):
+                        set_t = re.search(rf"\b{re.escape(st_nm)}\s*\(\s*true\b", cb_txt)
+                        set_f = re.search(rf"\b{re.escape(st_nm)}\s*\(\s*false\b", cb_txt)
+                        if set_t and set_f:
                             retriggered_effect_setters.setdefault(sv, set()).update(dep_ids)
 
             post_mount_flags: dict[str, tuple[int, set[str] | None]] = {}  # sv -> (set_true_line, only_effect_deps_or_None)
             for sv, (st_nm, _) in state_setters.items():
-                truthy_rx = re.compile(rf"\b{re.escape(st_nm)}\s*\(\s*(?:true\b|!\s*{re.escape(sv)}\b|\(\s*\w+\s*\)\s*=>\s*!)")
-                # Check helper functions first
+                set_true_rx = re.compile(rf"\b{re.escape(st_nm)}\s*\(\s*true\b")
+                set_false_rx = re.compile(rf"\b{re.escape(st_nm)}\s*\(\s*false\b")
+                # Require a same-handler transient round-trip (`setSv(true)` AND `setSv(false)` inside the
+                # same handler/helper/effect). One-way screens (`setSubmitted(true)` + separate "New Order"
+                # button) and synchronous mode toggles (`setIsPreview(!isPreview)`) do NOT trigger false positives.
                 found_interactive_line: int | None = None
                 for h_nm, (hs, he, h_txt) in nested_helper_fns.items():
-                    m_tr = truthy_rx.search(h_txt)
-                    if not m_tr:
+                    m_tr = set_true_rx.search(h_txt)
+                    if not (m_tr and set_false_rx.search(h_txt)):
                         continue
                     # Ensure helper isn't *exclusively* invoked inside a mount-only `useEffect(..., [])`
                     all_calls_to_h = len(re.findall(rf"\b{re.escape(h_nm)}\b", comp_txt)) - 1  # subtract declaration
@@ -1406,6 +1824,14 @@ def analyze_react_lifecycle_and_race_contracts(
                     if all_calls_to_h > mount_calls_to_h:
                         found_interactive_line = hs + h_txt.count("\n", 0, m_tr.start())
                         break
+                if found_interactive_line is None:
+                    for hs, he, h_txt in inline_handler_fns:
+                        if any(ms <= hs and he <= me for ms, me in mount_only_spans):
+                            continue
+                        m_tr = set_true_rx.search(h_txt)
+                        if m_tr and set_false_rx.search(h_txt):
+                            found_interactive_line = hs + h_txt.count("\n", 0, m_tr.start())
+                            break
                 if found_interactive_line is not None:
                     post_mount_flags[sv] = (found_interactive_line, None)
                 elif sv in retriggered_effect_setters:
@@ -1414,20 +1840,22 @@ def analyze_react_lifecycle_and_race_contracts(
             if post_mount_flags:
                 body_nd = comp_nd.child_by_field_name("body")
                 if body_nd is not None:
-                    # 1. Early return guards: `if (loading) return <Spinner />;` before main JSX return
-                    early_guarded_flags: dict[str, int] = {}
+                    # 1. Early return guards & `if (loading) { return <Spinner/> } else { return <Child/> }`
+                    early_guarded_flags: dict[str, tuple[int, dict[str, list[tuple[int, str]]] | None, dict[str, list[tuple[int, str]]]]] = {}
                     for stmt in body_nd.named_children:
                         if stmt.type == "if_statement":
                             cond_n = stmt.child_by_field_name("condition")
                             cons_n = stmt.child_by_field_name("consequence")
                             alt_n = stmt.child_by_field_name("alternative")
-                            if cond_n and cons_n and alt_n is None and "return" in _t_text(cons_n):
+                            if cond_n and cons_n and "return" in _t_text(cons_n):
                                 c_str = _t_text(cond_n)
+                                cons_tags = _subtree_jsx_tags(cons_n)
+                                alt_tags = _subtree_jsx_tags(alt_n) if alt_n is not None else None
                                 for sv in post_mount_flags:
                                     if re.search(rf"(?<![!\w]){re.escape(sv)}\b", c_str) and not re.search(
                                         rf"!\s*{re.escape(sv)}\b|{re.escape(sv)}\s*===\s*false", c_str
                                     ):
-                                        early_guarded_flags.setdefault(sv, _t_line(stmt))
+                                        early_guarded_flags.setdefault(sv, (_t_line(stmt), alt_tags, cons_tags))
 
                     for tag_nm, tag_uses in jsx_tags_in_comp.items():
                         if tag_nm in nested_upper_defs:
@@ -1436,7 +1864,13 @@ def analyze_react_lifecycle_and_race_contracts(
                         if not child_peer:
                             continue
                         use_ln, raw_tag = tag_uses[0]
-                        if re.search(r"\bkey\s*=\s*\{", raw_tag):
+                        # A `key={docId}` on a single child is an intentional remount boundary;
+                        # however, a `key={item.id}` inside `.map(...)` is a mandatory React list key
+                        # and does NOT protect list items from being unmounted by `if (refreshing) return <Spinner />`.
+                        is_explicit_nonlist_key = bool(
+                            re.search(r"\bkey\s*=\s*\{", raw_tag) and (tag_nm, use_ln) not in jsx_tags_in_map
+                        )
+                        if is_explicit_nonlist_key:
                             continue
 
                         for sv, (set_ln, eff_deps_only) in post_mount_flags.items():
@@ -1446,52 +1880,184 @@ def analyze_react_lifecycle_and_race_contracts(
                                 for d in eff_deps_only
                             ):
                                 continue
-                            guard_ln = early_guarded_flags.get(sv)
-                            if guard_ln is not None and guard_ln < use_ln:
-                                _emit_react(
-                                    ("unmount_early", comp_name, sv, tag_nm),
-                                    (
-                                        f"- ⚠️ **[React Stateful Child Unmount Bug (`stateful_child_unmount_guard`)]** "
-                                        f"`{rel_path}:L{guard_ln}` (`{comp_name}`) → Early return on `{sv}` (`set` to `true` "
-                                        f"post-mount at `L{set_ln}`) unmounts stateful `<{tag_nm}>` (`{child_peer}`), "
-                                        f"destroying its internal `useState` state on refresh."
-                                    ),
-                                    category="stateful_child_unmount_guard",
-                                    line=guard_ln,
-                                    peer=child_peer,
-                                    summary=(
-                                        f"Early return on '{sv}' (toggled post-mount at L{set_ln}) unmounts "
-                                        f"stateful <{tag_nm}> ({child_peer}), wiping child state"
-                                    ),
-                                )
-                                break
-                            # Also check inline ternary `{loading ? <Spinner/> : <StatefulChild/>}`
-                            m_tern = re.search(
-                                rf"\b{re.escape(sv)}\s*\?[\s\S]{{1,220}}?:\s*(?:\(\s*)?<{re.escape(tag_nm)}\b",
-                                comp_txt,
-                            )
-                            if m_tern:
-                                tern_ln = _t_line(comp_nd) + comp_txt.count("\n", 0, m_tern.start())
+                            eg_info = early_guarded_flags.get(sv)
+                            if eg_info is not None:
+                                guard_ln, alt_tags, cons_tags = eg_info
+                                if tag_nm not in cons_tags and (
+                                    (alt_tags is None and guard_ln < use_ln)
+                                    or (alt_tags is not None and tag_nm in alt_tags)
+                                ):
+                                    _emit_react(
+                                        ("unmount_early", comp_name, sv, tag_nm),
+                                        (
+                                            f"- ⚠️ **[React Stateful Child Unmount Bug (`stateful_child_unmount_guard`)]** "
+                                            f"`{rel_path}:L{guard_ln}` (`{comp_name}`) → Early return on `{sv}` (`set` to `true` "
+                                            f"post-mount at `L{set_ln}`) unmounts stateful `<{tag_nm}>` (`{child_peer}`), "
+                                            f"destroying its internal `useState` state on refresh."
+                                        ),
+                                        category="stateful_child_unmount_guard",
+                                        line=guard_ln,
+                                        peer=child_peer,
+                                        summary=(
+                                            f"Early return on '{sv}' (toggled post-mount at L{set_ln}) unmounts "
+                                            f"stateful <{tag_nm}> ({child_peer}), wiping child state"
+                                        ),
+                                    )
+                                    break
+                            # 2. CST-exact ternary & logical-AND (`{!saving && <Child />}`) checks
+                            matched_tern_ln: int | None = None
+                            matched_cond_kind = "ternary"
+                            for t_nd in ternary_nodes:
+                                t_cond = t_nd.child_by_field_name("condition")
+                                t_cons = t_nd.child_by_field_name("consequence")
+                                t_alt = t_nd.child_by_field_name("alternative")
+                                if not (t_cond and t_cons and t_alt):
+                                    continue
+                                c_txt = _t_text(t_cond)
+                                if not re.search(rf"\b{re.escape(sv)}\b", c_txt):
+                                    continue
+                                is_neg = bool(re.search(rf"!\s*{re.escape(sv)}\b|{re.escape(sv)}\s*===\s*false", c_txt))
+                                cons_t = _subtree_jsx_tags(t_cons)
+                                alt_t = _subtree_jsx_tags(t_alt)
+                                child_branch = cons_t if is_neg else alt_t
+                                other_branch = alt_t if is_neg else cons_t
+                                if tag_nm in child_branch and tag_nm not in other_branch:
+                                    if not any(
+                                        re.search(r"\bkey\s*=\s*\{", rt) and (tag_nm, rl) not in jsx_tags_in_map
+                                        for rl, rt in child_branch[tag_nm]
+                                    ):
+                                        matched_tern_ln = _t_line(t_nd)
+                                        break
+                            if matched_tern_ln is None:
+                                for and_nd in logical_and_nodes:
+                                    l_nd = and_nd.child_by_field_name("left")
+                                    r_nd = and_nd.child_by_field_name("right")
+                                    if not (l_nd and r_nd):
+                                        continue
+                                    l_txt = _t_text(l_nd)
+                                    if not re.search(rf"!\s*{re.escape(sv)}\b|{re.escape(sv)}\s*===\s*false", l_txt):
+                                        continue
+                                    r_tags = _subtree_jsx_tags(r_nd)
+                                    if tag_nm in r_tags:
+                                        if not any(
+                                            re.search(r"\bkey\s*=\s*\{", rt) and (tag_nm, rl) not in jsx_tags_in_map
+                                            for rl, rt in r_tags[tag_nm]
+                                        ):
+                                            matched_tern_ln = _t_line(and_nd)
+                                            matched_cond_kind = "logical_and"
+                                            break
+                            if matched_tern_ln is not None:
+                                expr_lbl = f"!{sv} && <{tag_nm}>" if matched_cond_kind == "logical_and" else f"{sv} ? ... : <{tag_nm}>"
                                 _emit_react(
                                     ("unmount_tern", comp_name, sv, tag_nm),
                                     (
                                         f"- ⚠️ **[React Stateful Child Unmount Bug (`stateful_child_unmount_guard`)]** "
-                                        f"`{rel_path}:L{tern_ln}` (`{comp_name}`) → Conditional branch `{sv} ? ... : <{tag_nm}>` "
+                                        f"`{rel_path}:L{matched_tern_ln}` (`{comp_name}`) → Conditional branch `{expr_lbl}` "
                                         f"(`{sv}` set `true` post-mount at `L{set_ln}`) unmounts stateful `<{tag_nm}>` "
                                         f"(`{child_peer}`), wiping its internal state."
                                     ),
                                     category="stateful_child_unmount_guard",
-                                    line=tern_ln,
+                                    line=matched_tern_ln,
                                     peer=child_peer,
                                     summary=(
-                                        f"Ternary '{sv} ? ... : <{tag_nm}>' (toggled post-mount at L{set_ln}) "
+                                        f"Conditional '{expr_lbl}' (toggled post-mount at L{set_ln}) "
                                         f"unmounts stateful <{tag_nm}> ({child_peer})"
                                     ),
                                 )
                                 break
 
-        # Law 8: Uncancelled Async `useEffect([dep])` `setState` Race Condition
+        # Law 8: Uncancelled Async `useEffect([dep])` `setState` Race Condition (CST-Hardened)
+        def _has_direct_cleanup_return(cb_node) -> bool:
+            """Return True ONLY if `cb_node` itself returns a cleanup function/ref (ignores returns inside `.then()`)."""
+            b_nd = cb_node.child_by_field_name("body")
+            if b_nd is None:
+                return False
+            if b_nd.type != "statement_block":
+                return False
+            st_r = list(reversed(b_nd.named_children))
+            while st_r:
+                cur_r = st_r.pop()
+                ct = cur_r.type
+                if ct in ("arrow_function", "function_expression", "function_declaration", "method_definition"):
+                    continue
+                if ct == "return_statement" and cur_r.named_children:
+                    return True
+                if cur_r.named_child_count:
+                    st_r.extend(reversed(cur_r.named_children))
+            return False
+
+        def _has_abort_signal_cst(root_nodes: list, combined_txt: str) -> bool:
+            """Detect actual AbortController/AbortSignal usage without false-skipping `{ signal: 'buy' }` or axios body payloads."""
+            if "AbortController" in combined_txt or ".abort(" in combined_txt or re.search(r"\bAbortSignal\b", combined_txt):
+                return True
+
+            def _is_axios_body_arg(obj_nd) -> bool:
+                """Return True if `obj_nd` is arg[1] (the request body, NOT config) of `axios.post/put/patch(url, body, cfg)`."""
+                args_p = obj_nd.parent
+                if args_p is None or args_p.type != "arguments":
+                    return False
+                call_p = args_p.parent
+                if call_p is None or call_p.type != "call_expression":
+                    return False
+                fn_p = call_p.child_by_field_name("function")
+                if fn_p is None:
+                    return False
+                callee_p = re.sub(r"\s+", "", _t_text(fn_p))
+                m_axp = re.match(r"^[A-Za-z_$][\w$]*\.(post|put|patch)$", callee_p, re.IGNORECASE)
+                if not m_axp:
+                    return False
+                named_a = args_p.named_children
+                return len(named_a) >= 2 and named_a[1] == obj_nd
+
+            for rn in root_nodes:
+                if rn is None:
+                    continue
+                st_s = [rn]
+                while st_s:
+                    cur_s = st_s.pop()
+                    ct = cur_s.type
+                    # Never treat keys inside `JSON.stringify(...)` or axios POST/PUT/PATCH body arg[1] as AbortSignals!
+                    if ct == "call_expression":
+                        fn_s = cur_s.child_by_field_name("function")
+                        if fn_s is not None and _t_text(fn_s).strip() == "JSON.stringify":
+                            continue
+                    if ct == "object" and _is_axios_body_arg(cur_s):
+                        continue
+                    if ct == "member_expression":
+                        p_s = cur_s.child_by_field_name("property")
+                        if p_s is not None and _t_text(p_s) == "signal":
+                            return True
+                    elif ct == "shorthand_property_identifier" and _t_text(cur_s) == "signal":
+                        return True
+                    elif ct == "pair":
+                        k_s = cur_s.child_by_field_name("key")
+                        v_s = cur_s.child_by_field_name("value")
+                        if k_s is not None and v_s is not None and _t_text(k_s).strip("'\"`") == "signal":
+                            if v_s.type not in ("string", "template_string", "number", "true", "false", "null", "undefined"):
+                                return True
+                    if cur_s.named_child_count:
+                        st_s.extend(reversed(cur_s.named_children))
+            return False
+
         if setter_to_var and effect_calls:
+            # Map helper names to their CST nodes as well for AbortSignal CST inspection
+            helper_cst_nodes: dict[str, object] = {}
+            st_hc = [comp_nd]
+            while st_hc:
+                cur_hc = st_hc.pop()
+                if cur_hc is not comp_nd:
+                    if cur_hc.type == "function_declaration":
+                        nm_hc = cur_hc.child_by_field_name("name")
+                        if nm_hc:
+                            helper_cst_nodes[_t_text(nm_hc)] = cur_hc
+                    elif cur_hc.type == "variable_declarator":
+                        nm_hc = cur_hc.child_by_field_name("name")
+                        val_hc = cur_hc.child_by_field_name("value")
+                        if nm_hc and val_hc and nm_hc.type == "identifier" and val_hc.type in ("arrow_function", "function_expression"):
+                            helper_cst_nodes[_t_text(nm_hc)] = val_hc
+                if cur_hc.named_child_count:
+                    st_hc.extend(reversed(cur_hc.named_children))
+
             for eff_nd in effect_calls:
                 ac = eff_nd.child_by_field_name("arguments")
                 if not ac or len(ac.named_children) < 2:
@@ -1503,28 +2069,48 @@ def analyze_react_lifecycle_and_race_contracts(
                 if not dep_ids:
                     continue
                 cb_txt = _t_text(cb_nd)
-                # Skip if cleanup return, AbortController/signal, or `.current` ref sequence guard exists
-                if (
-                    "AbortController" in cb_txt
-                    or ".abort(" in cb_txt
-                    or "signal" in cb_txt
-                    or ".current" in cb_txt
-                    or re.search(r"\breturn\s*(?:\(\s*\)\s*=>|function\b|[A-Za-z_$][\w$]*\s*;)", cb_txt)
-                ):
+                # Follow 1-hop local async helper functions invoked from inside the effect callback
+                eff_s_ln, eff_e_ln = _t_line(eff_nd), int(eff_nd.end_point[0]) + 1
+                helper_chunks: list[str] = []
+                effect_cst_roots: list = [cb_nd]
+                for h_nm, (hs, he, h_txt) in nested_helper_fns.items():
+                    if eff_s_ln <= hs and he <= eff_e_ln:
+                        continue
+                    if re.search(rf"\b{re.escape(h_nm)}\s*\(", cb_txt):
+                        helper_chunks.append(h_txt)
+                        if h_nm in helper_cst_nodes:
+                            effect_cst_roots.append(helper_cst_nodes[h_nm])
+                effective_txt = cb_txt + ("\n" + "\n".join(helper_chunks) if helper_chunks else "")
+
+                if _has_direct_cleanup_return(cb_nd) or _has_abort_signal_cst(effect_cst_roots, effective_txt):
                     continue
-                if "await " not in cb_txt and ".then(" not in cb_txt:
+                if "await " not in effective_txt and ".then(" not in effective_txt:
                     continue
-                if not any(re.search(rf"\b{re.escape(d)}\b", cb_txt) for d in dep_ids):
+                if not any(re.search(rf"\b{re.escape(d)}\b", effective_txt) for d in dep_ids):
                     continue
 
-                # Confirm a declared `setState` setter is called after `await` or inside `.then(...)`
-                m_async_pos = re.search(r"\bawait\s+|\.then\s*\(", cb_txt)
+                # Confirm a declared `setState` setter is called after `await` or inside `.then(...)` (including point-free `.then(setItems)`)
+                m_async_pos = re.search(r"\bawait\s+|\.then\s*\(", effective_txt)
                 if not m_async_pos:
                     continue
-                tail_after_async = cb_txt[m_async_pos.end() :]
+                tail_after_async = effective_txt[m_async_pos.start() :]
+
+                # A real `.current` ref race guard mutates/compares a sequence ref OR checks `.current`
+                # AFTER the async suspension (not a pre-fetch DOM call like `if (inputRef.current) inputRef.current.focus()`).
+                has_ref_seq_guard = bool(
+                    re.search(r"\.current\s*(?:\+\+|--|\+=|-=|=(?!=))", effective_txt)
+                    and re.search(r"\.current\s*(?:===|!==|==|!=)|(?:===|!==|==|!=)\s*[A-Za-z_$][\w$]*\.current\b", tail_after_async)
+                )
+                has_post_async_ref_guard = bool(re.search(
+                    r"\bif\s*\([^)]*\.current\b|&&\s*!?\s*[A-Za-z_$][\w$]*\.current\b",
+                    tail_after_async,
+                ))
+                if has_ref_seq_guard or has_post_async_ref_guard:
+                    continue
+
                 called_setters = [
                     st_nm for st_nm in setter_to_var
-                    if re.search(rf"\b{re.escape(st_nm)}\s*\(", tail_after_async)
+                    if re.search(rf"\b{re.escape(st_nm)}\s*\(|\.\s*then\s*\(\s*{re.escape(st_nm)}\b", tail_after_async)
                 ]
                 if called_setters:
                     eff_ln = _t_line(eff_nd)
@@ -1684,9 +2270,28 @@ def analyze_python_semantic_hazards(
                     schema_params[arg.arg] = sc
 
         if schema_params:
-            unset_unsafe_vars: dict[str, tuple[str, dict, int]] = {}  # local_var -> (param_nm, sc, line)
+            unset_unsafe_vars: dict[str, tuple[str, dict, int, list[str]]] = {}  # local_var -> (param_nm, sc, line, clobbered_opts)
 
-            def _is_unsafe_dump_call(c_nd: ast.AST) -> tuple[str, dict, int] | None:
+            def _extract_literal_field_names(expr: ast.AST) -> set[str] | None:
+                if isinstance(expr, (ast.Set, ast.List, ast.Tuple)):
+                    out: set[str] = set()
+                    for elt in expr.elts:
+                        if isinstance(elt, ast.Constant) and isinstance(elt.value, str):
+                            out.add(elt.value)
+                        else:
+                            return None
+                    return out
+                if isinstance(expr, ast.Dict):
+                    out = set()
+                    for k_nd in expr.keys:
+                        if isinstance(k_nd, ast.Constant) and isinstance(k_nd.value, str):
+                            out.add(k_nd.value)
+                        else:
+                            return None
+                    return out
+                return None
+
+            def _is_unsafe_dump_call(c_nd: ast.AST) -> tuple[str, dict, int, list[str]] | None:
                 if not (
                     isinstance(c_nd, ast.Call)
                     and isinstance(c_nd.func, ast.Attribute)
@@ -1695,23 +2300,59 @@ def analyze_python_semantic_hazards(
                     and c_nd.func.value.id in schema_params
                 ):
                     return None
+                excluded_keys: set[str] = set()
+                included_keys: set[str] | None = None
                 for kw in c_nd.keywords:
                     if kw.arg in ("exclude_unset", "exclude_none", "exclude_defaults"):
                         if isinstance(kw.value, ast.Constant) and kw.value.value is True:
                             return None
                         if not isinstance(kw.value, ast.Constant):
                             return None
+                    elif kw.arg == "exclude":
+                        if isinstance(kw.value, ast.Constant) and kw.value.value is None:
+                            continue
+                        lit_ex = _extract_literal_field_names(kw.value)
+                        if lit_ex is None:
+                            return None
+                        excluded_keys.update(lit_ex)
+                    elif kw.arg == "include":
+                        if isinstance(kw.value, ast.Constant) and kw.value.value is None:
+                            continue
+                        lit_in = _extract_literal_field_names(kw.value)
+                        if lit_in is None:
+                            return None
+                        included_keys = lit_in
                 p_nm = c_nd.func.value.id
-                return p_nm, schema_params[p_nm], int(getattr(c_nd, "lineno", node.lineno))
+                sc = schema_params[p_nm]
+                clobbered = [
+                    f for f in sc["optional_fields"]
+                    if f not in excluded_keys and (included_keys is None or f in included_keys)
+                ]
+                if not clobbered:
+                    return None
+                return p_nm, sc, int(getattr(c_nd, "lineno", node.lineno)), clobbered
 
             local_nodes = list(_iter_fn_local_nodes(node))
+            # Single top-to-bottom flow-sensitive pass: reassigning `data` to a filtered dict/expr
+            # clears its unsafe taint before subsequent `.sqlmodel_update(data)` / `setattr` sinks.
             for sub in local_nodes:
                 if isinstance(sub, ast.Assign) and len(sub.targets) == 1 and isinstance(sub.targets[0], ast.Name):
+                    t_nm = sub.targets[0].id
                     hit = _is_unsafe_dump_call(sub.value)
                     if hit is not None:
-                        unset_unsafe_vars[sub.targets[0].id] = hit
+                        unset_unsafe_vars[t_nm] = hit
+                    elif t_nm in unset_unsafe_vars and not isinstance(sub.value, (ast.Dict, ast.BinOp)):
+                        unset_unsafe_vars.pop(t_nm, None)
+                    continue
+                if isinstance(sub, ast.AnnAssign) and isinstance(sub.target, ast.Name) and sub.value is not None:
+                    t_nm = sub.target.id
+                    hit = _is_unsafe_dump_call(sub.value)
+                    if hit is not None:
+                        unset_unsafe_vars[t_nm] = hit
+                    elif t_nm in unset_unsafe_vars and not isinstance(sub.value, (ast.Dict, ast.BinOp)):
+                        unset_unsafe_vars.pop(t_nm, None)
+                    continue
 
-            for sub in local_nodes:
                 # Pattern i: `for k, v in data.items(): setattr(row, k, v)` without `if v is not None`
                 if isinstance(sub, ast.For):
                     dump_origin = None
@@ -1726,10 +2367,16 @@ def analyze_python_semantic_hazards(
                             dump_origin = _is_unsafe_dump_call(sub.iter.func.value)
                     if dump_origin is not None:
                         for_src = ast.unparse(sub)
-                        if "setattr(" in for_src and "is not None" not in for_src:
-                            p_nm, sc, d_ln = dump_origin
+                        has_safe_guard = (
+                            "is not None" in for_src
+                            or "is None" in for_src
+                            or "model_fields_set" in for_src
+                            or "__fields_set__" in for_src
+                        )
+                        if "setattr(" in for_src and not has_safe_guard:
+                            p_nm, sc, d_ln, clobbered_opts = dump_origin
                             sc_loc = f"{sc['rel_path']}:L{sc['line']}"
-                            opt_preview = sc["optional_fields"][:4]
+                            opt_preview = clobbered_opts[:4]
                             _emit_py(
                                 ("clobber_setattr", fn_name, d_ln),
                                 (
@@ -1747,9 +2394,11 @@ def analyze_python_semantic_hazards(
                                 ),
                             )
 
-                # Pattern ii: `row.sqlmodel_update(data)` / `query.update(data)` / `stmt.values(**data)`
+                # Pattern ii: `row.sqlmodel_update(data)` / `query.update(data)` / `stmt.values(**data)` / `existing.model_copy(update=data)`
                 elif isinstance(sub, ast.Call) and isinstance(sub.func, ast.Attribute):
-                    if sub.func.attr in ("sqlmodel_update", "update", "values") and is_patch_or_update_fn:
+                    if sub.func.attr == "sqlmodel_update" or (
+                        sub.func.attr in ("update", "values") and is_patch_or_update_fn
+                    ):
                         dump_origin = None
                         if sub.args:
                             a0 = sub.args[0]
@@ -1764,9 +2413,9 @@ def analyze_python_semantic_hazards(
                                 else:
                                     dump_origin = _is_unsafe_dump_call(kw.value)
                         if dump_origin is not None:
-                            p_nm, sc, d_ln = dump_origin
+                            p_nm, sc, d_ln, clobbered_opts = dump_origin
                             sc_loc = f"{sc['rel_path']}:L{sc['line']}"
-                            opt_preview = sc["optional_fields"][:4]
+                            opt_preview = clobbered_opts[:4]
                             _emit_py(
                                 ("clobber_upd", fn_name, d_ln),
                                 (
@@ -1783,8 +2432,62 @@ def analyze_python_semantic_hazards(
                                     f"clobbers omitted {sc['name']} fields {opt_preview}"
                                 ),
                             )
+                    elif sub.func.attr in ("model_copy", "copy"):
+                        dump_origin = None
+                        for kw in sub.keywords:
+                            if kw.arg == "update":
+                                if isinstance(kw.value, ast.Name) and kw.value.id in unset_unsafe_vars:
+                                    dump_origin = unset_unsafe_vars[kw.value.id]
+                                else:
+                                    dump_origin = _is_unsafe_dump_call(kw.value)
+                        if dump_origin is not None:
+                            p_nm, sc, d_ln, clobbered_opts = dump_origin
+                            sc_loc = f"{sc['rel_path']}:L{sc['line']}"
+                            opt_preview = clobbered_opts[:4]
+                            _emit_py(
+                                ("clobber_copy", fn_name, d_ln),
+                                (
+                                    f"- ⚠️ **[Pydantic Partial-Update Clobber (`pydantic_partial_update_clobber`)]** "
+                                    f"`{rel_path}:L{d_ln}` (`{fn_name}`) → Passes `{p_nm}.model_dump()` without "
+                                    f"`exclude_unset=True` into `.{sub.func.attr}(update=...)` (`L{sub.lineno}`), "
+                                    f"clobbering omitted `{sc['name']}` fields `{opt_preview}` with defaults/`None`."
+                                ),
+                                category="pydantic_partial_update_clobber",
+                                line=d_ln,
+                                peer=sc_loc,
+                                summary=(
+                                    f"{p_nm}.model_dump() without exclude_unset=True passed to .{sub.func.attr}(update=...) "
+                                    f"clobbers omitted {sc['name']} fields {opt_preview}"
+                                ),
+                            )
 
-                # Pattern iii: Dict merge `{**existing_defaults, **payload.model_dump()}`
+                # Pattern iii: Dict merge `{**existing_defaults, **payload.model_dump()}` or Python 3.9+ `existing | payload.model_dump()`
+                elif isinstance(sub, ast.BinOp) and isinstance(sub.op, ast.BitOr):
+                    dump_origin = (
+                        unset_unsafe_vars.get(sub.right.id)
+                        if isinstance(sub.right, ast.Name)
+                        else _is_unsafe_dump_call(sub.right)
+                    )
+                    if dump_origin is not None:
+                        p_nm, sc, d_ln, clobbered_opts = dump_origin
+                        sc_loc = f"{sc['rel_path']}:L{sc['line']}"
+                        opt_preview = clobbered_opts[:4]
+                        _emit_py(
+                            ("clobber_merge", fn_name, d_ln),
+                            (
+                                f"- ⚠️ **[Pydantic Partial-Update Clobber (`pydantic_partial_update_clobber`)]** "
+                                f"`{rel_path}:L{d_ln}` (`{fn_name}`) → Merges `| {p_nm}.model_dump()` without "
+                                f"`exclude_unset=True` over an existing dict (`L{sub.lineno}`), "
+                                f"overwriting base keys `{opt_preview}` with `{sc['name']}` defaults/`None`."
+                            ),
+                            category="pydantic_partial_update_clobber",
+                            line=d_ln,
+                            peer=sc_loc,
+                            summary=(
+                                f"| {p_nm}.model_dump() without exclude_unset=True overwrites base dict "
+                                f"keys {opt_preview} with {sc['name']} defaults"
+                            ),
+                        )
                 elif isinstance(sub, ast.Dict) and len(sub.keys) >= 2 and sub.keys[0] is None:
                     for k_node, v_node in zip(sub.keys[1:], sub.values[1:]):
                         if k_node is not None:
@@ -1795,9 +2498,9 @@ def analyze_python_semantic_hazards(
                             else _is_unsafe_dump_call(v_node)
                         )
                         if dump_origin is not None:
-                            p_nm, sc, d_ln = dump_origin
+                            p_nm, sc, d_ln, clobbered_opts = dump_origin
                             sc_loc = f"{sc['rel_path']}:L{sc['line']}"
-                            opt_preview = sc["optional_fields"][:4]
+                            opt_preview = clobbered_opts[:4]
                             _emit_py(
                                 ("clobber_merge", fn_name, d_ln),
                                 (
@@ -1815,10 +2518,27 @@ def analyze_python_semantic_hazards(
                                 ),
                             )
 
-        # 3B. Silent `except Exception: pass` Around `.commit()` or Outbound Notification/Webhook Calls
+        # 3B. Silent `except Exception: pass` Around `.commit()` or Outbound Notification/Webhook/HTTP Calls
         if not want_io or fn_name in ("__del__", "close", "cleanup", "teardown", "dispose"):
             continue
-        for sub in _iter_fn_local_nodes(node):
+        _HTTP_CLIENT_CTORS = frozenset({"Client", "AsyncClient", "Session", "ClientSession"})
+        local_http_clients: set[str] = set()
+        fn_local_io = list(_iter_fn_local_nodes(node))
+        for ln_nd in fn_local_io:
+            if isinstance(ln_nd, (ast.With, ast.AsyncWith)):
+                for w_it in ln_nd.items:
+                    if isinstance(w_it.optional_vars, ast.Name) and isinstance(w_it.context_expr, ast.Call):
+                        cf = w_it.context_expr.func
+                        c_nm = cf.attr if isinstance(cf, ast.Attribute) else (cf.id if isinstance(cf, ast.Name) else "")
+                        if c_nm in _HTTP_CLIENT_CTORS:
+                            local_http_clients.add(w_it.optional_vars.id)
+            elif isinstance(ln_nd, ast.Assign) and len(ln_nd.targets) == 1 and isinstance(ln_nd.targets[0], ast.Name) and isinstance(ln_nd.value, ast.Call):
+                cf = ln_nd.value.func
+                c_nm = cf.attr if isinstance(cf, ast.Attribute) else (cf.id if isinstance(cf, ast.Name) else "")
+                if c_nm in _HTTP_CLIENT_CTORS:
+                    local_http_clients.add(ln_nd.targets[0].id)
+
+        for sub in fn_local_io:
             if not isinstance(sub, ast.Try) or not sub.handlers:
                 continue
             silent_handlers = []
@@ -1853,7 +2573,13 @@ def analyze_python_semantic_hazards(
                         c_expr = ast.unparse(func_nd)
                     else:
                         continue
-                    if bare_c in _PY_SIDE_EFFECT_CALLS or _PY_HTTP_MUTATION_RE.match(c_expr):
+                    is_local_http_mut = (
+                        isinstance(func_nd, ast.Attribute)
+                        and isinstance(func_nd.value, ast.Name)
+                        and func_nd.value.id in local_http_clients
+                        and bare_c in ("post", "put", "patch", "delete")
+                    )
+                    if bare_c in _PY_SIDE_EFFECT_CALLS or is_local_http_mut or _PY_HTTP_MUTATION_RE.match(c_expr):
                         side_effect_desc = f"{c_expr}(...)"
                         break
                 if side_effect_desc:
@@ -1892,15 +2618,19 @@ def run_semantic_repo_audit(
     brain: "ProjectBrain",
     *,
     scope_glob: str | None = None,
+    exclude_globs: list[str] | None = None,
 ) -> dict:
     """Execute <1.5s whole-repo semantic & cross-stack anomaly triage and rank exact hotspot spans."""
     import time as _time
+    from .config import path_is_excluded
     from .contracts import verify_cross_file_contracts
     from .reporters import _classify_diag_rule_id
 
     t0 = _time.perf_counter()
     prod_rels: set[str] = set()
     for rel in brain._index:
+        if exclude_globs and path_is_excluded(rel, exclude_globs):
+            continue
         if scope_glob:
             if not fnmatch.fnmatch(rel, scope_glob) and scope_glob.strip("*") not in rel:
                 continue
@@ -1965,13 +2695,15 @@ def run_semantic_repo_audit(
     static_6d, _ = brain._compile_6d_contract_diagnostics(
         "static contract bug audit", prod_rels, strict_focus=True, skip_http_schemas=True,
     ) if prod_rels else ([], [])
+    xf_deadline_state: dict[str, bool] = {"exceeded": False}
     static_xf = (
         verify_cross_file_contracts(
             brain,
             prod_rels,
             lines_cache=lines_cache,
             include_deep_semantic=False,
-            deadline=t0 + 1.15,
+            deadline=t0 + 4.0,
+            deadline_state=xf_deadline_state,
             skip_git_head=True,
         )
         if prod_rels
@@ -2030,7 +2762,7 @@ def run_semantic_repo_audit(
     return {
         "error_diagnostics": error_diags,
         "combined_diagnostics": combined_diags,
-        "ranked_hotspots": cleaned_hotspots[:25],
+        "ranked_hotspots": cleaned_hotspots[:100],
         "total_hotspots": len(cleaned_hotspots),
         "audit_coverage": {
             "files_scanned": len(prod_rels),
@@ -2039,6 +2771,8 @@ def run_semantic_repo_audit(
             "http_routes_indexed": http_stats["http_routes_indexed"],
             "http_callsites_verified": http_stats["http_callsites_verified"],
             "schemas_indexed": len(schema_registry),
+            "deadline_exceeded": bool(xf_deadline_state.get("exceeded")),
+            "partial_audit": bool(xf_deadline_state.get("exceeded")),
             "elapsed_ms": elapsed_ms,
         },
     }

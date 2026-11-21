@@ -97,6 +97,7 @@ def discover_boundary_rules(
     brain: "ProjectBrain",
     *,
     max_rules: int = 12,
+    include_module_rules: bool = False,
 ) -> list[dict]:
     """Discover zero-violation directional `--forbid` rules from resolved imports & call graph."""
     prod_files = sorted(r for r in brain._index.keys() if _is_prod_layer_file(r))
@@ -120,7 +121,9 @@ def discover_boundary_rules(
 
     is_module_mode = False
     if len(layer_files) < 2:
-        # Flat single-package architecture: partition by module files inside `prefix`
+        # Flat single-package architecture: skip noisy file-to-file bans unless explicitly opted in
+        if not include_module_rules:
+            return []
         layer_files.clear()
         layer_short_name.clear()
         is_module_mode = True
@@ -540,11 +543,16 @@ def learn_repository_governance(
     days: int = 180,
     min_cochanges: int = 3,
     min_confidence: float = 0.70,
+    include_module_rules: bool = False,
 ) -> dict:
     """Discover Day-1 architectural `--forbid` boundaries, git co-change contracts, and hub symbols."""
     brain._ensure_fresh()
 
-    proposed_boundaries = discover_boundary_rules(brain, max_rules=max_rules)
+    proposed_boundaries = discover_boundary_rules(
+        brain,
+        max_rules=max_rules,
+        include_module_rules=include_module_rules,
+    )
     proposed_cochanges = mine_co_change_contracts(
         brain,
         days=days,

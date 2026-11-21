@@ -6,20 +6,19 @@ import sys
 from pathlib import Path
 
 _AGENT_RULE_CONTENT = """\
-# ProjectBrain — Code Graph & Blast-Radius Guardrail Rules
+# ProjectBrain — Cross-Stack Firewall & Satellite Coordinate Router Rules
 
-This repository is indexed by **ProjectBrain** (`projectbrain`). Choose the fastest tool for the scope:
+This repository is indexed by **ProjectBrain** (`projectbrain`). Use it as a lightweight coordinate router and deterministic guardrail:
 
-1. **Direct Reads vs. Code Graph (`rg` / `read_file` vs. `brain_dossier` / `brain_explore`):**
-   - **Small scope / small files / React monoliths:** When a feature lives in `<=6` well-named files, a file is `<=350` lines, or a React/JSX component is one giant monolith function (`>400` lines), use native `rg` + batch `read_file` directly — do not query graph edges on small files.
-   - **Large multi-file chains:** Use `brain_explore` (`projectbrain explore`) or `brain_dossier` (`projectbrain dossier`) when tracing unfamiliar multi-hop call chains, cross-file `/api/...` routes, or git `co_changes` across dozens of files.
-2. **Surgical Symbol & Variable Slicing (`brain_slice` / `projectbrain slice`):**
-   When inspecting specific functions, class skeletons, monolith internal component maps, or PDG variable flows (`focus="target_var"`), batch targets into `brain_slice(targets=["file.py:Class.method"])`.
-3. **Edit Natively + Sub-2s Contract Gate & Repo Bug Triage (`brain_check`):**
-   - **Whole-repo bug audit:** Start with `brain_check(audit=True)` (`projectbrain check --audit`) to rank cross-stack HTTP/Pydantic schema bugs (`PB011`), React stateful remount/race bugs (`PB012`), and Python `.model_dump()` clobbers (`PB013`) in `<1.5s`, then `read_file` only the `ranked_hotspots` spans instead of scanning clean files blindly.
-   - **Post-edit gate:** Edit files natively (`Edit` / `edit_file`) and call `brain_check` once after multi-file edits to verify arity/import/schema contracts and blast radius.
-4. **Architectural Invariants (`brain_remember`) & Test Log Compression (`projectbrain run`):**
-   Pin function invariants (`brain_remember(target="Symbol", note="...")`) or layer rules (`forbid="routes/* -> db/*"`). Use `projectbrain run "<cmd>"` to fold noisy test output to failing traceback symbols.
+1. **Satellite Coordinate Routing vs. Direct Reads (`brain_dossier(..., coordinates_only=True)` / `rg`):**
+   - **Small scope (`<=6` files, `<=350` lines, or React monoliths):** Use native `rg` + `read_file` directly.
+   - **Large multi-file flows:** Send a task signal to `brain_dossier(tasks="...", coordinates_only=True)` (or `projectbrain route "..."`) to get exact `file:Lstart-Lend` coordinates, callers/callees, route peers, covering tests, and touched invariants in ~500 tokens — then read and edit exact lines natively.
+2. **Whole-Repo Cross-Stack & Semantic Audit (`brain_check(audit=True)` / `projectbrain audit`):**
+   Run `brain_check(audit=True, profile="fullstack")` (or `projectbrain audit --profile fullstack`) to catch cross-stack HTTP/Pydantic schema drift (`PB011`), React stateful remount/race bugs (`PB012`), Python `.model_dump()` partial-update clobbers (`PB013`), and boundary/invariant breaks in `<1.5s` without duplicating `pyright`/`tsc`/`ruff`.
+3. **Edit Natively + Post-Edit Gate + Escape Hatches:**
+   Edit natively (`Edit` / `edit_file`) and run `brain_check` once after multi-file edits. Suppress intentional exceptions inline with `# pb:ignore PBxxx -- reason` (or `// pb:ignore PBxxx`) and tune rules in `.projectbrain.toml`.
+4. **Code-Native Invariants (`# @pb-invariant:` / `brain_remember`) & Test Log Compression (`projectbrain run`):**
+   Add `# @pb-invariant: <rule>` (or `// @pb-invariant: <rule>`) directly above critical functions/classes so edits automatically surface alerts, lock AST hashes via `brain_remember(action="sync")` / `forbid="routes/* -> db/*"`, and use `projectbrain run "<cmd>"` to fold noisy test output.
 """
 
 _CURSOR_MDC_FRONTMATTER = """\
@@ -703,10 +702,62 @@ def main(argv: list[str] | None = None) -> int:
         help="Optional glob filter for --audit (e.g. 'frontend/*' or 'backend/routers/*')",
     )
     check_parser.add_argument(
+        "--profile",
+        choices=["all", "fullstack", "cross-stack", "governance"],
+        default=None,
+        help="Rule profile preset (all | fullstack [non-overlapping with pyright/tsc/ruff] | governance)",
+    )
+    check_parser.add_argument(
+        "--select",
+        default=None,
+        help="Comma-separated rule IDs to enable (e.g. 'PB002,PB011,PB012,PB013')",
+    )
+    check_parser.add_argument(
+        "--ignore",
+        default=None,
+        help="Comma-separated rule IDs to ignore (e.g. 'PB003,PB006')",
+    )
+    check_parser.add_argument(
         "--fail-on-violation",
         action="store_true",
         help="Exit with non-zero code (1) if any syntax, contract, boundary, or governance violation is detected",
     )
+
+    audit_parser = sub.add_parser(
+        "audit",
+        help="Zero-write <1.5s whole-repo cross-stack & semantic bug audit (creates no dotfiles unless --save-index)",
+    )
+    audit_parser.add_argument(
+        "--profile",
+        choices=["all", "fullstack", "cross-stack", "governance"],
+        default=None,
+        help="Rule profile preset (default: config or all; use 'fullstack' alongside pyright/tsc/ruff)",
+    )
+    audit_parser.add_argument("--select", default=None, help="Comma-separated rule IDs to enable")
+    audit_parser.add_argument("--ignore", default=None, help="Comma-separated rule IDs to ignore")
+    audit_parser.add_argument("--scope", default=None, help="Optional glob filter (e.g. 'frontend/*')")
+    audit_parser.add_argument(
+        "--format",
+        choices=["text", "json", "markdown", "pr-comment", "github", "sarif"],
+        default=None,
+        help="Output format (default: text)",
+    )
+    audit_parser.add_argument("--json", action="store_true", help="Alias for --format json")
+    audit_parser.add_argument("--ci", action="store_true", help="CI gate mode: exit 1 on violations")
+    audit_parser.add_argument("--fail-on-violation", action="store_true", help="Exit 1 on violations")
+    audit_parser.add_argument(
+        "--save-index",
+        action="store_true",
+        help="Persist .projectbrain.db cache to disk (default: zero-write in-memory scan)",
+    )
+
+    route_parser = sub.add_parser(
+        "route",
+        help="Satellite Coordinate Router: return exact file:Lstart-Lend spans, callers, routes, tests & invariants",
+    )
+    route_parser.add_argument("tasks", nargs="+", help="Task prompt, bug symptom, or feature description")
+    route_parser.add_argument("--top-n", type=int, default=8, help="Max ranked coordinates to return (default: 8)")
+    route_parser.add_argument("--json", action="store_true", help="Output raw JSON coordinates")
 
     learn_parser = sub.add_parser(
         "learn",
@@ -714,6 +765,11 @@ def main(argv: list[str] | None = None) -> int:
     )
     learn_parser.add_argument("--apply", action="store_true", help="Save discovered rules to .projectbrain_memory.json (default: dry-run preview)")
     learn_parser.add_argument("--pin-hubs", action="store_true", help="Also pin AST invariants on top high-fan-in hub symbols when --apply is set")
+    learn_parser.add_argument(
+        "--include-module-rules",
+        action="store_true",
+        help="Also propose file-to-file bans in flat single-package repos without subdirectories",
+    )
     learn_parser.add_argument("--max-rules", type=int, default=12, help="Maximum boundary rules to propose (default: 12)")
     learn_parser.add_argument("--days", type=int, default=180, help="Git history window in days for co-change mining (default: 180)")
     learn_parser.add_argument("--min-cochanges", type=int, default=3, help="Minimum co-change commits required (default: 3)")
@@ -726,6 +782,11 @@ def main(argv: list[str] | None = None) -> int:
     remember_parser.add_argument("--forbid", default=None, help="Enforceable layer rule: '<src_glob> -> <dst_glob>' (e.g. 'routes/* -> db/*')")
     remember_parser.add_argument("--co-change", default=None, help="Co-change contract: '<file_a> <-> <file_b>' or '<file_a> -> <file_b>'")
     remember_parser.add_argument("--reason", default="", help="Reason for --forbid or --co-change rule")
+    remember_parser.add_argument(
+        "--sync-annotations",
+        action="store_true",
+        help="Discover all inline `# @pb-invariant:` / `// @pb-invariant:` comments and lock their AST hashes",
+    )
 
     memories_parser = sub.add_parser("memories", help="List, audit stale, refresh, or forget repo invariants and boundary rules")
     memories_parser.add_argument("--stale", action="store_true", help="Show only stale AST invariants")
@@ -956,6 +1017,9 @@ def main(argv: list[str] | None = None) -> int:
             allow_governance_change=bool(getattr(args, "allow_governance_change", False)),
             audit=bool(getattr(args, "audit", False)),
             scope_glob=getattr(args, "scope", None),
+            profile=getattr(args, "profile", None),
+            select_rules=getattr(args, "select", None),
+            ignore_rules=getattr(args, "ignore", None),
         )
         chosen_fmt = args.format
         if args.json:
@@ -971,6 +1035,43 @@ def main(argv: list[str] | None = None) -> int:
             return 1
         return 0
 
+    if args.command == "audit":
+        res = brain.check(
+            audit=True,
+            scope_glob=getattr(args, "scope", None),
+            profile=getattr(args, "profile", None),
+            select_rules=getattr(args, "select", None),
+            ignore_rules=getattr(args, "ignore", None),
+            zero_write=not bool(getattr(args, "save_index", False)),
+        )
+        chosen_fmt = args.format
+        if args.json:
+            chosen_fmt = "json"
+        elif chosen_fmt is None:
+            if args.ci and os.environ.get("GITHUB_ACTIONS") == "true":
+                chosen_fmt = "github"
+            else:
+                chosen_fmt = "text"
+        print(format_check_report(res, fmt=chosen_fmt))
+        fail_gate = bool(args.fail_on_violation or args.ci)
+        if fail_gate and res.get("all_contracts_valid") is False:
+            return 1
+        return 0
+
+    if args.command == "route":
+        from .dossier import format_route_coordinates
+
+        res = brain.route(
+            args.tasks,
+            top_n=args.top_n,
+            zero_write=not brain._db_store.db_path.exists(),
+        )
+        if args.json:
+            print(json.dumps(res, indent=2))
+        else:
+            print(format_route_coordinates(res))
+        return 0
+
     if args.command == "learn":
         res = brain.learn(
             apply=bool(args.apply),
@@ -979,6 +1080,7 @@ def main(argv: list[str] | None = None) -> int:
             days=args.days,
             min_cochanges=args.min_cochanges,
             min_confidence=args.min_confidence,
+            include_module_rules=bool(getattr(args, "include_module_rules", False)),
         )
         if args.json:
             print(json.dumps(res, indent=2))
@@ -988,6 +1090,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
 
     if args.command == "remember":
+        if getattr(args, "sync_annotations", False):
+            print(json.dumps(brain.remember(action="sync"), indent=2))
+            return 0
         if args.forbid:
             reason_txt = args.reason or args.note or args.target
             print(json.dumps(brain.remember(note=reason_txt, forbid=args.forbid), indent=2))

@@ -87,11 +87,34 @@ _TEMP_PATH_PREFIXES = (".pytest", "pytest-of-", "__pycache__")
 
 def find_git_context(root: Path) -> tuple[Path | None, str]:
     """Return `(git_toplevel_path, sub_prefix)` supporting both repo roots and monorepo subpackages."""
+    import tempfile as _tempfile
+
     resolved = Path(root).resolve()
     if (resolved / ".git").exists():
         return resolved, ""
 
+    try:
+        home_dir = Path.home().resolve()
+    except Exception:
+        home_dir = None
+    try:
+        temp_dir = Path(_tempfile.gettempdir()).resolve()
+    except Exception:
+        temp_dir = None
+    in_temp = False
+    if temp_dir is not None:
+        try:
+            resolved.relative_to(temp_dir)
+            in_temp = True
+        except ValueError:
+            in_temp = False
+
     for parent in resolved.parents:
+        # Never leak non-git projects into an unrelated `$HOME/.git` dotfiles repo or past the OS temp root
+        if home_dir is not None and parent == home_dir:
+            return None, ""
+        if in_temp and temp_dir is not None and (parent == temp_dir or parent in temp_dir.parents):
+            return None, ""
         try:
             rel_parts = resolved.relative_to(parent).parts
         except ValueError:
@@ -698,41 +721,178 @@ def verify_deleted_or_renamed_file_consumers(
     return diags, records
 
 
+def _check_config_governance_tamper(
+    root: Path,
+    target_ref: str,
+    *,
+    from_git_index: bool = False,
+    has_base_memory_governance: bool = False,
+) -> list[dict]:
+    """Detect unauthorized weakening of `.projectbrain.toml` or `[tool.projectbrain]` in `pyproject.toml`."""
+    from .config import (
+        ALL_RULE_IDS,
+        RULE_PROFILES,
+        extract_config_from_toml_dict,
+        parse_toml_text,
+    )
+
+    def _read_cfg_at(ref: str | None) -> tuple[dict, str | None]:
+        for fname, is_pyproj in ((".projectbrain.toml", False), ("pyproject.toml", True)):
+            if ref is None:
+                p = root / fname
+                if not p.is_file():
+                    continue
+                try:
+                    raw = p.read_text(encoding="utf-8", errors="replace")
+                except OSError:
+                    continue
+            else:
+                raw = read_blob_at_ref(root, ref, fname)
+                if raw is None:
+                    continue
+            cfg = extract_config_from_toml_dict(parse_toml_text(raw), from_pyproject=is_pyproj)
+            if not is_pyproj or cfg.get("has_config"):
+                return cfg, fname
+        return {
+            "has_config": False,
+            "profile": "all",
+            "select": [],
+            "ignore": [],
+            "exclude": [],
+            "allow_inline_boundary_ignore": False,
+        }, None
+
+    base_cfg, base_src = _read_cfg_at(target_ref)
+    curr_cfg, curr_src = _read_cfg_at("" if from_git_index else None)
+
+    if not curr_cfg.get("has_config"):
+        return []
+
+    def _effective_rules(cfg: dict) -> set[str]:
+        sel = set(cfg.get("select") or [])
+        ign = set(cfg.get("ignore") or [])
+        prof = str(cfg.get("profile") or "all").lower()
+        base_set = sel if sel else set(RULE_PROFILES.get(prof, ALL_RULE_IDS))
+        return base_set - ign
+
+    cfg_file = curr_src or base_src or ".projectbrain.toml"
+    tampers: list[dict] = []
+
+    if "PB007" in (curr_cfg.get("ignore") or []):
+        tampers.append({
+            "kind": "config_tamper_lock_disabled",
+            "id": f"{cfg_file}:PB007",
+            "file": cfg_file,
+            "line": 1,
+            "message": (
+                f"[GOVERNANCE TAMPER] `{cfg_file}` attempts to disable `PB007` (Governance Tamper Lock) "
+                f"relative to `{target_ref[:12]}` (pass `--allow-governance-change` if intentional)."
+            ),
+        })
+
+    base_rules = _effective_rules(base_cfg)
+    curr_rules = _effective_rules(curr_cfg)
+    dropped_rules = sorted(base_rules - curr_rules)
+    if dropped_rules:
+        tampers.append({
+            "kind": "config_rules_weakened",
+            "id": f"{cfg_file}:rules",
+            "file": cfg_file,
+            "line": 1,
+            "message": (
+                f"[GOVERNANCE TAMPER] `{cfg_file}` weakens active guardrail rules relative to `{target_ref[:12]}` "
+                f"(disabled: `{', '.join(dropped_rules)}`; pass `--allow-governance-change` if intentional)."
+            ),
+        })
+
+    base_excl = {e.strip() for e in (base_cfg.get("exclude") or []) if e.strip()}
+    curr_excl = {e.strip() for e in (curr_cfg.get("exclude") or []) if e.strip()}
+    added_excl = sorted(curr_excl - base_excl)
+    if added_excl:
+        tampers.append({
+            "kind": "config_exclude_weakened",
+            "id": f"{cfg_file}:exclude",
+            "file": cfg_file,
+            "line": 1,
+            "message": (
+                f"[GOVERNANCE TAMPER] `{cfg_file}` adds new exclusion glob(s) `{added_excl}` relative to "
+                f"`{target_ref[:12]}` (pass `--allow-governance-change` if intentional)."
+            ),
+        })
+
+    if not base_cfg.get("allow_inline_boundary_ignore") and curr_cfg.get("allow_inline_boundary_ignore"):
+        tampers.append({
+            "kind": "config_boundary_ignore_enabled",
+            "id": f"{cfg_file}:allow_inline_boundary_ignore",
+            "file": cfg_file,
+            "line": 1,
+            "message": (
+                f"[GOVERNANCE TAMPER] `{cfg_file}` enables `allow_inline_boundary_ignore = true` relative to "
+                f"`{target_ref[:12]}` (pass `--allow-governance-change` if intentional)."
+            ),
+        })
+
+    return tampers
+
+
 def check_governance_tamper(
     root: Path,
     ref_commit: str | None = None,
     *,
     from_git_index: bool = False,
 ) -> list[dict]:
-    """Compare current `.projectbrain_memory.json` against `ref_commit` (or `HEAD`) to detect rule removal/weakening."""
-    if find_git_context(root)[0] is None:
+    """Compare `.projectbrain_memory.json` and `.projectbrain.toml` against `ref_commit` to detect rule weakening."""
+    git_root, _ = find_git_context(root)
+    if git_root is None:
         return []
     target_ref = (ref_commit or "HEAD").strip()
+    ref_ok = _git_run(git_root, ["rev-parse", "--verify", f"{target_ref}^{{commit}}"], timeout=2.0)
+    if ref_ok is None or ref_ok.returncode != 0:
+        return []
     base_raw = read_blob_at_ref(root, target_ref, ".projectbrain_memory.json")
-    if not base_raw:
-        return []
-    try:
-        base_data = json.loads(base_raw)
-    except json.JSONDecodeError:
-        return []
-    if not isinstance(base_data, dict):
-        return []
+    base_data = None
+    if base_raw:
+        try:
+            parsed_b = json.loads(base_raw)
+            if isinstance(parsed_b, dict):
+                base_data = parsed_b
+        except json.JSONDecodeError:
+            base_data = None
 
-    base_rules: list[dict] = [
-        r for r in (base_data.get("boundary_rules") or [])
-        if isinstance(r, dict) and r.get("src_glob") and r.get("dst_glob")
-    ]
-    base_notes: list[dict] = [
-        n for n in (base_data.get("notes") or [])
-        if isinstance(n, dict) and n.get("target_id") and n.get("note")
-    ]
-    base_cochanges: list[dict] = [
-        c for c in (base_data.get("co_change_rules") or [])
-        if isinstance(c, dict) and c.get("file_a") and c.get("file_b")
-    ]
+    base_rules: list[dict] = (
+        [
+            r for r in (base_data.get("boundary_rules") or [])
+            if isinstance(r, dict) and r.get("src_glob") and r.get("dst_glob")
+        ]
+        if base_data
+        else []
+    )
+    base_notes: list[dict] = (
+        [
+            n for n in (base_data.get("notes") or [])
+            if isinstance(n, dict) and n.get("target_id") and n.get("note")
+        ]
+        if base_data
+        else []
+    )
+    base_cochanges: list[dict] = (
+        [
+            c for c in (base_data.get("co_change_rules") or [])
+            if isinstance(c, dict) and c.get("file_a") and c.get("file_b")
+        ]
+        if base_data
+        else []
+    )
+    has_base_mem = bool(base_rules or base_notes or base_cochanges)
+    cfg_tampers = _check_config_governance_tamper(
+        root,
+        target_ref,
+        from_git_index=from_git_index,
+        has_base_memory_governance=has_base_mem,
+    )
 
-    if not base_rules and not base_notes and not base_cochanges:
-        return []
+    if not has_base_mem:
+        return cfg_tampers
 
     curr_text: str | None = None
     if from_git_index:
@@ -749,7 +909,7 @@ def check_governance_tamper(
                     f"and {len(base_cochanges)} co-change rule(s) present at `{target_ref[:12]}`; "
                     f"pass `--allow-governance-change` if intentional)."
                 ),
-            }]
+            }, *cfg_tampers]
     else:
         gov_path = root / ".projectbrain_memory.json"
         if not gov_path.exists():
@@ -764,7 +924,7 @@ def check_governance_tamper(
                     f"and {len(base_cochanges)} co-change rule(s) present at `{target_ref[:12]}`; "
                     f"pass `--allow-governance-change` if intentional)."
                 ),
-            }]
+            }, *cfg_tampers]
         try:
             curr_text = gov_path.read_text(encoding="utf-8")
         except OSError:
@@ -780,7 +940,7 @@ def check_governance_tamper(
                 "[GOVERNANCE TAMPER] `.projectbrain_memory.json` contains invalid JSON or could not be read "
                 "(pass `--allow-governance-change` only after restoring valid governance format)."
             ),
-        }]
+        }, *cfg_tampers]
 
     try:
         curr_data = json.loads(curr_text)
@@ -794,7 +954,7 @@ def check_governance_tamper(
                 "[GOVERNANCE TAMPER] `.projectbrain_memory.json` contains invalid JSON or could not be read "
                 "(pass `--allow-governance-change` only after restoring valid governance format)."
             ),
-        }]
+        }, *cfg_tampers]
 
     if not isinstance(curr_data, dict):
         return [{
@@ -803,13 +963,13 @@ def check_governance_tamper(
             "file": ".projectbrain_memory.json",
             "line": 1,
             "message": "[GOVERNANCE TAMPER] `.projectbrain_memory.json` root must be a JSON object.",
-        }]
+        }, *cfg_tampers]
 
     curr_rules = [r for r in (curr_data.get("boundary_rules") or []) if isinstance(r, dict)]
     curr_notes = [n for n in (curr_data.get("notes") or []) if isinstance(n, dict)]
     curr_cochanges = [c for c in (curr_data.get("co_change_rules") or []) if isinstance(c, dict)]
 
-    tampers: list[dict] = []
+    tampers: list[dict] = list(cfg_tampers)
 
     # 1. Check `--forbid` boundary rules for removal or scope/edge-type weakening
     used_rule_idxs: set[int] = set()
@@ -883,9 +1043,9 @@ def check_governance_tamper(
     curr_notes_by_id: dict[str, tuple[int, dict]] = {
         str(n["id"]): (idx, n) for idx, n in enumerate(curr_notes) if n.get("id")
     }
-    file_ast_hashes_cache: dict[str, set[str] | None] = {}
+    file_ast_hashes_cache: dict[str, dict[str, str] | None] = {}
 
-    def _valid_symbol_hashes_for(rel_p: str) -> set[str] | None:
+    def _valid_symbol_hashes_for(rel_p: str) -> dict[str, str] | None:
         if rel_p in file_ast_hashes_cache:
             return file_ast_hashes_cache[rel_p]
         ext = Path(rel_p).suffix.lower()
@@ -903,18 +1063,23 @@ def check_governance_tamper(
                 except OSError:
                     src_txt = None
         if src_txt is None:
-            file_ast_hashes_cache[rel_p] = set()
-            return set()
+            file_ast_hashes_cache[rel_p] = {}
+            return {}
         try:
+            from .graph import cls_id, fn_id
+
             inf = parse(src_txt, ext)
-            hashes = (
-                {str(fn["ast_hash"]) for fn in inf.get("functions", []) if fn.get("ast_hash")}
-                | {str(cl["ast_hash"]) for cl in inf.get("classes", []) if cl.get("ast_hash")}
-            )
+            hash_map: dict[str, str] = {}
+            for fn in inf.get("functions", []):
+                if fn.get("ast_hash"):
+                    hash_map[fn_id(rel_p, fn["name"], fn.get("parent_class"))] = str(fn["ast_hash"])
+            for cl in inf.get("classes", []):
+                if cl.get("ast_hash"):
+                    hash_map[cls_id(rel_p, cl["name"])] = str(cl["ast_hash"])
         except Exception:
-            hashes = None
-        file_ast_hashes_cache[rel_p] = hashes
-        return hashes
+            hash_map = None
+        file_ast_hashes_cache[rel_p] = hash_map
+        return hash_map
 
     for bn in base_notes:
         b_tid = str(bn.get("target_id", "")).strip()
@@ -974,19 +1139,25 @@ def check_governance_tamper(
         elif b_hash and c_hash != b_hash:
             note_rel = extract_note_rel_path(matched_n) or extract_note_rel_path(bn)
             if note_rel:
-                valid_hashes = _valid_symbol_hashes_for(note_rel)
-                if valid_hashes is not None and c_hash not in valid_hashes:
-                    tampers.append({
-                        "kind": "invariant_hash_forged",
-                        "id": b_id,
-                        "file": ".projectbrain_memory.json",
-                        "line": 1,
-                        "message": (
-                            f"[GOVERNANCE TAMPER] Pinned AST invariant `{b_id}` on `{b_tid}` had its `ast_hash` "
-                            f"altered to `{c_hash}` which does not match any symbol in `{note_rel}` "
-                            f"(use `projectbrain memories --refresh` after verifying or pass `--allow-governance-change`)."
-                        ),
-                    })
+                valid_map = _valid_symbol_hashes_for(note_rel)
+                if valid_map is not None:
+                    if b_tid.startswith(("fn:", "cls:")):
+                        expected_h = valid_map.get(b_tid)
+                        hash_matches = bool(expected_h and c_hash == expected_h)
+                    else:
+                        hash_matches = c_hash in valid_map.values()
+                    if not hash_matches:
+                        tampers.append({
+                            "kind": "invariant_hash_forged",
+                            "id": b_id,
+                            "file": ".projectbrain_memory.json",
+                            "line": 1,
+                            "message": (
+                                f"[GOVERNANCE TAMPER] Pinned AST invariant `{b_id}` on `{b_tid}` had its `ast_hash` "
+                                f"altered to `{c_hash}` which does not match `{b_tid}` in `{note_rel}` "
+                                f"(use `projectbrain memories --refresh` after verifying or pass `--allow-governance-change`)."
+                            ),
+                        })
 
     # 3. Check `co_change_rules` for deletion or weakening
     used_cc_idxs: set[int] = set()

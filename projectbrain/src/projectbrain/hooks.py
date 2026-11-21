@@ -43,6 +43,80 @@ _EDIT_TOOL_NAMES = {
     "str_replace_editor",
 }
 
+_GOVERNANCE_FILES = frozenset({
+    ".projectbrain_memory.json",
+    ".projectbrain.toml",
+    "pyproject.toml",
+})
+
+_JS_TS_HOOK_EXTS = frozenset({".js", ".jsx", ".ts", ".tsx", ".mjs", ".cjs"})
+_PY_DEEP_HOOK_TOKENS = (
+    "model_dump",
+    ".dict(",
+    "except",
+    "BaseModel",
+    "SQLModel",
+    "TypedDict",
+    "@dataclass",
+    "APIRouter",
+    "FastAPI",
+)
+_JS_DEEP_HOOK_TOKENS = (
+    "fetch(",
+    "axios",
+    ".post(",
+    ".put(",
+    ".patch(",
+    ".delete(",
+    ".get(",
+    "useState",
+    "useEffect",
+    "useReducer",
+    "<",
+    "({",
+)
+
+
+def _file_has_inline_invariants(inf: dict | None, src_txt: str | None = None) -> bool:
+    if src_txt and ("@pb-invariant" in src_txt or "@projectbrain-invariant" in src_txt):
+        return True
+    if not inf:
+        return False
+    return any(
+        fn.get("inline_invariants") for fn in (inf.get("functions") or ())
+    ) or any(
+        cls.get("inline_invariants") for cls in (inf.get("classes") or ())
+    )
+
+
+def _needs_deep_hook_audit(rel_path: str, pre_inf: dict, post_inf: dict, src_txt: str) -> bool:
+    """Return True when body-only edits can still trigger PB011-PB013 or inline invariants."""
+    if _file_has_inline_invariants(pre_inf) or _file_has_inline_invariants(post_inf, src_txt):
+        return True
+    if "pb:ignore" in src_txt or "projectbrain:ignore" in src_txt:
+        return True
+    ext = Path(rel_path).suffix.lower()
+    if ext == ".py":
+        if pre_inf.get("routes") or post_inf.get("routes"):
+            return True
+        if any(c.get("schema_spec") for c in (pre_inf.get("classes") or ())) or any(
+            c.get("schema_spec") for c in (post_inf.get("classes") or ())
+        ):
+            return True
+        return any(tok in src_txt for tok in _PY_DEEP_HOOK_TOKENS)
+    if ext in _JS_TS_HOOK_EXTS:
+        if ext in (".jsx", ".tsx"):
+            return True
+        if (
+            pre_inf.get("http_wrapper_spec")
+            or post_inf.get("http_wrapper_spec")
+            or pre_inf.get("routes")
+            or post_inf.get("routes")
+        ):
+            return True
+        return any(tok in src_txt for tok in _JS_DEEP_HOOK_TOKENS)
+    return False
+
 _IGNORED_PARTS = {
     ".git", "node_modules", "__pycache__", ".venv", "venv",
     "dist", "build", ".next", ".nuxt", ".pytest_cache",
@@ -142,9 +216,9 @@ def parse_hook_payload(
     for raw in candidates:
         if orig_root != root and raw and not Path(raw).is_absolute():
             cand_abs = orig_root / raw
-            if cand_abs.exists() or Path(raw).name == ".projectbrain_memory.json":
+            if cand_abs.exists() or Path(raw).name in _GOVERNANCE_FILES:
                 raw = str(cand_abs.resolve())
-        if Path(raw).name == ".projectbrain_memory.json":
+        if Path(raw).name in _GOVERNANCE_FILES:
             governance_edited = True
             continue
         if not _is_auditable_code_path(raw):
@@ -268,15 +342,18 @@ def _cst_items(source: str, ext_l: str) -> list[tuple[tuple[str, str, str], int,
     return out
 
 
-def _file_diag_lines(root: Path, rel_path: str) -> list[str]:
+def _file_diag_lines(root: Path, rel_path: str, *, src_override: str | None = None) -> list[str]:
     """Return pinpoint `[SYNTAX ERROR]` lines for `rel_path`."""
     from collections import Counter
 
     abs_path = root / rel_path
-    try:
-        src = abs_path.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return [f"[SYNTAX ERROR] {rel_path}: unable to read file."]
+    if src_override is not None:
+        src = src_override
+    else:
+        try:
+            src = abs_path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return [f"[SYNTAX ERROR] {rel_path}: unable to read file."]
     ext_l = abs_path.suffix.lower()
     if ext_l == ".py":
         try:
@@ -327,6 +404,8 @@ def audit_edited_files(
     files: list[str],
     *,
     source: str = "post-edit",
+    staged_overrides: dict[str, str] | None = None,
+    deleted_files: list[str] | None = None,
 ) -> dict:
     """Run the 5-layer incremental guardrail audit on `files` inside `root`."""
     resolved_root = Path(root).resolve()
@@ -336,7 +415,19 @@ def audit_edited_files(
         if r and r not in rel_files:
             rel_files.append(r)
 
-    if not rel_files:
+    del_rels: list[str] = []
+    for df in (deleted_files or ()):
+        rd = _norm_rel_fast(resolved_root, str(df))
+        if rd and rd not in del_rels:
+            del_rels.append(rd)
+
+    overrides_norm: dict[str, str] = {}
+    for k_ov, v_ov in (staged_overrides or {}).items():
+        r_ov = _norm_rel_fast(resolved_root, str(k_ov))
+        if r_ov:
+            overrides_norm[r_ov] = v_ov
+
+    if not rel_files and not del_rels:
         return {"clean": True, "blocking": False, "report": ""}
 
     db_file = resolved_root / ".projectbrain.db"
@@ -345,11 +436,11 @@ def audit_edited_files(
     pending_src: dict[str, str] = {}
     pending_parsed: dict[str, tuple] = {}
 
-    # Fast Cold-SQLite Salsa Early-Cutoff: if `.projectbrain.db` exists and edited files have
-    # valid syntax, unchanged `interface_hash`, unchanged `imports`/`calls`/`return_keys`, no
-    # boundary violations touching `rel_files`, and no pinned invariants on `rel_files`,
-    # exit in <15ms without importing `brain.py`/`contracts.py` or hydrating the repository.
-    if db_file.exists() and not cache_file.exists():
+    # Fast Cold-SQLite Salsa Early-Cutoff (post-edit only — NEVER skip pre-commit!):
+    # If `.projectbrain.db` exists and edited files have valid syntax, unchanged AST hashes,
+    # unchanged `interface_hash`/`imports`/`calls`/`return_keys`, no boundary violations touching
+    # `rel_files`, and no pinned invariants on `rel_files`, exit in <15ms.
+    if source != "pre-commit" and db_file.exists() and not cache_file.exists():
         from .memory import RepoMemory
         from .store import SQLiteIndexStore
 
@@ -373,15 +464,16 @@ def audit_edited_files(
                 fast_pre_infos[r] = pre_inf
                 try:
                     st = fpath.stat()
-                    if f_hit.get("mtime") is not None and st.st_mtime == f_hit.get("mtime"):
-                        post_inf = pre_inf
-                    else:
-                        src_txt = fpath.read_text(encoding="utf-8", errors="ignore")
-                        post_inf, ts_tree = _parse_with_tree(src_txt, fpath.suffix.lower())
-                        pending_pre[r] = dict(pre_inf)
-                        pending_src[r] = src_txt
-                        pending_parsed[r] = (post_inf, ts_tree, src_txt, st.st_mtime, st.st_size)
+                    src_txt = fpath.read_text(encoding="utf-8", errors="ignore")
+                    post_inf, ts_tree = _parse_with_tree(src_txt, fpath.suffix.lower())
+                    pending_pre[r] = dict(pre_inf)
+                    pending_src[r] = src_txt
+                    pending_parsed[r] = (post_inf, ts_tree, src_txt, st.st_mtime, st.st_size)
                 except OSError:
+                    fast_clean = False
+                    break
+
+                if _needs_deep_hook_audit(r, pre_inf, post_inf, src_txt):
                     fast_clean = False
                     break
 
@@ -393,10 +485,18 @@ def audit_edited_files(
                             (
                                 fn_d.get("parent_class") or "",
                                 fn_d["name"],
+                                fn_d.get("ast_hash") or "",
                                 tuple(sorted(fn_d.get("calls") or [])),
                                 tuple(sorted(fn_d.get("return_keys") or [])),
                             )
                             for fn_d in inf.get("functions", [])
+                        )),
+                        tuple(sorted(
+                            (
+                                cl_d["name"],
+                                cl_d.get("ast_hash") or "",
+                            )
+                            for cl_d in inf.get("classes", [])
                         )),
                     )
 
@@ -444,7 +544,28 @@ def audit_edited_files(
     brain._pending_parsed_files.update(pending_parsed)
 
     # Ensure pre-edit symbol snapshots are captured from SQLite / git HEAD BEFORE re-indexing
-    if not brain._db_store.db_path.exists() and not brain._cache_path.exists():
+    if overrides_norm or del_rels:
+        from .graph import CodeGraph
+        from .parsers import parse_with_tree as _parse_ov
+
+        brain.index(persist=False)
+        for r_ov, blob_ov in overrides_norm.items():
+            ov_inf, _ = _parse_ov(blob_ov, Path(r_ov).suffix.lower())
+            brain._index[r_ov] = ov_inf
+            brain._source_cache[r_ov] = blob_ov
+            brain._sizes[r_ov] = len(blob_ov.encode("utf-8", errors="ignore"))
+        for r_del in del_rels:
+            brain._index.pop(r_del, None)
+            brain._source_cache.pop(r_del, None)
+        brain._build_blobs(recompute_imports=True)
+        brain._graph = CodeGraph.build(
+            brain._index,
+            import_targets=brain._import_targets,
+            symbol_imports=brain._symbol_imports,
+        )
+        brain._sync_interprocedural_effects()
+        brain._blobs_ready = True
+    elif not brain._db_store.db_path.exists() and not brain._cache_path.exists():
         brain.index()
     elif any(r not in brain._pre_edit_index for r in rel_files):
         brain._capture_pre_edit_snapshots(rel_files)
@@ -455,7 +576,50 @@ def audit_edited_files(
         if pre_inf:
             pre_snapshots[r] = pre_inf
 
-    check_res = brain.check(files_modified=rel_files)
+    if overrides_norm or del_rels:
+        from .config import apply_rule_and_suppression_filters, load_repo_config, resolve_active_rules
+        from .git_diff import verify_deleted_or_renamed_file_consumers
+
+        imp_res = brain.impact(rel_files, _already_fresh=True) if rel_files else {
+            "details": [], "contract_diagnostics": [], "semantic_warnings": [],
+        }
+        diags_ov = list(imp_res.get("contract_diagnostics", []))
+        if del_rels:
+            del_diags, _ = verify_deleted_or_renamed_file_consumers(brain, set(del_rels))
+            for dd in del_diags:
+                if dd not in diags_ov:
+                    diags_ov.append(dd)
+        bv_ov = (
+            brain._memory.check_boundary_violations(
+                brain._index, brain._import_targets, brain._graph, focus_rels=set(rel_files),
+            )
+            if rel_files
+            else []
+        )
+        for bv in bv_ov:
+            if bv["message"] not in diags_ov:
+                diags_ov.append(bv["message"])
+        repo_cfg = load_repo_config(resolved_root)
+        active_rules, eff_profile, has_custom = resolve_active_rules(repo_cfg)
+        check_res = apply_rule_and_suppression_filters(
+            {
+                "impact_analysis": imp_res,
+                "contract_diagnostics": diags_ov,
+                "boundary_violations": bv_ov,
+                "semantic_warnings": list(imp_res.get("semantic_warnings") or []),
+                "memories": [],
+                "all_contracts_valid": len(diags_ov) == 0,
+            },
+            resolved_root,
+            active_rules=active_rules,
+            exclude_globs=list(repo_cfg.get("exclude") or []),
+            profile_name=eff_profile,
+            has_custom_filter=has_custom,
+            allow_inline_boundary_ignore=bool(repo_cfg.get("allow_inline_boundary_ignore", False)),
+            file_text_getter=brain._get_file_text,
+        )
+    else:
+        check_res = brain.check(files_modified=rel_files)
     imp = check_res.get("impact_analysis", {})
     details_by_rel = {d["rel_path"]: d for d in imp.get("details", []) if d.get("rel_path")}
 
@@ -465,7 +629,7 @@ def audit_edited_files(
     for r in rel_files:
         post_inf = brain._index.get(r, {})
         if post_inf.get("parse_status") == "partial":
-            s_errs = _file_diag_lines(brain.root, r)
+            s_errs = _file_diag_lines(brain.root, r, src_override=overrides_norm.get(r))
             if s_errs:
                 files_with_syntax_err.add(r)
                 syntax_errors.extend(s_errs)
@@ -572,9 +736,10 @@ def audit_edited_files(
                 "tests": det.get("test_consumers", [])[:6],
             })
 
-    # 5. AST-Anchored Invariants & Stale Memory Warnings
+    # 5. AST-Anchored Invariants, Stale Memory Warnings & Semantic Advisories
     memories = check_res.get("memories", [])
     stale_memories = [m for m in memories if m.get("stale")]
+    semantic_warnings: list[str] = list(check_res.get("semantic_warnings") or [])
 
     brain._ledger.record_guardrail_audit(
         source=source,
@@ -587,7 +752,7 @@ def audit_edited_files(
     )
 
     blocking = bool(syntax_errors or contract_violations or boundary_violations)
-    advisory = bool(signature_blast or memories)
+    advisory = bool(signature_blast or memories or semantic_warnings)
     if not blocking and not advisory:
         return {
             "clean": True,
@@ -599,6 +764,7 @@ def audit_edited_files(
             "signature_blast": [],
             "memories": [],
             "stale_memories": [],
+            "semantic_warnings": [],
             "covering_tests": [],
             "report": "",
         }
@@ -610,6 +776,8 @@ def audit_edited_files(
         lines.append(f"  ! {bv['message']}")
     for cv in contract_violations[:8]:
         lines.append(f"  ! [CONTRACT] {cv}")
+    for sw in semantic_warnings[:6]:
+        lines.append(f"  ~ [WARNING] {sw}")
 
     for sb in signature_blast:
         for mut in sb["mutations"][:4]:
@@ -653,6 +821,7 @@ def audit_edited_files(
         "signature_blast": signature_blast,
         "memories": memories,
         "stale_memories": stale_memories,
+        "semantic_warnings": semantic_warnings,
         "covering_tests": covering_tests,
         "report": "\n".join(lines),
     }
@@ -679,8 +848,9 @@ def run_post_edit_hook(
         if find_git_context(root)[0] is not None:
             tampers = check_governance_tamper(root, ref_commit="HEAD")
             if tampers:
+                gov_files = ", ".join(sorted({tp.get("file", ".projectbrain_memory.json") for tp in tampers}))
                 gov_lines = [
-                    f"[ProjectBrain Guardrail — ACTION REQUIRED] (hook:{protocol} on .projectbrain_memory.json)"
+                    f"[ProjectBrain Guardrail — ACTION REQUIRED] (hook:{protocol} on {gov_files})"
                 ]
                 for tp in tampers:
                     gov_lines.append(f"  X {tp['message']}")
@@ -732,6 +902,8 @@ def run_pre_commit_hook(root: Path, strict: bool = False) -> tuple[int, str]:
         return 0, ""
 
     staged: list[str] = []
+    deleted_staged: list[str] = []
+    staged_repo_paths: list[str] = []
     gov_staged = False
     for raw_ln in proc.stdout.splitlines():
         parts = raw_ln.strip().split("\t")
@@ -739,12 +911,48 @@ def run_pre_commit_hook(root: Path, strict: bool = False) -> tuple[int, str]:
             continue
         status_code = parts[0].strip().upper()[:1]
         cand_path = parts[-1].strip()
-        if any(_to_local_rel(p.strip(), sub_prefix) == ".projectbrain_memory.json" for p in parts[1:]):
+        if any(_to_local_rel(p.strip(), sub_prefix) in _GOVERNANCE_FILES for p in parts[1:]):
             gov_staged = True
             continue
+        if status_code == "D":
+            local_del = _to_local_rel(parts[1].strip(), sub_prefix)
+            if local_del and _is_auditable_code_path(local_del):
+                deleted_staged.append(local_del)
+            continue
+        if status_code == "R" and len(parts) >= 3:
+            local_old = _to_local_rel(parts[1].strip(), sub_prefix)
+            if local_old and _is_auditable_code_path(local_old):
+                deleted_staged.append(local_old)
         local_cand = _to_local_rel(cand_path, sub_prefix)
         if local_cand and status_code in ("A", "C", "M", "R") and _is_auditable_code_path(local_cand):
             staged.append(local_cand)
+            staged_repo_paths.append(cand_path)
+
+    # Detect any staged files whose working-tree copy differs from the git index (partial staging / unstaged edits)
+    # so `pre-commit` audits the EXACT blobs being committed, not stale working-tree files!
+    staged_overrides: dict[str, str] = {}
+    if staged_repo_paths:
+        from .git_diff import read_blob_at_ref
+
+        try:
+            wt_diff = subprocess.run(
+                ["git", "-c", "core.quotepath=false", "diff", "--name-only", "--", *staged_repo_paths],
+                cwd=str(git_root),
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                timeout=5,
+            )
+            if wt_diff.returncode == 0 and wt_diff.stdout.strip():
+                for dirty_rp in wt_diff.stdout.splitlines():
+                    loc_dirty = _to_local_rel(dirty_rp.strip(), sub_prefix)
+                    if loc_dirty and loc_dirty in staged:
+                        idx_blob = read_blob_at_ref(root, "", loc_dirty)
+                        if idx_blob is not None:
+                            staged_overrides[loc_dirty] = idx_blob
+        except (OSError, subprocess.TimeoutExpired):
+            pass
 
     gov_fail = False
     report_blocks: list[str] = []
@@ -752,23 +960,34 @@ def run_pre_commit_hook(root: Path, strict: bool = False) -> tuple[int, str]:
         tampers = check_governance_tamper(root, ref_commit="HEAD", from_git_index=True)
         if tampers:
             gov_fail = True
+            gov_files = ", ".join(sorted({tp.get("file", ".projectbrain_memory.json") for tp in tampers}))
             gov_lines = [
-                "[ProjectBrain Guardrail — ACTION REQUIRED] (pre-commit on .projectbrain_memory.json)"
+                f"[ProjectBrain Guardrail — ACTION REQUIRED] (pre-commit on {gov_files})"
             ]
             for tp in tampers:
                 gov_lines.append(f"  X {tp['message']}")
             report_blocks.append("\n".join(gov_lines))
 
     should_fail = gov_fail
-    if staged:
-        audit = audit_edited_files(root, staged, source="pre-commit")
+    if staged or deleted_staged:
+        audit = audit_edited_files(
+            root,
+            staged,
+            source="pre-commit",
+            staged_overrides=staged_overrides or None,
+            deleted_files=deleted_staged or None,
+        )
         if not audit["clean"] and audit["report"]:
             report_blocks.append(audit["report"])
-            # By default, only deterministic failures (syntax errors, explicit boundary rules,
-            # and governance tampering) block `git commit`; heuristic cross-file contract warnings
-            # and stale invariants are advisory unless `--strict` is passed.
-            deterministic_fail = bool(audit["syntax_errors"] or audit["boundary_violations"])
-            if deterministic_fail or (strict and bool(audit["contract_violations"] or audit["stale_memories"])):
+            # Blocking findings (syntax errors, explicit boundary rules, proven contract errors,
+            # and governance tampering) block `git commit`; advisory warnings and stale invariants
+            # remain non-blocking unless `--strict` is passed.
+            deterministic_fail = bool(
+                audit["syntax_errors"]
+                or audit["boundary_violations"]
+                or audit["contract_violations"]
+            )
+            if deterministic_fail or (strict and bool(audit.get("semantic_warnings") or audit["stale_memories"])):
                 should_fail = True
 
     if not report_blocks:
@@ -970,11 +1189,7 @@ jobs:
       - name: Install ProjectBrain
         run: |
           python -m pip install --upgrade pip
-          if [ -f "projectbrain/pyproject.toml" ]; then
-            pip install -e ./projectbrain
-          else
-            pip install projectbrain-mcp
-          fi
+          pip install projectbrain-mcp
 
       - name: Build code graph index
         run: projectbrain index

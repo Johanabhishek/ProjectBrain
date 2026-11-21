@@ -321,15 +321,16 @@ def resolve_file_imports_and_symbols(
             resolved = resolve_python_import(importer_rel_path, qual_mod, file_set, module_index)
         if not resolved and mod:
             resolved = resolve_import(importer_rel_path, mod, file_set, module_index)
+        is_type_only = bool(bind.get("type_only"))
         if resolved and resolved != importer_rel_path:
-            if resolved not in targets:
+            if not is_type_only and resolved not in targets:
                 targets.append(resolved)
             if index is not None:
                 orig_sym = bind.get("symbol") or local_name
                 unwrapped = unwrap_barrel_reexport(resolved, orig_sym, index, file_set, module_index)
                 if unwrapped and unwrapped != importer_rel_path:
                     resolved = unwrapped
-                    if unwrapped not in targets:
+                    if not is_type_only and unwrapped not in targets:
                         targets.append(unwrapped)
             symbol_to_file[local_name] = resolved
 

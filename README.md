@@ -1,84 +1,150 @@
-# ProjectBrain (`projectbrain-mcp` v1.3.0)
+# ProjectBrain (`projectbrain-mcp` v1.4.0)
 
 [![PyPI](https://img.shields.io/pypi/v/projectbrain-mcp.svg)](https://pypi.org/project/projectbrain-mcp/)
 [![License: MIT](https://img.shields.io/badge/License: MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
 
-**Zero-LSP SQLite Code Graph, `<1.5s` Deep Semantic & Cross-Stack Anomaly Triage, `<8 KB` Inline MCP Context Compiler & Sub-2s Contract Guardrail for AI Coding Agents.**
+**Zero-LLM Cross-Stack Contract Firewall, Satellite Coordinate Router & Sub-2s PR Architecture Gate for AI-Generated Code (CLI, CI SARIF & Bundled MCP Server).**
 
-ProjectBrain gives Claude Code, Cursor, Antigravity, Windsurf, and CI pipelines both **Offense** (`<1.5s` whole-repo semantic anomaly triage `check --audit`, `<8 KB` zero-spillover architectural dossiers, `<20ms` surgical PDG + React monolith maps, and verb-agnostic `${baseUrl}` -> FastAPI/Express route tracing) and **Defense** (cross-stack HTTP request/response schema verification `PB011`, React stateful remount & async race verification `PB012`, Python Pydantic partial-update clobber & silent I/O swallow detection `PB013`, PR merge-base verification, Governance Tamper Lock, and SARIF v2.1.0) backed by a local SQLite WAL + FTS5 graph (`.projectbrain.db`) and lazy-loaded `tree-sitter` / Python `ast`. No LSP servers, no Docker, no cloud embeddings, and no API keys.
-
----
-
-## What's New in v1.3.0 (Deep Semantic Contracts & `<1.5s` Repo-Wide Anomaly Triage)
-
-1. **`PB011` Cross-Stack HTTP Request & Response Schema Solver:** Deterministically verifies JS/TS `fetch`, `axios`, 1-hop client functions, and cross-file 2-hop transport wrappers against mounted FastAPI, Pydantic v1/v2 (`BaseModel`, `SQLModel`, `TypedDict`, `@dataclass`), and Express route schemas — catching missing required fields (`422`), `camelCase <-> snake_case` / renamed payload drift, `extra="forbid"` violations, missing `Query(...)` params, response property mismatches (including `list[Model]` `.map(...)` items), and HTTP verb mismatches while respecting `{...spread}`, `Field(alias=...)`, `alias_generator`, `extra="allow"`, `Depends(...)`, and Axios `.data` envelopes with zero false positives.
-2. **`PB012` React Stateful Lifecycle, Remount & Async Race Verifier:** Catches post-mount loading/saving early-returns and ternaries that unmount stateful child components (tracking direct `useState`/`useReducer` and transitive custom hooks across files while skipping mount-only bootstrap spinners and explicit `key={...}` boundaries), inline nested `PascalCase` component definitions (`nested_component_remount`), and uncancelled `useEffect([dep])` async `setState` races (`uncancelled_async_effect_race`).
-3. **`PB013` Python Pydantic Partial-Update & Transactional I/O Hazard Verifier:** Catches `PATCH`/`PUT`/update handlers calling `.model_dump()` / `.dict()` without `exclude_unset=True` and overwriting persisted columns via `setattr(...)` loops, `.sqlmodel_update(...)`, `.update(...)`, or `{**existing, **dump}` merges, plus completely silent broad `except: pass` swallows around `.commit()` or outbound email/HTTP calls.
-4. **`<1.5s` Whole-Repo Semantic Anomaly Triage (`brain_check(audit=True)` / `projectbrain check --audit`):** Audits every production file in the repo (on both clean and dirty git trees, or narrowed via `--scope <glob>`) in `<1.5s` (even on `939` Django production files) and returns `ranked_hotspots` with exact `recommended_read` line spans so agents read only the flagged files instead of 80+ blind `read_file` calls — strictly capped `<= 7,800` chars inline (`0` `output.txt` spillovers).
-5. **Retains All v1.2 Speed & Monolith Guarantees:** `<8 KB` inline MCP payload cap (`structured_output=False`), React monolith internal maps + `undeclared_state_setter` (`Law 6`), batched `git cat-file --batch` PR diffs, and built-in `direct_read_hint` guidance for small scopes (`<=6` files or `<=350` lines).
+Single-language compilers (`pyright`, `tsc`, `ruff`, `eslint`) are blind across the **HTTP network boundary** and **repo architecture rules**. Cloud AI PR reviewers (CodeRabbit, Greptile) are slow, probabilistic, and require sending code off-machine. **ProjectBrain sits cleanly between them**: a `<1.5s`, 100% local, zero-API-key static analyzer & live SQLite code-graph router that catches cross-stack FastAPI/Pydantic ↔ React/TS schema & Express verb bugs (`PB011`–`PB013`), enforces layer boundaries (`--forbid`) and code-native `@pb-invariant:` rules, blocks governance/config tampering in PRs, and routes coding agents to exact `file:Lstart-Lend` coordinates without dumping truncated code.
 
 ---
 
-## Why ProjectBrain? (Offense + Team/CI Defense)
+## Try in 10 Seconds (Zero Config, Zero Dotfiles Written)
 
-AI coding agents edit fast with native `Edit` / `edit_file` tools, but routinely **break uninspected callers across files**, **violate layer boundaries**, **silently delete governance rules in PRs**, or **burn 50k+ tokens** grep-crawling monoliths. ProjectBrain solves both without forcing agents to learn a custom edit DSL:
+Run a full read-only cross-stack & semantic audit on any repository without installing permanently or writing a single `.projectbrain*` or IDE config file:
 
-### 1. Defense: Active Real-Time Hooks, PR Merge-Base CI Gate & Governance Tamper Lock
-Installed automatically by `projectbrain init` (or OS-portable `projectbrain init --team --learn` for git-shared team configs and `.github/workflows/projectbrain.yml`):
-- **Silent When Clean (`0` Token Tax):** Non-code edits (`.md`, `.json`, `.toml`) exit in `<30ms` on a pure-stdlib fast path without importing Tree-sitter. Clean body-only code edits verify incrementally via Salsa early-cutoff and emit **zero bytes** (`exit 0`).
-- **True PR Merge-Base Diffing (`check --base main` / Automatic CI PR Detection):** Audits committed multi-commit PR branches against `git merge-base` (auto-detecting `GITHUB_BASE_REF`, `CI_MERGE_REQUEST_TARGET_BRANCH_NAME`, Bitbucket, and Azure PR envs) even when the CI working tree is 100% clean — catching cross-file arity/return-key breaks, signature blast radius, broken imports from deleted/renamed files, stale invariants, and git co-change drift.
-- **Governance Tamper Lock (`.projectbrain_memory.json`):** Compares `.projectbrain_memory.json` against the base branch and blocks `--ci` (`UNSAFE_GOVERNANCE_TAMPER`) if an agent deletes/weakens `--forbid` boundary rules, deletes/modifies AST invariants, wipes `ast_hash`, or removes `co_change_rules` without explicit human `--allow-governance-change`.
-- **Zero-Config Day-1 Onboarding (`projectbrain learn` / `init --learn`):** Automatically discovers **zero-violation** directional layer `--forbid` boundaries (`routes/* -> db/*`, `db/* -> services/*`), mines high-confidence git co-change contracts, and ranks high-fan-in hub symbols on Day 1.
-- **OASIS SARIF v2.1.0 & Zero-Noise Sticky PR Comments:** `--format sarif` emits Code Scanning SARIF (`PB001`–`PB013`); `--format pr-comment` emits sticky `<!-- projectbrain-pr-guardrail -->` Markdown (1-line green pass when clean; full Mermaid `graph LR` blast-radius diagram + covering test suite when impactful).
+```bash
+# Non-overlapping profile for teams already running ruff / pyright / tsc / eslint:
+uvx --from projectbrain-mcp projectbrain audit --profile fullstack
 
-### 2. Offense: Lean 5-Tool Zero-LSP MCP & CLI Surface (`server.py`)
-By default (`projectbrain-mcp --lean`), ProjectBrain exposes **5 non-overlapping power tools** so it never bloats the agent's tool-schema budget:
+# Or scan all PB001–PB013 rules:
+uvx --from projectbrain-mcp projectbrain audit
 
-| MCP Tool / CLI Command | Purpose |
+# Satellite Coordinate Router: send a task signal -> get exact file:Lstart-Lend spans + callers + tests
+uvx --from projectbrain-mcp projectbrain route "how are invoices validated and settled"
+```
+
+---
+
+## How ProjectBrain Complements Your Existing Stack
+
+ProjectBrain is designed to **pair with** your compilers and AI reviewers, not replace them:
+
+| Tool Layer | What It Catches | Blind Spot | How ProjectBrain Fills the Gap (`--profile fullstack`) |
+| :--- | :--- | :--- | :--- |
+| **`ruff` / `pyright` / `tsc` / `eslint`** | Single-language syntax, types, lints | Blind across Python ↔ TS HTTP boundaries, repo layers, and AST-locked business invariants | **`PB011`** FastAPI/Pydantic ↔ React schema solver (+ FastAPI/Express HTTP verb & route checks); **`PB012`** React stateful remount & async effect races; **`PB013`** Pydantic `.model_dump()` partial-update clobbers |
+| **LLM PR Reviewers** *(CodeRabbit, Greptile, Bugbot)* | High-level logic & style feedback | 30–90s latency, probabilistic noise, cloud code egress, per-seat cost | **`<2s` deterministic local/CI gate**, zero API keys, OASIS SARIF v2.1.0, sticky Mermaid PR impact summaries |
+| **Native Coding Agents** *(Claude Code, Cursor, Antigravity)* | Fast `rg`, parallel `read_file`, native `Edit` | Blindly break uninspected callers, violate layer rules, or edit past business invariants | **Satellite Coordinate Router** (`route` / `brain_dossier(coordinates_only=True)`) + **Post-Edit Hook Relay** (silent when clean; redirects exact broken `file:L` on regressions) |
+
+---
+
+## What's New in v1.4.0
+
+1. **Zero-Write 10-Second Trial (`projectbrain audit`):** Runs whole-repo `<1.5s` cross-stack & semantic triage strictly in-memory when no `.projectbrain.db` exists (pass `--save-index` only when you want a local cache).
+2. **CI-Grade Escape Hatches (`.projectbrain.toml`, `--profile`, `# pb:ignore`):**
+   - Configure `profile`, `select`, `ignore`, and `exclude` in `.projectbrain.toml` or `[tool.projectbrain]` inside `pyproject.toml`.
+   - Use `--profile fullstack` (`PB002, PB007, PB008, PB011, PB012, PB013`) alongside `pyright`/`tsc`/`ruff` with zero duplicate noise, or `--profile governance` (`PB002, PB007, PB008, PB010`).
+   - Suppress intentional exceptions inline via `# pb:ignore PB013 -- deliberate full reset` or `// pb:ignore PB012 -- fire-and-forget` (same line, immediately preceding comment line, or directly above single/multi-line decorators and function headers). Both `PB007` (Governance Tamper Lock) and `PB002` (team-pinned `--forbid` boundary rules) are immune to inline source-comment suppression by default (`PB002` can only be opted in via tamper-locked `allow_inline_boundary_ignore = true`).
+3. **Pure Satellite Coordinate Router (`projectbrain route` / `brain_dossier(..., coordinates_only=True)`):**
+   - Agent sends a lightweight task signal → Brain bounces back exact `file:Lstart-Lend` GPS coordinates, 1-hop callers/callees, HTTP route peers, covering tests, and touched invariants in ~500 tokens — zero truncated code dumps, letting agents use native `read_file`/`edit_file` directly.
+4. **Code-Native Invariants (`# @pb-invariant:` / `// @pb-invariant:`):**
+   - Write `# @pb-invariant: Must remain idempotent on duplicate invoice_id` directly above any function or class; `check` and post-edit hooks automatically surface it whenever that file is edited, and `projectbrain remember --sync-annotations` locks its AST hash into `.projectbrain_memory.json`.
+5. **Type-Only Import Semantics & Safer `learn`:**
+   - Python `if TYPE_CHECKING:` and TypeScript `import type` statements are excluded from runtime `import_targets`, `PB002` layer boundaries, and `learn` (while remaining available for cross-file schema resolution).
+   - `projectbrain learn` skips noisy file-to-file bans in flat single-package repos by default (opt-in via `--include-module-rules`).
+6. **Parametric URL Matching & Tighter React Race Detection:**
+   - `PB011` matches concrete frontend ID segments (`/api/v1/users/u_42`) against parametric backend routes (`/api/v1/users/{user_id}`), and `PB012` checks actual `AbortSignal` usage so variables like `signalStrength` never mask uncancelled async races.
+
+---
+
+## Core Capabilities
+
+### 1. Cross-Stack & Semantic Firewall (`PB001`–`PB013`)
+- **`PB011` Cross-Stack HTTP Request & Response Schema Solver:** Deterministically verifies JS/TS `fetch` (including `{ ...auth, method: "POST" }` and `.then(r => r.json()).then(...)` chains), `axios`, 1-hop client functions, and cross-file 2-hop transport wrappers against mounted FastAPI/Pydantic v1/v2 (`BaseModel`, `SQLModel`, `TypedDict`, `@dataclass`, both `ConfigDict(...)` and dict `model_config`) request/response schemas and FastAPI/Express HTTP verb & route mounts — catching missing required fields (`422`), `camelCase <-> snake_case` payload drift, `extra="forbid"` violations, missing `Query(...)` params, response property mismatches (including CST-parsed `list[Model]` `.map()` item/destructured reads and typed TS `const data: Dto = await res.json()`), and HTTP verb mismatches while respecting `{...spread}`, `Field(alias=...)`, `alias_generator`, `extra="allow"`, default `extra="ignore"` extra client keys, `Depends(...)`, and Axios `.data`. *(Note: Express routes currently verify HTTP verb & path matching, not request/response body schemas.)*
+- **`PB012` React Stateful Lifecycle, Remount & Async Race Verifier:** Uses Tree-sitter CST to catch post-mount same-handler `true -> false` loading/saving early-returns (`if`/`if-else`) and ternaries (including arbitrary container-wrapped branches and inline `onClick={async () => ...}` handlers) unmounting stateful child components (tracking direct `useState`/`useReducer` and custom hooks across files while skipping mount-only bootstrap spinners, resettable screens like `Order Confirmed` + `New Order`, synchronous edit/preview toggles, and `key={...}` boundaries), inline nested `PascalCase` component definitions, and uncancelled `useEffect([dep])` async `setState` races (including point-free `.then(setItems)` and 1-hop local async helpers without false-skipping on `.then()` returns, DOM `ref.current.focus()`, or `{ signal: "buy" }` JSON keys).
+- **`PB013` Python Pydantic Partial-Update & Transactional I/O Hazard Verifier:** Flow-sensitively catches `PATCH`/`PUT`/update handlers calling `.model_dump()` / `.dict()` without `exclude_unset=True` and overwriting columns via `setattr(...)`, `.sqlmodel_update(...)`, `.update(...)`, `.model_copy(update=...)`, or `{**existing, **dump}` (while respecting filtered reassignments like `{k: v for k, v in data.items() if v is not None}`), plus silent broad `except: pass` around `.commit()`, webhook/email/payment side effects, or outbound HTTP mutations (`requests`/`httpx`/`aiohttp` clients including `with httpx.Client() as c:`).
+- **PR Merge-Base Diffing & Governance Tamper Lock (`PB002`, `PB007`, `PB008`, `PB010`):** Audits multi-commit PRs against `git merge-base` (auto-detecting GitHub, GitLab, Bitbucket, and Azure PR envs), enforces `--forbid` architectural layers (with exact import line numbers, immune to `# pb:ignore PB002` by default) and `@pb-invariant:` rules (supporting multi-line decorators and preserving stale `PB008` hashes on `--sync-annotations`), blocks unauthorized deletion/weakening of `.projectbrain_memory.json` rules OR adding/weakening `.projectbrain.toml` / `[tool.projectbrain]` configs even on zero-config repos (`PB007`), and outputs `text`, `json`, `markdown`, `pr-comment` (sticky Mermaid blast-radius + advisories comment), `github` (errors + warnings), or OASIS `sarif` v2.1.0.
+
+### 2. Configuration (`.projectbrain.toml` or `pyproject.toml`)
+
+```toml
+# .projectbrain.toml (or [tool.projectbrain] inside pyproject.toml)
+profile = "fullstack"          # all | fullstack | governance
+ignore = ["PB010"]             # optional additional rule exclusions
+exclude = ["generated/*", "migrations/*"]
+```
+
+Inline suppression & code-native invariants:
+
+```python
+# @pb-invariant: Must remain idempotent on duplicate invoice_id
+@router.patch("/invoices/{invoice_id}")
+def patch_invoice(invoice_id: str, payload: InvoicePatch, db=Depends(get_db)):
+    data = payload.model_dump(exclude_unset=True)  # safe partial update
+    ...
+```
+
+```ts
+// pb:ignore PB012 -- intentionally fire-and-forget analytics ping
+useEffect(() => {
+  fetch(`/api/v1/ping?tab=${tabId}`).then(() => setLastPing(Date.now()));
+}, [tabId]);
+```
+
+### 3. Satellite Coordinate Router & Bundled 5-Tool MCP Server (Optional to Wire)
+The `projectbrain-mcp` package bundles the MCP SDK and 6 Tree-sitter language grammars so both CLI and MCP work out of the box via `uvx` (wiring `.mcp.json` is optional — every command works standalone from the CLI and CI). When wired into Claude Code, Cursor, or Antigravity (`projectbrain-mcp --lean`), ProjectBrain exposes **5 non-overlapping MCP tools**:
+
+| MCP Tool / CLI Command | Role in the Satellite Loop |
 | :--- | :--- |
-| **`brain_dossier`** (`projectbrain dossier`) | **1-Turn Architecture Compiler:** Ranks relevant files & symbols via sub-identifier BM25 + 1–2 hop call/import/state-flow edges, returning class-qualified code slices, neighbor skeletons, covering tests, and pinned invariants in `~0.2s`. |
-| **`brain_slice`** (`projectbrain slice`) | **`<20ms` Surgical Symbol & PDG Slicer:** Reads exact functions, methods (`Class.method`, `res.send`), file skeletons, or intra-function **Program Dependence Graph (`--focus var`)** slices (`backward defs` + `forward uses` + `enclosing guards`) directly from SQLite. |
-| **`brain_explore`** (`projectbrain explore`) | **Unified Code Graph Navigator:** Traces callers/callees, shortest call/import path between `target` and `target_b`, full-stack `/api/...` route flows, and git `co_changes`. |
-| **`brain_check`** (`projectbrain check`) | **Pre-Flight Verifier, Whole-Repo Semantic Triage (`--audit`), PR Merge-Base Gate & SARIF/PR Reporter:** Runs `<1.5s` whole-repo semantic & cross-stack anomaly triage (`audit=True` / `--audit --scope`), fact-checks 3-valued claims (`SUPPORTED` / `REFUTED` / `UNKNOWN`), audits working-tree or `--base <ref>` PR diffs, enforces Governance Tamper Lock, and outputs `text`, `json`, `markdown`, `pr-comment`, `github`, or `sarif`. |
-| **`brain_remember`** (`projectbrain remember` / `memories`) | **Git-Tracked Repo Governance (`.projectbrain_memory.json`):** Pins symbol invariants anchored to normalized AST hashes, `--forbid "<src_glob> -> <dst_glob>"` layer rules, and `--co-change "<file_a> <-> <file_b>"` coupling contracts. |
+| **`brain_check`** (`projectbrain audit` / `check`) | **Firewall & Anomaly Triage:** `<1.5s` whole-repo semantic audit (`audit=True`), PR merge-base gate (`base_ref="main"`), pre-edit `plan_files` impact check, and 3-valued claim verification (`SUPPORTED` / `REFUTED` / `UNKNOWN`). |
+| **`brain_dossier`** (`projectbrain route` / `dossier`) | **Satellite Coordinate Router & Context Compiler:** Pass `coordinates_only=True` (or CLI `route`) for ~500-token exact `file:Lstart-Lend` coordinates + callers/callees + tests + invariants; omit for full `<8 KB` inline AST/PDG slices. |
+| **`brain_explore`** (`projectbrain explore`) | **Graph Navigator:** Traces callers/callees, shortest path `A -> B`, full-stack `/api/...` route flows, and git `co_changes`. |
+| **`brain_slice`** (`projectbrain slice`) | **`<20ms` Surgical Symbol & PDG Slicer:** Extracts specific symbols, file skeletons, React monolith maps, or intra-function PDG variable slices (`--focus var`). |
+| **`brain_remember`** (`projectbrain remember` / `memories`) | **Git-Tracked Governance (`.projectbrain_memory.json`):** Pins `--forbid` layer rules, `--co-change` contracts, and AST-hash invariants (including `action="sync"` / `--sync-annotations` for inline `@pb-invariant:` comments). |
 
 *(Pass `--full` or `PROJECTBRAIN_FULL_TOOLS=1` to also expose auxiliary tools: `brain_learn`, `brain_context`, `brain_stats`, `brain_run`, `brain_patch`.)*
 
 ---
 
-## Quick Start (60 Seconds)
-
-### 1. Install (`uv` Recommended — Zero PEP 668 Friction)
+## Full Setup (Local Hooks, Team CI & Bundled MCP Server)
 
 ```bash
-# Recommended: isolated global CLI + MCP binaries via uv (or pipx)
+# Install isolated CLI + MCP binaries via uv (or pipx / pip)
 uv tool install projectbrain-mcp
 
-# Alternative: pipx
-pipx install projectbrain-mcp
+# 1. Zero-write audit (try first!)
+projectbrain audit --profile fullstack
 
-# Or inside an active Python virtual environment:
-pip install projectbrain-mcp
+# 2. Optional: initialize local index, .mcp.json, rules, and silent-when-clean post-edit hooks
+projectbrain --path /path/to/repo init --git-hook
+
+# 3. Optional: OS-portable team hooks + GitHub Actions PR guardrail workflow
+projectbrain --path /path/to/repo init --team
+
+# 4. Preview (or --apply) discovered layer boundaries & co-change rules
+projectbrain learn
+projectbrain remember --sync-annotations
 ```
 
-### 2. Initialize Your Repository (Local or OS-Portable Team + CI Mode)
+### `<2s` GitHub Actions PR Gate
 
-```bash
-# Personal / local workstation setup (ENOENT-proof absolute IDE paths):
-projectbrain --path /path/to/your/repo init --git-hook
-
-# Team + CI setup (OS-portable .claude/settings.json, .cursor/hooks.json, GitHub Action, & Day-1 rule discovery):
-projectbrain --path /path/to/your/repo init --team --learn
+```yaml
+name: ProjectBrain Cross-Stack & Architecture Gate
+on: [pull_request]
+jobs:
+  guardrail:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: astral-sh/setup-uv@v4
+      - name: Cross-stack schema, React lifecycle & architecture check
+        run: uvx --from projectbrain-mcp projectbrain check --profile fullstack --ci
 ```
 
-What `init` sets up non-destructively:
-1. Indexes your repository into `.projectbrain.db` (SQLite WAL + FTS5) honoring `.gitignore` and `.git/info/exclude`.
-2. Writes `.mcp.json` and non-destructive `<!-- projectbrain:start -->` workflow rules in `AGENTS.md` (with `--team`, emits zero local user/workspace paths so `.claude/settings.json`, `.cursor/hooks.json`, and `.github/workflows/projectbrain.yml` commit cleanly across macOS/Linux/Windows).
-3. Optionally runs `learn` (`--learn`) to auto-discover zero-violation `--forbid` layer boundaries and git co-change contracts into `.projectbrain_memory.json`.
-4. Keeps `.projectbrain.db` git-ignored while leaving `.projectbrain_memory.json` git-trackable and Tamper-Locked across PRs.
-
-### 3. MCP Server Configuration (or Zero-Install via `uvx`)
+### Wiring the Bundled MCP Server (Optional)
 
 ```json
 {
@@ -91,49 +157,6 @@ What `init` sets up non-destructively:
 }
 ```
 
-### 4. Core CLI Workflow
-
-```bash
-# 1. Auto-discover zero-violation architectural boundaries, co-change rules & hub symbols (dry-run or --apply)
-projectbrain --path /path/to/repo learn
-projectbrain --path /path/to/repo learn --apply
-
-# 2. Compile a 1-turn architecture dossier or <20ms PDG variable slice
-projectbrain --path /path/to/repo dossier "how are exceptions routed to error handlers"
-projectbrain --path /path/to/repo slice billing.py:compute_invoice --focus discount_total
-
-# 3. Pin an enforceable boundary rule, co-change contract, or AST symbol invariant (git-tracked)
-projectbrain --path /path/to/repo remember --forbid "routes/* -> db/*" --reason "Routes must go through services/*"
-projectbrain --path /path/to/repo remember --co-change "schema.sql <-> models/user.py" --reason "Keep ORM synced"
-projectbrain --path /path/to/repo remember settle_invoice "Must remain idempotent on duplicate invoice_id"
-
-# 4. Run <1.5s whole-repo semantic anomaly triage or PR merge-base contract & governance gate
-projectbrain --path /path/to/repo check --audit
-projectbrain --path /path/to/repo check --base main --ci
-projectbrain --path /path/to/repo check --base main --format pr-comment
-projectbrain --path /path/to/repo check --base main --format sarif > projectbrain.sarif
-
-# 5. View regression interception & code-graph scorecard
-projectbrain --path /path/to/repo stats --summary
-```
-
-### 5. `<2s` GitHub Actions CI / PR Guardrail
-
-```yaml
-name: ProjectBrain Architecture & Contract Gate
-on: [pull_request]
-jobs:
-  guardrail:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-      - uses: astral-sh/setup-uv@v4
-      - name: Verify cross-file contracts, boundaries & blast radius
-        run: uvx --from projectbrain-mcp projectbrain check --ci
-```
-
 ---
 
 ## System Architecture
@@ -141,85 +164,76 @@ jobs:
 ```mermaid
 flowchart LR
     subgraph Indexer["1. Lazy Tree-sitter + SQLite WAL (.projectbrain.db)"]
-        A["Source Files (20+ Exts)"] --> B["Lazy Tree-sitter CST + Python AST"]
+        A["Source Files"] --> B["Lazy Tree-sitter CST + Python AST\n(TYPE_CHECKING / import type aware)"]
         B --> C["Interface Hash (Salsa Early-Cutoff)"]
-        C --> D[("SQLite WAL + FTS5\nfiles | symbols | edges")]
+        C --> D[("SQLite WAL + FTS5\nfiles | symbols | edges | @pb-invariant")]
     end
-    subgraph Offense["2. Offense: 5-Tool MCP & CLI"]
-        D --> DO["dossier: BM25 + 1-2 Hop Call/State Graph"]
-        D --> S["slice: <20ms Lookup + PDG --focus"]
-        D --> EX["explore: Paths + HTTP Routes + Co-Change"]
-        D --> CH["check: 3-Valued Verify + 4-Pillar Contracts"]
-        D --> RM["remember: AST-Hash Invariants + --forbid Rules"]
+    subgraph Satellite["2. Satellite Coordinate Router & Bundled MCP"]
+        D --> RT["route / dossier(coordinates_only=True)\nExact file:Lstart-Lend + callers + tests"]
+        D --> EX["explore / slice\nPaths + HTTP Routes + PDG --focus"]
     end
-    subgraph Defense["3. Defense: Real-Time Hooks & CI"]
-        E["Native Edit / Write / git commit"] --> F["<30ms Stdlib Filter"]
-        F --> G["5-Layer Audit (Silent When Clean)"]
-        D --> G
-        RM --> G
+    subgraph Firewall["3. Cross-Stack & Architecture Firewall"]
+        E["CLI audit / PR Merge-Base / Post-Edit Hook"] --> CFG[".projectbrain.toml\n--profile | --select | --ignore"]
+        CFG --> CHK["PB011 HTTP · PB012 React · PB013 Pydantic\nPB002 Layers · PB007 Tamper · PB008 Invariants"]
+        D --> CHK
+        CHK --> SUP["Inline # pb:ignore Filter -> Text / SARIF / PR Comment"]
     end
 ```
 
 ---
 
-## Honest Tradeoffs, Limitations & When to Use `rg`
+## Honest Tradeoffs, Scope & Language Support Tiers
 
-ProjectBrain is a deterministic static AST + lexical/graph engine, **not** an embedding model or runtime tracer:
+ProjectBrain is a deterministic static AST + graph engine — **not** an embedding model, full typechecker, or runtime tracer:
 
-1. **When plain `rg` + `read_file` is better:** If you already know an exact literal string, if the repo/feature touches `<=6` well-named files, if a file is `<=350` lines (`<=12 KB`), or if you are auditing a single giant React JSX monolith component end-to-end, native `rg` + `read_file` in 1 turn beats adding a code-graph middleman — then run `brain_check` once at the end as a `<2s` cross-file & hook contract gate.
-2. **Lexical + Graph Ranking vs. Embeddings (`dossier`):** Indexing takes `~0.1–1.5s` locally with zero API keys or model downloads. If a query uses completely different words from the codebase's identifiers and docstrings (naming zero symbols), lexical ranking can miss entry points until you supply a domain term.
-3. **Static Analysis vs. Dynamic Dispatch (`verify` / `check`):** Calls through runtime-assigned variables (`adapter = self.get_adapter(url); adapter.send(req)`) cannot be proven to hit a single concrete class statically. `dossier` surfaces candidate edges (`send -> HTTPAdapter.send`), while `verify` honestly returns **`UNKNOWN`** rather than fabricating a false `REFUTED` or `SUPPORTED`.
-4. **Language Tier Depth:**
-   - **Tier 1 (Python, TypeScript/JavaScript):** Full AST/CST parsing (CommonJS, prototypes, `@typing.overload` dedup), intra-function PDG `--focus` slicing, relative/barrel/`tsconfig` alias resolution, route inference (FastAPI, Flask, Django, Next.js, Express, Hono), and 4-pillar cross-file contract verification.
-   - **Tier 2 (Go, Rust, Java, Kotlin, C/C++, C#, Ruby, PHP):** Tree-sitter structural symbol extraction, call/import graph edges, CST PDG slicing (`.go`, `.rs`, `.java`), skeletons, and boundary/syntax guardrails.
-   - **Tier 3 (SQL, GraphQL, Prisma, Protobuf, Vue/Svelte, Scala, Swift):** DDL table/column/`NOT NULL` constraint extraction, schema-to-code linking, SFC script extraction, and symbol/line slicing.
+1. **Single-Repo Scope & Framework Boundaries Today:** `PB011` cross-stack HTTP schema checking requires frontend and backend code to live in the **same repository** (monorepo) and extracts request/response schemas from **FastAPI + Pydantic v1/v2 / SQLModel / `TypedDict` / `@dataclass`** backends with direct or 1–2 hop `fetch`/`axios` clients. **Express** routes currently support HTTP verb/path matching and route-graph tracing, *not* request/response body schema extraction (Zod/Joi/OpenAPI SDKs and split FE/BE repositories are outside its static proof boundary today).
+2. **When Plain `rg` + `read_file` Is Better:** For exact literal lookups, `<=6` well-named files, small files (`<=350` lines), or auditing a single React monolith component end-to-end, use native `rg` + `read_file` directly — then run `brain_check` / `projectbrain audit` as your `<2s` verification gate.
+3. **Static Analysis vs. Dynamic Dispatch:** Calls through runtime-assigned variables (`adapter = self.get_adapter(url); adapter.send(req)`) cannot be proven statically; `verify` honestly returns **`UNKNOWN`** instead of fabricating a false `REFUTED` or `SUPPORTED`.
+4. **Honest Language Support Tiers:**
+   - **Tier 1 — Full Semantic & Cross-Stack (Tree-sitter + Python AST):** **Python, TypeScript, JavaScript, JSX, TSX** — full call/import/type-only resolution, `PB001`–`PB013`, cross-stack FastAPI/Pydantic ↔ React schema verification (+ Express verb/route matching), intra-function PDG `--focus` slicing, and inline `@pb-invariant:` tracking.
+   - **Tier 2 — Tree-sitter Structural (Bundled Grammars):** **Go, Rust, Java** — Tree-sitter symbol/call/import graph, CST PDG slicing, file skeletons, syntax checks (`PB001`), `--forbid` layer rules (`PB002`), and inline `@pb-invariant:` tracking.
+   - **Tier 3 — Lightweight Regex / DDL Fallback (*Not* Tree-sitter):** **Kotlin, C/C++, C#, Ruby, PHP, Scala, Swift, SQL, GraphQL, Prisma, Protobuf, Vue/Svelte** — best-effort regex symbol/DDL extraction and line slicing (not backed by bundled Tree-sitter C grammars).
 
 ---
 
 ## Reproducible Benchmarks (`projectbrain/eval/`)
 
-All evaluation scripts are checked into [`projectbrain/eval/`](projectbrain/eval/) and enforced in CI:
+All evaluation scripts are checked into [`projectbrain/eval/`](projectbrain/eval/) and runnable locally:
 
 ```bash
-# 1. Fixture regression guards, self-dogfooding, and zero-ID adversarial evaluation
+# 1. Synthetic full-stack PB011/PB012/PB013 precision & recall suite (add --external to also audit full-stack-fastapi-template)
+python projectbrain/eval/bench_fullstack.py
+
+# 2. Fixture regression guards, claim verification, self-dogfooding & zero-ID adversarial evaluation
 python projectbrain/eval/run_eval.py
 
-# 2. 200-file polyglot scale, incremental Salsa early-cutoff, FTS5, and recursive CTE latency benchmark
+# 3. Scale, incremental Salsa early-cutoff, FTS5 & CTE latency benchmark
 python projectbrain/eval/bench_scale.py
 
-# 3. External repository benchmarks: pallets/flask, django/django, psf/requests, pallets/click, expressjs/express
+# 4. External OSS backend indexing, dossier recall & scale suite (flask, django, requests, click, express)
 python projectbrain/eval/bench_external.py --suite all
 
-# 4. Full unit, guardrail, anti-leakage, security, and regression test suite (265 tests)
+# 5. Full unit, guardrail, suppression, anti-leakage & regression test suite (290 tests)
 pytest projectbrain/tests -q
 ```
 
-### 1. Held-Out External Repository Benchmark (`python projectbrain/eval/bench_external.py --suite heldout`)
+### 1. Synthetic Full-Stack Corpus & External OSS Audit (`python projectbrain/eval/bench_fullstack.py`)
 
-| Repository | Dossier Questions | Target Symbol Slice Recall | Cost per Hit | Structural & Slicing Checks |
-| :--- | :---: | :---: | :---: | :--- |
-| **`psf/requests`** | 4 questions (`proxies`, `redirects/auth`, `cookies`, `adapters/pool`) | **`15 / 15` (`100%`)** | `3.99 KB` | `verify_claim("Session.send", "calls", "HTTPAdapter.send")` -> **`UNKNOWN`** (dynamic receiver `adapter.send`, never false `REFUTED`); `slice_symbols(["should_strip_auth", "get_environ_proxies"])` -> `2 / 2` |
-| **`pallets/click`** | 3 questions (`option/arg parsing`, `Group subcommand dispatch`, `ParamType converters`) | **`11 / 11` (`100%`)** | `4.35 KB` | **`0` bare `__init__` headers** (all methods qualified as `ClassName.method`, e.g. `Group.invoke`, `Group.resolve_command`, `ParamType.convert`) |
-| **`expressjs/express`** | 3 questions (`res.send content-type`, `app.use mounting`, `app.handle dispatch`) | **`6 / 6` (`100%`)** | `2.81 KB` | `lib/response.js`: **32 functions** indexed; `lib/application.js`: **18 functions** indexed; `slice_symbols(["res.send", "app.use", "app.handle"])` -> **`3 / 3`** |
-| **Combined Held-Out Total** | **10 questions** | **`32 / 32` (`100%`)** | **`3.89 KB`** | — |
+> **Transparency note:** The `PB011`–`PB013` precision/recall numbers below are measured on our **synthetic planted-bug corpus** (`eval/bench_fullstack.py`, strictly scored by function line-range spans where *any* unexpected hotspot anywhere counts as a FP). External real-world OSS validation is reported separately in the final row.
 
-### 2. Scale & Incremental Latency (`pallets/flask` & `django/django`)
+| Target | Scope | Precision | Recall | Latency | Notes |
+| :--- | :--- | :---: | :---: | :---: | :--- |
+| **Synthetic Corpus (`PB011` HTTP/Pydantic)** | 15 planted TP bugs (incl. CST `.map()` nested calls/destructuring, `.then().then()`, `{...auth, method}`, dict `model_config`) + hard negatives (`extra="ignore"` extra keys, `extra="allow"`, `alias`, `{...spread}`, Axios `.data`, `// pb:ignore`) | **`100%` (`15/15`, `0` FP)** | **`100%`** | `~1.8s` total | Zero-write (`0` dotfiles created) |
+| **Synthetic Corpus (`PB012` React Lifecycle/Race)** | 10 planted TP bugs (incl. inline `onClick`, `if/else`, sibling container ternary, `.then(setItems)`, local async helper, `{ signal: "buy" }`) + hard negatives (bootstrap spinner, resettable confirmation screen, edit/preview toggle, `AbortController`, `// pb:ignore`) | **`100%` (`10/10`, `0` FP)** | **`100%`** | included | CST cleanup & `AbortSignal` analysis |
+| **Synthetic Corpus (`PB013` Pydantic/IO)** | 6 planted TP bugs (incl. `model_copy(update=...)`, `send_webhook`, `httpx.Client() as c`) + hard negatives (`exclude_unset=True`, `if v is not None`, filtered dict reassignment, multi-line decorator `# pb:ignore`) | **`100%` (`6/6`, `0` FP)** | **`100%`** | included | Strict function line-span FP verification |
+| **`fastapi/full-stack-fastapi-template` (External OSS)** | 123 prod files (`23` FastAPI routes, `108` Pydantic/SQLModel schemas, React/TSX) | **`0` FP (`SAFE_TO_PROCEED`)** | — | **`1.12s`** | Note: frontend uses generated OpenAPI SDK (`0` raw `fetch`/`axios` callsites) |
 
-| Benchmark | Result |
-| :--- | :---: |
-| **`pallets/flask` (6 Architectural Questions) — Target Function Slice Recall** | **`20 / 21` (`95.2%`)** (`2.96 KB` / hit) |
-| **Whole-Repo Semantic Audit (`check --audit`) Across 5 OSS Repos (`1,077` prod files)** | **`0` false positives** (`SAFE_TO_PROCEED` on `flask`, `requests`, `click`, `express`, `django`; `26ms`–`1.03s`) |
-| **`django/django` (`3,051` files) — Single-File Body Edit `incremental_index()`** | **`~515 ms`** (`salsa_early_cutoff: True`) |
-| **`django/django` (`3,051` files) — Single-File Signature Edit `incremental_index()`** | **`~894 ms`** (`O(Δ)` subgraph update) |
-| **Cold Python Import (`from projectbrain.brain import ProjectBrain`)** | **`~150 ms`** (`3.15x` faster via lazy Tree-sitter C grammar loading) |
-| **Non-Code Hook Bailout (`projectbrain hook post-edit` on `.md` / `.json`)** | **`< 30 ms`** (pure stdlib fast-path, `0` bytes emitted) |
+### 2. Indexing Scale, Incremental Latency & Graph Retrieval (`bench_external.py` & `run_eval.py`)
 
-### 3. Built-In Verification, Self-Dogfood & Adversarial Suite (`python projectbrain/eval/run_eval.py`)
-
-| Suite | Scope | Metric | Result |
-| :--- | :--- | :--- | :---: |
-| **File Localization (`eval/tasks.json`)** | Fixture repos (10 tasks) | Precision / Recall | **`100%` / `100%`** |
-| **Multi-Hop Graph vs. Grep (`eval/relationship_tasks.json`)** | Fixture repos (8 tasks, incl. negative controls) | Pass Rate | **`8 / 8` (`100%`)** |
-| **Closed-World Claim Verification (`eval/claim_tasks.json`)** | Fixture repos (22 tasks) | Exact Verdict Accuracy | **`22 / 22` (`100%`, `0` false refutations)** |
-| **Self-Dogfooding (`compile_context`)** | ProjectBrain repo (3 tasks, 6 target symbols) | Symbol Recall | **`100%` (`6 / 6` symbols)** |
-| **Adversarial Zero-Identifier (`compile_context`)** | ProjectBrain repo (4 tasks, 8 target symbols; zero function names in prompt) | Symbol Recall | **`87.5%` (`7 / 8` symbols vs `50.0%` for disciplined `grep`)** |
+| Benchmark | Scope | Result |
+| :--- | :--- | :---: |
+| **`django/django` (`3,051` files) Incremental Index** | Body edit / Signature edit (`SQLite WAL` + Salsa early-cutoff) | **`~515 ms` / `~894 ms`** |
+| **Core Backend Contract Audit (`check --audit`)** | `flask`, `requests`, `click`, `express`, `django` (`1,077` backend prod files; validates core Python/JS/arity/import precision) | **`0` FP (`26ms`–`1.03s`)** |
+| **Held-Out Dossier Symbol Recall** | `psf/requests`, `pallets/click`, `expressjs/express` (10 architectural questions) | **`32 / 32` (`100%`, `3.89 KB`/hit)** |
+| **Closed-World Claim Verification (`eval/claim_tasks.json`)** | 22 epistemic claims (`SUPPORTED` / `REFUTED` / `UNKNOWN`) | **`22 / 22` (`100%`, `0` false refutations)** |
+| **Cold Python Import / Non-Code Hook Bailout** | Lazy Tree-sitter loading / `.md` & `.json` post-edit fast path (in-process; `~150–320 ms` cold subprocess startup on Windows) | **`~150 ms` / `< 30 ms` in-process** |

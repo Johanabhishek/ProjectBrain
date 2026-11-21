@@ -1,4 +1,4 @@
-"""ProjectBrain MCP Server (v1.3: Deep Semantic Triage, Cross-Stack HTTP Schemas & <8KB Inline Cap).
+"""ProjectBrain MCP Server (v1.4: Cross-Stack Firewall, Satellite Coordinate Router & <8KB Inline Cap).
 
 Exposes 5 primary non-overlapping power tools by default (`--lean`):
   1. `brain_dossier`  — One-call Architecture & Context Compiler: returns PDG/AST code
@@ -248,13 +248,18 @@ def brain_dossier(
     impact_files: list[str] | None = None,
     zoom: bool = False,
     include_markdown: bool = True,
+    coordinates_only: bool = False,
+    top_n: int = 8,
     repo_path: str | None = None,
 ) -> dict:
-    """Compile a self-contained inline Engineering Dossier (<8KB) in ONE call.
+    """Compile an Engineering Dossier (<8KB) OR pure Satellite Coordinate Map (`coordinates_only=True`) in ONE call.
 
-    Use when investigating an unfamiliar multi-file flow across a large repo (>30 files).
-    Skip this tool and use native `rg` + `read_file` directly when the repo/feature spans <=6 well-named
-    files or when reading small (<350-line) / monolithic single-component files.
+    Modes:
+      - `coordinates_only=True` (Satellite Router — ~500 tokens): returns exact `file:Lstart-Lend`
+        coordinates, 1-hop callers/callees, route peers, tests, and invariants with ZERO truncated code
+        dumps so you can jump straight to native `read_file` / `edit_file`.
+      - `coordinates_only=False` (Default Dossier): returns ranked AST/PDG slices + neighbor skeletons.
+    Skip for <=6 well-named files or small (<350-line) single-file edits; use `rg` + `read_file` directly.
     """
     task_list = [tasks] if isinstance(tasks, str) else list(tasks)
     b = _get_brain(repo_path)
@@ -264,8 +269,10 @@ def brain_dossier(
             impact_files=impact_files,
             zoom=zoom,
             write_file=False,
+            coordinates_only=coordinates_only,
+            top_n=top_n,
         )
-    if not (include_markdown or zoom):
+    if not coordinates_only and not (include_markdown or zoom):
         res = {k: v for k, v in res.items() if k != "markdown"}
     return _enforce_mcp_inline_budget(res)
 
@@ -336,15 +343,18 @@ def brain_check(
     allow_governance_change: bool = False,
     audit: bool = False,
     scope_glob: str | None = None,
+    profile: str | None = None,
+    select_rules: list[str] | str | None = None,
+    ignore_rules: list[str] | str | None = None,
     repo_path: str | None = None,
 ) -> dict:
     """Sub-2s verification, deep semantic repo bug triage & blast-radius gate (<8KB inline).
 
     Modes:
-      - Whole-repo deep semantic triage (`audit=True`, optional `scope_glob="frontend/*"`): scans the entire
-        repo in <1.5s (even when git is dirty) and returns `ranked_hotspots` + `recommended_read` spans across
-        cross-stack HTTP/Pydantic schemas (`PB011`), React stateful remount/race bugs (`PB012`), Python
-        `.model_dump()` partial-update clobbers & silent exception drops (`PB013`), and 6D/cross-file contracts.
+      - Whole-repo deep semantic triage (`audit=True`, optional `scope_glob="frontend/*"`, `profile="fullstack"`):
+        scans the repo in <1.5s and returns `ranked_hotspots` + `recommended_read` spans across cross-stack
+        HTTP/Pydantic schemas (`PB011`), React remount/race bugs (`PB012`), Python `.model_dump()` clobbers
+        & silent I/O drops (`PB013`), and cross-file contracts. Respects `.projectbrain.toml` & `# pb:ignore`.
       - Post-edit / PR merge-base gate (`files_modified=[...]`, `base_ref="main"`, or git diff): checks AST validity,
         cross-stack HTTP/Pydantic/SQL/arity/import contracts, React lifecycle bugs, boundary rules, and callers.
       - Pre-edit plan gate (`plan_files=[...]`, `task="..."`) or fact-check (`claims=[["A", "calls", "B"]]`).
@@ -360,6 +370,9 @@ def brain_check(
             allow_governance_change=allow_governance_change,
             audit=audit,
             scope_glob=scope_glob,
+            profile=profile,
+            select_rules=select_rules,
+            ignore_rules=ignore_rules,
         )
     return _enforce_mcp_inline_budget(res)
 
@@ -380,9 +393,22 @@ def brain_remember(
       - Pin invariant: `brain_remember(target="AuthService.verify", note="Must strip Bearer prefix before HMAC")`
       - Enforce layer rule: `brain_remember(forbid="routes/* -> db/*", note="Routes must call services, not DB")`
       - Pin co-change rule: `brain_remember(co_change="schema.sql <-> models/user.py", note="Keep ORM synced")`
+      - Sync inline `# @pb-invariant:` comments: `brain_remember(action="sync")`
       - Audit invariants: `brain_remember(action="list")` or `brain_remember(action="stale")`
-      - Remove/refresh: `brain_remember(target="mem_1", action="forget")` or `action="refresh"`
+      - Note: `action="refresh"` and `action="forget"` are blocked over MCP by default so AI agents
+        cannot silently clear stale hashes or delete human-pinned governance rules (run CLI
+        `projectbrain memories --refresh` / `--forget` instead).
     """
+    act_l = (action or "save").strip().lower()
+    if act_l in ("refresh", "forget") and os.environ.get("PROJECTBRAIN_ALLOW_GOVERNANCE_CHANGE") != "1":
+        return {
+            "status": "blocked_by_governance_policy",
+            "error": (
+                f"MCP agents cannot invoke `brain_remember(action='{act_l}')` to clear stale AST hashes or "
+                "delete human-pinned governance rules. A human must run `projectbrain memories --refresh` or "
+                "`--forget` via CLI (or explicitly set `PROJECTBRAIN_ALLOW_GOVERNANCE_CHANGE=1`)."
+            ),
+        }
     b = _get_brain(repo_path)
     with b._op_lock:
         res = b.remember(

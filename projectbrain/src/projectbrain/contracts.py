@@ -2723,6 +2723,7 @@ def verify_cross_file_contracts(
     lines_cache: dict[str, list[str]] | None = None,
     include_deep_semantic: bool = True,
     deadline: float | None = None,
+    deadline_state: dict | None = None,
     skip_git_head: bool = False,
 ) -> list[str]:
     """Universal Cross-File & Deep Semantic Contract Verifier for `brain.patch()` and `brain.check()`.
@@ -3121,6 +3122,8 @@ def verify_cross_file_contracts(
     if brain._graph:
         for f_rel in sorted(focus_rels):
             if deadline is not None and _time.perf_counter() > deadline:
+                if deadline_state is not None:
+                    deadline_state["exceeded"] = True
                 break
             new_info = _get_info(f_rel)
             old_info = resolved_pre.get(f_rel) or {}
@@ -3344,6 +3347,8 @@ def verify_cross_file_contracts(
 
     for imp_rel in sorted(files_to_check_imports):
         if deadline is not None and _time.perf_counter() > deadline:
+            if deadline_state is not None:
+                deadline_state["exceeded"] = True
             break
         imp_info = _get_info(imp_rel)
         for local_name, bind in (imp_info.get("import_bindings") or {}).items():

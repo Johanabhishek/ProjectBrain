@@ -359,17 +359,22 @@ class ProjectBrain:
         out_path: str | None = None,
         zoom: bool = False,
         write_file: bool = True,
+        coordinates_only: bool = False,
+        top_n: int = 8,
     ) -> dict:
-        """Compile a self-contained, zero-follow-up Engineering Dossier across one or more tasks."""
+        """Compile a self-contained Engineering Dossier or pure Satellite Coordinate map (`coordinates_only=True`)."""
+        if coordinates_only:
+            from .dossier import compile_route_coordinates
+            return compile_route_coordinates(self, tasks, top_n=top_n)
         from .dossier import compile_engineering_dossier
         return compile_engineering_dossier(
-            self,
-            tasks,
-            impact_files=impact_files,
-            out_path=out_path,
-            zoom=zoom,
-            write_file=write_file,
+            self, tasks, impact_files=impact_files, out_path=out_path, zoom=zoom, write_file=write_file,
         )
+
+    def route(self, tasks: list[str] | str, *, top_n: int = 8, zero_write: bool = False) -> dict:
+        """Satellite Coordinate Router: return exact `file:Lstart-Lend` spans, peers, tests & invariants."""
+        from .dossier import compile_route_coordinates
+        return compile_route_coordinates(self, tasks, top_n=top_n, zero_write=zero_write)
 
     def patch(
         self,
@@ -953,18 +958,17 @@ class ProjectBrain:
         allow_governance_change: bool = False,
         audit: bool = False,
         scope_glob: str | None = None,
+        profile: str | None = None,
+        select_rules: list[str] | str | None = None,
+        ignore_rules: list[str] | str | None = None,
+        zero_write: bool = False,
     ) -> dict:
         """Unified verification gate: checks claims, validates plans, audits diffs, or runs whole-repo semantic triage."""
         return _verify_run_check(
-            self,
-            files_modified=files_modified,
-            claims=claims,
-            plan_files=plan_files,
-            task=task,
-            base_ref=base_ref,
-            allow_governance_change=allow_governance_change,
-            audit=audit,
-            scope_glob=scope_glob,
+            self, files_modified=files_modified, claims=claims, plan_files=plan_files, task=task,
+            base_ref=base_ref, allow_governance_change=allow_governance_change, audit=audit,
+            scope_glob=scope_glob, profile=profile, select_rules=select_rules,
+            ignore_rules=ignore_rules, zero_write=zero_write,
         )
 
     def learn(
@@ -976,18 +980,15 @@ class ProjectBrain:
         days: int = 180,
         min_cochanges: int = 3,
         min_confidence: float = 0.70,
+        include_module_rules: bool = False,
     ) -> dict:
         """Discover zero-violation architectural boundary rules, co-change contracts, and hub symbols."""
         from .learn import learn_repository_governance
 
         return learn_repository_governance(
-            self,
-            apply=apply,
-            pin_hubs=pin_hubs,
-            max_rules=max_rules,
-            days=days,
-            min_cochanges=min_cochanges,
-            min_confidence=min_confidence,
+            self, apply=apply, pin_hubs=pin_hubs, max_rules=max_rules, days=days,
+            min_cochanges=min_cochanges, min_confidence=min_confidence,
+            include_module_rules=include_module_rules,
         )
 
     def remember(
@@ -1020,6 +1021,9 @@ class ProjectBrain:
             return {"status": "removed", **self._memory.forget(key)}
 
         self._ensure_fresh()
+        if act in ("sync", "sync-annotations"):
+            from .memory import sync_inline_invariants
+            return sync_inline_invariants(self._memory, self._index, self._ast_hashes)
         if act == "refresh":
             updated = self._memory.refresh_hashes(self._ast_hashes, target.strip() or None)
             return {"status": "refreshed", "updated_count": updated}
@@ -1209,7 +1213,7 @@ class ProjectBrain:
             return {"error": f"Session '{session_id}' not found"}
         return session.status()
 
-    def index(self) -> dict:
+    def index(self, *, persist: bool = True) -> dict:
         """Parse all Python and JS/TS files under root and cache the result."""
         import time as _time
 
@@ -1294,23 +1298,24 @@ class ProjectBrain:
         self._sync_interprocedural_effects()
         self._blobs_ready = True
         self._cached_stats_summary = compute_stats_summary(self._index)
-        self._db_store.write_full(
-            {
-                "schema_version": SCHEMA_VERSION,
-                "parser_version": PARSER_VERSION,
-                "graph_version": GRAPH_VERSION,
-                "root": str(self.root),
-                "stats_summary": self._cached_stats_summary,
-                "symbol_imports_b85": pack_symbol_imports(self._symbol_imports),
-            },
-            self._index,
-            self._sizes,
-            self._skipped,
-            graph_json=self._graph.to_dict(),
-        )
-        for legacy in (self._cache_path, self._graph_path):
-            if legacy.exists():
-                legacy.unlink(missing_ok=True)
+        if persist:
+            self._db_store.write_full(
+                {
+                    "schema_version": SCHEMA_VERSION,
+                    "parser_version": PARSER_VERSION,
+                    "graph_version": GRAPH_VERSION,
+                    "root": str(self.root),
+                    "stats_summary": self._cached_stats_summary,
+                    "symbol_imports_b85": pack_symbol_imports(self._symbol_imports),
+                },
+                self._index,
+                self._sizes,
+                self._skipped,
+                graph_json=self._graph.to_dict(),
+            )
+            for legacy in (self._cache_path, self._graph_path):
+                if legacy.exists():
+                    legacy.unlink(missing_ok=True)
         return self.stats()
 
     def _load_neighborhood_for_check(self, candidate_files: list[str]) -> bool:
