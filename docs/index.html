@@ -133,6 +133,32 @@
       font-weight: 600 !important;
     }
     .nav-cta:hover { background: rgba(255, 255, 255, 0.11); }
+    .nav-cta-rust {
+      background: rgba(251, 146, 60, 0.12);
+      border-color: rgba(251, 146, 60, 0.35);
+      color: #fdba74 !important;
+    }
+    .nav-cta-rust:hover { background: rgba(251, 146, 60, 0.2); color: #ffedd5 !important; }
+    .rust-panel {
+      background: linear-gradient(180deg, rgba(251, 146, 60, 0.06) 0%, var(--bg-card) 100%);
+      border: 1px solid rgba(251, 146, 60, 0.24);
+      border-radius: var(--radius);
+      padding: 1.75rem;
+    }
+    .rust-grid { display: grid; grid-template-columns: 1.15fr 1fr; gap: 1.5rem; align-items: start; }
+    .rust-stats { display: flex; flex-wrap: wrap; gap: 0.55rem; margin: 1rem 0 1.2rem; }
+    .rust-pill {
+      font-size: 0.75rem;
+      font-weight: 600;
+      padding: 0.28rem 0.65rem;
+      border-radius: 7px;
+      background: rgba(255, 255, 255, 0.04);
+      border: 1px solid var(--border-hi);
+      color: var(--heading);
+    }
+    .rust-crates { list-style: none; padding: 0; margin: 0 0 1.25rem; display: grid; gap: 0.5rem; font-size: 0.86rem; color: var(--text-dim); }
+    .rust-crates li strong { color: var(--heading); }
+    @media (max-width: 900px) { .rust-grid { grid-template-columns: 1fr; } }
 
     /* Hero */
     .hero { padding: 5.5rem 0 4.5rem; text-align: center; }
@@ -511,10 +537,10 @@
         <a href="#receipts">Wild Audit</a>
         <a href="#quickstart">Quickstart</a>
         <a href="#capabilities">Rules</a>
-        <a href="#stack">Stack Fit</a>
-        <a href="https://github.com/Johanabhishek/projectbrain-rs" target="_blank" rel="noopener">Rust Engine</a>
+        <a href="#rust-engine">Rust Engine</a>
         <a href="https://pypi.org/project/projectbrain-mcp/" target="_blank" rel="noopener">PyPI</a>
-        <a class="nav-cta" href="https://github.com/Johanabhishek/ProjectBrain" target="_blank" rel="noopener">GitHub &rarr;</a>
+        <a class="nav-cta" href="https://github.com/Johanabhishek/ProjectBrain" target="_blank" rel="noopener">Python &rarr;</a>
+        <a class="nav-cta nav-cta-rust" href="https://github.com/Johanabhishek/projectbrain-rs" target="_blank" rel="noopener">Rust (pb) &rarr;</a>
       </div>
     </div>
   </nav>
@@ -817,6 +843,56 @@ def patch_invoice(invoice_id: str, payload: InvoicePatch):
           <span class="card-tag tag-green mono">SARIF · CI</span>
           <h3>Sub-2s PR Merge-Base Gate</h3>
           <p>Diffs multi-commit PRs cleanly against <code>git merge-base</code> and outputs text, JSON, GitHub annotations, sticky Mermaid PR impact summaries, or OASIS SARIF v2.1.0 with zero cloud code egress.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <section id="rust-engine">
+    <div class="container">
+      <div class="sec-head">
+        <div class="sec-kicker" style="color: #fdba74;">Native Rust Rewrite &middot; Apache-2.0</div>
+        <h2>ProjectBrain Rust Engine (<code>pb</code>)</h2>
+        <p class="sec-desc">
+          Need multi-repo contract linking, polyglot support beyond Python/TS, or sub-100 ms warm incremental checks? The core contract graph and Satellite MCP engine are also built as a 5-crate native Rust workspace.
+        </p>
+      </div>
+
+      <div class="rust-panel">
+        <div class="rust-grid">
+          <div>
+            <div class="rust-stats mono">
+              <span class="rust-pill">&lt;100 ms warm checks</span>
+              <span class="rust-pill">~15&ndash;60 ms warm MCP</span>
+              <span class="rust-pill">5 Rust crates (~39k LOC)</span>
+              <span class="rust-pill">74 / 74 CI tests passing</span>
+            </div>
+            <ul class="rust-crates">
+              <li><strong><code>pb-parser</code></strong> &mdash; Parallel <code>rayon</code> + <code>blake3</code> + <code>tree-sitter</code> AST extractors across TypeScript/TSX/JS, Python, Go, Rust, Kotlin, Protobuf (<code>.proto</code>), OpenAPI, Prisma, and SQL.</li>
+              <li><strong><code>pb-graph</code></strong> &mdash; Incremental <code>rusqlite</code> WAL index (<code>.pb/index.db</code>), multi-repo <code>pb.workspace.toml</code> linker, Ochiai co-change graph, and brownfield baseline ratchet.</li>
+              <li><strong><code>pb-bundles</code> &amp; <code>pb-reporters</code></strong> &mdash; Multiplex PPR Satellite Locator (<code>pb_locate</code>) with secret-redacting config fallback, <code>&lt;7,800</code>-char inline MCP, Mermaid PR comments, and SARIF.</li>
+              <li><strong><code>pb-cli</code></strong> &mdash; Single stripped native binary (<code>pb</code>) with local CLI, editor hooks, GitHub Action, and stdio MCP server.</li>
+            </ul>
+            <a class="btn btn-primary" href="https://github.com/Johanabhishek/projectbrain-rs" target="_blank" rel="noopener">Explore projectbrain-rs on GitHub &rarr;</a>
+          </div>
+
+          <div class="code-wrap">
+            <button class="copy-btn" data-copy="#code-rust">Copy</button>
+            <pre><code id="code-rust"># Clone &amp; build the native Rust binary (`pb`)
+git clone https://github.com/Johanabhishek/projectbrain-rs
+cd projectbrain-rs
+cargo build --release --bin pb
+cargo test --workspace
+
+# Index single repo or multi-repo workspace (pb.workspace.toml)
+pb index
+
+# Deterministic cross-stack &amp; org contract PR gate
+pb check --ci --base origin/main --new-only --format pr-comment
+
+# Sub-60ms warm Satellite Locator over local graph
+pb locate "invoice checkout route and schema"</code></pre>
+          </div>
         </div>
       </div>
     </div>
