@@ -3,7 +3,10 @@ from __future__ import annotations
 import json
 import subprocess
 import sys
-import tomllib
+try:
+    import tomllib  # Python 3.11+
+except ModuleNotFoundError:
+    import tomli as tomllib  # type: ignore[no-redef]
 from pathlib import Path
 
 import pytest
@@ -1719,7 +1722,7 @@ def test_nested_caller_deduplication_sarif_upload_and_v1_1_docs_sync(tmp_path: P
     assert root_readme_bytes == sub_readme_bytes
     root_readme = root_readme_bytes.decode("utf-8")
     assert "(220 tests)" not in root_readme and "(256 tests)" not in root_readme and "(260 tests)" not in root_readme and "(265 tests)" not in root_readme and "(273 tests)" not in root_readme and "(280 tests)" not in root_readme and "(285 tests)" not in root_readme
-    assert "(290 tests)" in root_readme
+    assert "(291 tests)" in root_readme
 
 
 

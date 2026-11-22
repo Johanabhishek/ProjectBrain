@@ -512,6 +512,7 @@
         <a href="#quickstart">Quickstart</a>
         <a href="#capabilities">Rules</a>
         <a href="#stack">Stack Fit</a>
+        <a href="https://github.com/Johanabhishek/projectbrain-rs" target="_blank" rel="noopener">Rust Engine</a>
         <a href="https://pypi.org/project/projectbrain-mcp/" target="_blank" rel="noopener">PyPI</a>
         <a class="nav-cta" href="https://github.com/Johanabhishek/ProjectBrain" target="_blank" rel="noopener">GitHub &rarr;</a>
       </div>
@@ -541,7 +542,8 @@
 
       <div class="hero-actions">
         <a class="btn btn-primary" href="#quickstart">10-Second Trial</a>
-        <a class="btn btn-ghost" href="https://github.com/Johanabhishek/ProjectBrain" target="_blank" rel="noopener">View Source on GitHub</a>
+        <a class="btn btn-ghost" href="https://github.com/Johanabhishek/ProjectBrain" target="_blank" rel="noopener">Python Source</a>
+        <a class="btn btn-ghost" href="https://github.com/Johanabhishek/projectbrain-rs" target="_blank" rel="noopener">Rust Engine (pb)</a>
         <a class="btn btn-ghost" href="https://pypi.org/project/projectbrain-mcp/" target="_blank" rel="noopener">PyPI Package</a>
       </div>
 
@@ -707,6 +709,9 @@ uvx --from projectbrain-mcp projectbrain audit --profile fullstack
 # Satellite Coordinate Router: exact file:Lstart-Lend spans + callers + covering tests (~500 tokens):
 uvx --from projectbrain-mcp projectbrain route "how are invoices validated and settled"
 
+# Day-1 architecture &amp; boundary learning (optional):
+uvx --from projectbrain-mcp projectbrain learn
+
 # Permanent install via uv or pip:
 uv tool install projectbrain-mcp</code></pre>
         </div>
@@ -726,7 +731,9 @@ jobs:
           fetch-depth: 0
       - uses: astral-sh/setup-uv@v4
       - name: Cross-stack schema, React lifecycle &amp; architecture check
-        run: uvx --from projectbrain-mcp projectbrain check --profile fullstack --ci --format sarif</code></pre>
+        run: |
+          uvx --from projectbrain-mcp projectbrain check --base main --profile fullstack --ci --format sarif
+          # Or sticky Mermaid PR summary: projectbrain check --base main --format pr-comment</code></pre>
         </div>
       </div>
 
@@ -796,7 +803,7 @@ def patch_invoice(invoice_id: str, payload: InvoicePatch):
 
         <div class="card">
           <span class="card-tag tag-green mono">PB002 · PB007 · PB008</span>
-          <h3>Governance &amp; Tamper Lock</h3>
+          <h3>Governance Tamper Lock</h3>
           <p>Enforces <code>--forbid</code> architectural boundaries, tracks code-native <code>@pb-invariant:</code> AST hashes, and blocks AI agents from deleting or weakening <code>.projectbrain.toml</code> / governance rules in PRs.</p>
         </div>
 
@@ -882,7 +889,8 @@ def patch_invoice(invoice_id: str, payload: InvoicePatch):
         <strong style="color: var(--heading);">ProjectBrain</strong> &middot; Apache License 2.0 &middot; Built by Johan Abhishek Dasari
       </div>
       <div class="footer-links">
-        <a href="https://github.com/Johanabhishek/ProjectBrain" target="_blank" rel="noopener">GitHub</a>
+        <a href="https://github.com/Johanabhishek/ProjectBrain" target="_blank" rel="noopener">Python Repo</a>
+        <a href="https://github.com/Johanabhishek/projectbrain-rs" target="_blank" rel="noopener">Rust Engine (pb)</a>
         <a href="https://pypi.org/project/projectbrain-mcp/" target="_blank" rel="noopener">PyPI</a>
         <a href="https://github.com/Johanabhishek/projectbrain-docs" target="_blank" rel="noopener">Docs Repo</a>
         <a href="https://github.com/Johanabhishek/ProjectBrain/blob/main/LICENSE" target="_blank" rel="noopener">Apache-2.0 License</a>

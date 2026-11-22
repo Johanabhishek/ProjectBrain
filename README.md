@@ -1,11 +1,15 @@
 # ProjectBrain (`projectbrain-mcp` v1.4.0)
 
+[![CI](https://github.com/Johanabhishek/ProjectBrain/actions/workflows/ci.yml/badge.svg)](https://github.com/Johanabhishek/ProjectBrain/actions/workflows/ci.yml)
 [![PyPI](https://img.shields.io/pypi/v/projectbrain-mcp.svg)](https://pypi.org/project/projectbrain-mcp/)
 [![License: Apache-2.0](https://img.shields.io/badge/License-Apache_2.0-blue.svg)](https://opensource.org/licenses/Apache-2.0)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10+-blue.svg)](https://www.python.org/downloads/)
+[![Rust Engine](https://img.shields.io/badge/rust_engine-pb-orange.svg)](https://github.com/Johanabhishek/projectbrain-rs)
 [![Docs](https://img.shields.io/badge/docs-live-3fb950.svg)](https://johanabhishek.github.io/projectbrain-docs/)
 
 **Zero-LLM Cross-Stack Contract Firewall, Satellite Coordinate Router & Sub-2s PR Architecture Gate for AI-Generated Code (CLI, CI SARIF & Bundled MCP Server).**
+
+> **Native Rust Engine (`pb`):** Looking for the 5-crate Rust rewrite (`tree-sitter`, `rayon`, `blake3`, `rusqlite`, Go/Rust/Kotlin/TS/Python/Protobuf/OpenAPI/Prisma/SQL, sub-100ms warm incremental checks, multi-repo `pb.workspace.toml` linking)? See **[Johanabhishek/projectbrain-rs](https://github.com/Johanabhishek/projectbrain-rs)** (Apache-2.0).
 
 Single-language compilers (`pyright`, `tsc`, `ruff`, `eslint`) are blind across the **HTTP network boundary** and **repo architecture rules**. Cloud AI PR reviewers (CodeRabbit, Greptile) are slow, probabilistic, and require sending code off-machine. **ProjectBrain sits cleanly between them**: a `<1.5s`, 100% local, zero-API-key static analyzer & live SQLite code-graph router that catches cross-stack FastAPI/Pydantic ↔ React/TS schema & Express verb bugs (`PB011`–`PB013`), enforces layer boundaries (`--forbid`) and code-native `@pb-invariant:` rules, blocks governance/config tampering in PRs, and routes coding agents to exact `file:Lstart-Lend` coordinates without dumping truncated code.
 

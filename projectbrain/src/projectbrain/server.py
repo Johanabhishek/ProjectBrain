@@ -62,7 +62,7 @@ def _is_unsafe_unindexed_root(target: Path) -> bool:
     resolved = target.resolve()
     if (resolved / ".projectbrain.db").exists() or (resolved / ".git").exists() or (resolved / "pyproject.toml").exists() or (resolved / "package.json").exists():
         return False
-    if resolved == resolved.anchor or str(resolved) == resolved.drive + "\\":
+    if str(resolved) == resolved.anchor or resolved == resolved.parent:
         return True
     try:
         if resolved == Path.home().resolve():
